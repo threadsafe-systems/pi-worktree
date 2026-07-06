@@ -1,0 +1,41 @@
+{
+  "name": "pi-worktree",
+  "version": "1.3.3-loom.1",
+  "description": "Git worktree management for Pi (local fork). Adds: on relaunch into a worktree, fork the parent session so history follows the hop, and inject a one-turn orientation caveat (cwd/branch/path-semantics/uncommitted-WIP).",
+  "license": "MIT",
+  "type": "module",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "git",
+    "worktree",
+    "cmux",
+    "tmux"
+  ],
+  "files": [
+    "extensions/worktree.ts",
+    "skills/",
+    "README.md",
+    "FORK.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/worktree.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "lint": "npx tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
+  }
+}
