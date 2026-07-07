@@ -9,6 +9,7 @@ Inspired by `claude --worktree` from Claude Code.
 When working on multiple features in parallel (or running multiple AI coding agents), you need full isolation — not just a git branch, but separate `node_modules`, databases, env files, and dev server ports. Git worktrees provide the branch isolation; **pi-worktree** automates everything else via project-level hooks.
 
 **One command** gets you:
+
 - A fresh git worktree on its own branch
 - A dedicated database (via `createdb` or any command you configure)
 - A generated `.env.local` with worktree-specific config
@@ -27,17 +28,27 @@ If Pi is already running, use `/reload` to pick up the new extension.
 ## Usage
 
 ```bash
-# Create a worktree and start Pi in it
+# Create a worktree and start Pi in it (conventional-commit branch)
+pi --worktree feat/my-feature
+
+# Bare name → defaults to feat/ (e.g. feat/my-feature)
 pi --worktree my-feature
 
-# Auto-generated name (e.g. "calm-fox")
+# Auto-generated name (e.g. feat/calm-fox)
 pi --worktree
 
 # From within a Pi session
-/worktree my-feature
-/worktree destroy my-feature
+/worktree feat/my-feature
+/worktree fix login-bug      # → fix/login-bug
+/worktree dispose            # leave + remove this worktree, reopen Pi in the main repo
+/worktree destroy fix/login-bug
 /worktree list
 ```
+
+Worktrees are created in a **sibling** directory next to the repo
+(`<repoRoot>.worktrees/<branch-slug>`, where `/` in the branch collapses to `-`).
+For example `feat/my-feature` lives at `../my-repo.worktrees/feat-my-feature`.
+Because it sits outside the repo tree, there is nothing to add to `.gitignore`.
 
 When cmux or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Without a multiplexer, it prints the path for manual `cd && pi`.
 
@@ -47,9 +58,8 @@ Create `.pi/worktree.json` in your repo root (commit it so all contributors shar
 
 ```json
 {
-  "dir": ".worktrees",
-  "branchPrefix": "worktree/",
   "linkEnvFiles": true,
+  "defaultType": "feat",
   "postCreate": [
     "npm install",
     "npx prisma db push"
@@ -62,32 +72,37 @@ Create `.pi/worktree.json` in your repo root (commit it so all contributors shar
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `dir` | `.worktrees` | Directory for worktrees (relative to repo root) |
-| `branchPrefix` | `worktree/` | Branch name prefix |
+| `dir` | `<repoRoot>.worktrees` | Worktree base dir. Omit for the sibling default; set to resolve relative to the repo root |
+| `defaultType` | `feat` | Conventional-commit type used when the input has no `type/` prefix |
+| `types` | all conventional types | Override the accepted `<type>` set |
 | `linkEnvFiles` | `true` | Symlink gitignored `.env*` files (except `.env.local`) from main repo |
 | `postCreate` | `[]` | Shell commands run after creation (cwd = worktree) |
 | `preRemove` | `[]` | Shell commands run before removal (cwd = worktree) |
 
-Don't forget to add the worktree directory to `.gitignore`:
-
-```
-.worktrees/
-```
+Branches follow conventional commits: `<type>/<identifier>`, e.g.
+`feat/use-conventional-commits`. Valid types: `feat`, `fix`, `chore`, `docs`,
+`refactor`, `test`, `perf`, `build`, `ci`, `style`, `revert`.
 
 ## How it works
 
-**Create** (`pi --worktree my-feature` or `/worktree my-feature`):
+**Create** (`pi --worktree feat/my-feature` or `/worktree feat/my-feature`):
 
-1. `git worktree add -b worktree/my-feature .worktrees/my-feature HEAD`
+1. `git worktree add -b feat/my-feature <repoRoot>.worktrees/feat-my-feature HEAD`
 2. Symlinks gitignored `.env*` files (except `.env.local`) from the main repo
 3. Runs each `postCreate` command in order
-4. Relaunches Pi in the worktree directory
+4. Relaunches Pi in the worktree directory (forking the session so history follows)
 
-**Destroy** (`/worktree destroy my-feature`):
+**Dispose** (`/worktree dispose`, from inside a worktree):
+
+1. Exits Pi and, once it has stopped, `cd`s back to the main repo
+2. Runs each `preRemove` command, then `git worktree remove --force` + `git branch -d` (soft; the branch is kept if it still has unmerged commits)
+3. Relaunches Pi in the main repo, forking the worktree session so history follows the hop back
+
+**Destroy** (`/worktree destroy feat/my-feature`, from the main checkout):
 
 1. Runs each `preRemove` command
-2. `git worktree remove --force .worktrees/my-feature`
-3. `git branch -D worktree/my-feature`
+2. `git worktree remove --force <repoRoot>.worktrees/feat-my-feature`
+3. `git branch -D feat/my-feature`
 
 **Relaunch strategy:** Pi's tools (bash, read, edit, etc.) bind to the working directory at startup via closure — there is no way to change it mid-session. When a worktree is created from the main repo, Pi shuts down and injects `cd <worktree> && pi` into the terminal via `cmux send` or `tmux send-keys`, so Pi restarts with the correct cwd.
 
