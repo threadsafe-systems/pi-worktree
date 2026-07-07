@@ -11,9 +11,14 @@ import {
 	decodeHandoff,
 	encodeHandoff,
 	getWorktreeDir,
+	getWorktreePath,
 	handoffCaveat,
 	isPathInside,
+	isValidBaseRef,
+	isValidExplicitBranch,
+	parseCreateArgs,
 	parseWorktreeList,
+	planCreate,
 	resolveBranch,
 	resolveDestroyTarget,
 	type WtHandoff,
@@ -283,7 +288,7 @@ check(
 		const s = buildCreateScript("/repo", "/repo.worktrees/feat-x", "feat/x");
 		assert.match(
 			s,
-			/git worktree add -b 'feat\/x' '\/repo.worktrees\/feat-x' HEAD/,
+			/git worktree add -b 'feat\/x' '\/repo.worktrees\/feat-x' 'HEAD'/,
 		);
 		assert.match(s, /cd '\/repo'/);
 		assert.doesNotMatch(s, /branch -D/);
@@ -479,6 +484,87 @@ check("enter handoff defaults kind to enter on decode", () => {
 		uncommitted: 0,
 	});
 	assert.equal(decodeHandoff(legacy)?.kind, "enter");
+});
+
+// --- Ergonomic overrides: --dir / --branch / --base ---
+
+check("parseCreateArgs: positional name plus --dir/--branch/--base (space + = forms)", () => {
+	assert.deepEqual(parseCreateArgs("my-thing --dir /tmp/wt --branch feature/x --base develop"), {
+		name: "my-thing",
+		dir: "/tmp/wt",
+		branch: "feature/x",
+		base: "develop",
+	});
+	assert.deepEqual(parseCreateArgs("--branch=feature/y --base=HEAD~2 thing"), {
+		name: "thing",
+		branch: "feature/y",
+		base: "HEAD~2",
+	});
+});
+
+check("parseCreateArgs: two-token positional name is preserved for resolveBranch", () => {
+	assert.deepEqual(parseCreateArgs("fix login-bug"), { name: "fix login-bug" });
+});
+
+check("isValidExplicitBranch: accepts real branches, rejects unsafe/illegal", () => {
+	for (const ok of ["feature/x", "Release-1.2", "a/b/c", "hotfix_9"]) {
+		assert.equal(isValidExplicitBranch(ok), true, ok);
+	}
+	for (const bad of ["", "foo bar", "$(touch pwn)", "a..b", "a//b", "feat/", "x.lock", "-lead", "a`b`"]) {
+		assert.equal(isValidExplicitBranch(bad), false, bad);
+	}
+});
+
+check("isValidBaseRef: accepts refs, rejects leading dash and shell metachars", () => {
+	for (const ok of ["HEAD", "origin/main", "v1.2.3", "HEAD~3", "abc123"]) {
+		assert.equal(isValidBaseRef(ok), true, ok);
+	}
+	for (const bad of ["", "-x", "$(x)", "a b", "a;b", "a`b`"]) {
+		assert.equal(isValidBaseRef(bad), false, bad);
+	}
+});
+
+check("getWorktreeDir/getWorktreePath: --dir override wins over sibling default", () => {
+	assert.equal(getWorktreeDir("/repo", {}, "/tmp/wts"), "/tmp/wts");
+	assert.equal(getWorktreeDir("/repo", { dir: ".wt" }, "/tmp/wts"), "/tmp/wts");
+	assert.equal(
+		getWorktreePath("/repo", {}, "feat/x", "/tmp/wts"),
+		"/tmp/wts/feat-x",
+	);
+});
+
+check("buildCreateScript: base defaults to HEAD and is shQuote'd when overridden", () => {
+	assert.match(buildCreateScript("/repo", "/repo.worktrees/feat-x", "feat/x"), /'HEAD'$/m);
+	const s = buildCreateScript("/repo", "/repo.worktrees/feat-x", "feat/x", "develop");
+	assert.match(s, /git worktree add -b 'feat\/x' '\/repo.worktrees\/feat-x' 'develop'/);
+});
+
+check("planCreate: name resolves to a conventional branch + sibling path", () => {
+	const p = planCreate("/repo", {}, { name: "login-bug" });
+	assert.deepEqual(p, {
+		branch: "feat/login-bug",
+		worktreePath: "/repo.worktrees/feat-login-bug",
+		base: "HEAD",
+	});
+});
+
+check("planCreate: --branch is used verbatim; --dir + --base flow through", () => {
+	const p = planCreate("/repo", {}, {
+		name: "ignored",
+		branch: "release/2.0",
+		dir: "/tmp/wts",
+		base: "origin/main",
+	});
+	assert.deepEqual(p, {
+		branch: "release/2.0",
+		worktreePath: "/tmp/wts/release-2.0",
+		base: "origin/main",
+	});
+});
+
+check("planCreate: rejects an injection-y --branch and --base", () => {
+	assert.throws(() => planCreate("/repo", {}, { branch: "feat/$(touch x)" }), /Invalid .*branch/i);
+	assert.throws(() => planCreate("/repo", {}, { name: "x", base: "-rf" }), /Invalid .*base/i);
 });
 
 if (fail > 0) {

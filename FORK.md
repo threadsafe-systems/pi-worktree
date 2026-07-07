@@ -100,6 +100,15 @@ the session across.
       aborts before the irreversible worktree/branch removal.
     - `resolveDestroyTarget`'s main-checkout guard uses `canonicalPath` for
       consistency with `isPathInside` (git's own refusal remains the backstop).
+12. **Ergonomic create overrides** (ported from the origin `feat/worktree-overrides-and-resume`
+    lineage and adapted): `--dir` / `--branch` / `--base` on `/worktree create`
+    plus the `--worktree-dir` / `--worktree-branch` / `--worktree-base` CLI flags.
+    `--branch` bypasses conventional resolution but is still validated
+    (`isValidExplicitBranch`), and `--base` (`isValidBaseRef`) must not begin
+    with `-` or contain shell metacharacters, so the injection/hardening
+    guarantees hold. Parsing (`parseCreateArgs`) and planning (`planCreate`) are
+    pure and unit-tested. The digest `resume` mode from that lineage was
+    deliberately NOT ported: this fork carries the full session via `pi --fork`.
 
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.

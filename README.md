@@ -37,6 +37,11 @@ pi --worktree my-feature
 # Auto-generated name (e.g. feat/calm-fox)
 pi --worktree
 
+# Override the base dir, exact branch, or base ref
+pi --worktree my-feature --worktree-base develop
+/worktree feat/my-feature --dir ~/wts --base origin/main
+/worktree create hotfix --branch release/2.0.1
+
 # From within a Pi session
 /worktree feat/my-feature
 /worktree fix login-bug      # → fix/login-bug
@@ -44,6 +49,14 @@ pi --worktree
 /worktree destroy fix/login-bug
 /worktree list
 ```
+
+**Create overrides** (both `/worktree ...` and the `--worktree-*` CLI flags):
+
+| Override | Flag (CLI) | Effect |
+|---|---|---|
+| `--dir <path>` | `--worktree-dir` | Worktree base directory for this invocation |
+| `--branch <name>` | `--worktree-branch` | Exact branch, bypassing conventional resolution (still validated for ref/shell safety) |
+| `--base <ref>` | `--worktree-base` | Branch the worktree from `<ref>` instead of `HEAD` |
 
 Worktrees are created in a **sibling** directory next to the repo
 (`<repoRoot>.worktrees/<branch-slug>`, where `/` in the branch collapses to `-`).

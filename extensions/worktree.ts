@@ -233,10 +233,12 @@ export function expandHome(p: string): string {
 export function getWorktreeDir(
 	repoRoot: string,
 	config: WorktreeConfig,
+	dirOverride?: string,
 ): string {
-	// Explicit override resolves relative to the repo root; otherwise use a
-	// sibling base directory next to the repo (never nested inside it).
-	if (config.dir) return resolve(repoRoot, expandHome(config.dir));
+	// Per-invocation override wins, then config.dir; both resolve relative to the
+	// repo root. Otherwise use a sibling base directory (never nested inside it).
+	const dir = dirOverride ?? config.dir;
+	if (dir) return resolve(repoRoot, expandHome(dir));
 	return `${repoRoot}.worktrees`;
 }
 
@@ -338,8 +340,117 @@ export function getWorktreePath(
 	repoRoot: string,
 	config: WorktreeConfig,
 	branch: string,
+	dirOverride?: string,
 ): string {
-	return join(getWorktreeDir(repoRoot, config), branchToDirName(branch));
+	return join(
+		getWorktreeDir(repoRoot, config, dirOverride),
+		branchToDirName(branch),
+	);
+}
+
+/** A git-ref-safe, shell-safe explicit branch name (for `--branch`). Allows
+ *  slashes and mixed case but forbids shell metacharacters and the git ref
+ *  patterns git itself rejects. */
+export function isValidExplicitBranch(branch: string): boolean {
+	if (!branch) return false;
+	if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) return false;
+	if (branch.includes("..") || branch.includes("//")) return false;
+	if (branch.endsWith("/") || branch.endsWith(".") || branch.endsWith(".lock"))
+		return false;
+	return true;
+}
+
+/** A shell-safe base ref (for `--base`). Must not begin with `-` (else git reads
+ *  it as a flag) and must avoid shell metacharacters. git validates the rest. */
+export function isValidBaseRef(ref: string): boolean {
+	return /^[A-Za-z0-9_][A-Za-z0-9._/@~^-]*$/.test(ref);
+}
+
+// ---------------------------------------------------------------------------
+// Command argument parsing + create planning
+// ---------------------------------------------------------------------------
+
+export interface CreateOptions {
+	/** Positional worktree name (fed to resolveBranch unless `branch` is set). */
+	name?: string;
+	/** Per-invocation worktree base directory override. */
+	dir?: string;
+	/** Exact branch name, bypassing conventional-commit resolution. */
+	branch?: string;
+	/** Base ref to branch from. Default: HEAD. */
+	base?: string;
+}
+
+/** Parse `/worktree create` args: a positional name plus `--dir`, `--branch`,
+ *  `--base` (both `--flag value` and `--flag=value` forms). Positional tokens
+ *  join with a space so `resolveBranch` still sees the two-token type form. */
+export function parseCreateArgs(raw: string): CreateOptions {
+	const tokens = (raw ?? "").trim().split(/\s+/).filter(Boolean);
+	const opts: CreateOptions = {};
+	const positionals: string[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const tok = tokens[i];
+		if (!tok.startsWith("--")) {
+			positionals.push(tok);
+			continue;
+		}
+		const eq = tok.indexOf("=");
+		const flag = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
+		const inlineVal = eq >= 0 ? tok.slice(eq + 1) : undefined;
+		const takeValue = (): string | undefined =>
+			inlineVal ?? (i + 1 < tokens.length ? tokens[++i] : undefined);
+		if (flag === "dir") {
+			const v = takeValue();
+			if (v) opts.dir = v;
+		} else if (flag === "branch") {
+			const v = takeValue();
+			if (v) opts.branch = v;
+		} else if (flag === "base") {
+			const v = takeValue();
+			if (v) opts.base = v;
+		}
+	}
+	if (positionals.length > 0) opts.name = positionals.join(" ");
+	return opts;
+}
+
+export interface CreatePlan {
+	branch: string;
+	worktreePath: string;
+	base: string;
+}
+
+/** Resolve create options into a concrete branch, worktree path and base ref.
+ *  An explicit `--branch` bypasses conventional resolution but is still
+ *  validated for git-ref/shell safety; `--base` likewise. Throws on invalid. */
+export function planCreate(
+	repoRoot: string,
+	config: WorktreeConfig,
+	opts: CreateOptions,
+): CreatePlan {
+	let branch: string;
+	if (opts.branch !== undefined) {
+		const b = opts.branch.trim();
+		if (!isValidExplicitBranch(b)) {
+			throw new Error(
+				`Invalid --branch "${b}". Use a git-ref-safe name (letters, digits, ., _, -, /); no shell metacharacters, "..", "//", or trailing "/"/".lock".`,
+			);
+		}
+		branch = b;
+	} else {
+		branch = resolveBranch(opts.name ?? "", config);
+	}
+	const base = (opts.base ?? "").trim() || "HEAD";
+	if (base !== "HEAD" && !isValidBaseRef(base)) {
+		throw new Error(
+			`Invalid --base "${base}". Use a ref name (letters, digits, ., _, -, /, @, ~, ^) that does not start with "-".`,
+		);
+	}
+	return {
+		branch,
+		worktreePath: getWorktreePath(repoRoot, config, branch, opts.dir),
+		base,
+	};
 }
 
 /** Canonicalise a path (resolve symlinks) when it exists, else resolve it
@@ -587,11 +698,12 @@ export function buildCreateScript(
 	repoRoot: string,
 	worktreePath: string,
 	branch: string,
+	base = "HEAD",
 ): string {
 	return [
 		`cd ${shQuote(repoRoot)}`,
 		`mkdir -p ${shQuote(dirname(worktreePath))}`,
-		`git worktree add -b ${shQuote(branch)} ${shQuote(worktreePath)} HEAD`,
+		`git worktree add -b ${shQuote(branch)} ${shQuote(worktreePath)} ${shQuote(base)}`,
 	].join("\n");
 }
 
@@ -755,12 +867,29 @@ function relaunchInPlace(
 export default function (pi: ExtensionAPI) {
 	let worktreeBranch: string | null = null;
 
-	// --- Register --worktree flag ---
+	// --- Register --worktree flags ---
 	pi.registerFlag("worktree", {
 		description:
 			"Create or reuse a git worktree and work inside it. Optionally specify a conventional-commit branch (e.g. feat/my-feature).",
 		type: "string",
 	});
+	pi.registerFlag("worktree-dir", {
+		description:
+			"Worktree base directory for this invocation (overrides the configured dir).",
+		type: "string",
+	});
+	pi.registerFlag("worktree-branch", {
+		description:
+			"Exact branch name for the worktree (bypasses conventional-commit resolution).",
+		type: "string",
+	});
+	pi.registerFlag("worktree-base", {
+		description: "Base ref to branch the worktree from. Default: HEAD.",
+		type: "string",
+	});
+
+	const flagString = (v: unknown): string | undefined =>
+		typeof v === "string" && v.length > 0 ? v : undefined;
 
 	// --- Auto-detect worktree from cwd, or handle --worktree flag ---
 	pi.on("session_start", async (_event, ctx) => {
@@ -771,14 +900,21 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const repoRoot = await getRepoRoot(pi);
 				const config = loadConfig(repoRoot);
-				const input = typeof flagValue === "string" ? flagValue : "";
-				const branch = resolveBranch(input, config);
-				const worktreePath = getWorktreePath(repoRoot, config, branch);
+				const { branch, worktreePath, base } = planCreate(repoRoot, config, {
+					name: typeof flagValue === "string" ? flagValue : "",
+					dir: flagString(pi.getFlag("worktree-dir")),
+					branch: flagString(pi.getFlag("worktree-branch")),
+					base: flagString(pi.getFlag("worktree-base")),
+				});
 
 				const exists = existsSync(worktreePath);
 				if (!exists) {
 					ctx.ui.setStatus("worktree", `⏳ Creating worktree "${branch}"...`);
-					await createWorktree(pi, ctx, repoRoot, config, branch);
+					await createWorktree(pi, ctx, repoRoot, config, {
+						branch,
+						worktreePath,
+						base,
+					});
 					ctx.ui.setStatus("worktree", `🌿 ${branch}`);
 				} else {
 					ctx.ui.setStatus("worktree", `🌿 ${branch} (existing)`);
@@ -866,7 +1002,7 @@ export default function (pi: ExtensionAPI) {
 	// --- Commands ---
 	pi.registerCommand("worktree", {
 		description:
-			"Git worktree management. Usage: /worktree [type/name], /worktree create [type/name], /worktree dispose, /worktree destroy <branch>, /worktree list. When creating on the user's behalf, infer a conventional-commit type (feat/fix/chore/docs/refactor/...) from the conversation; it defaults to feat.",
+			"Git worktree management. Usage: /worktree [type/name] [--dir <path>] [--branch <name>] [--base <ref>], /worktree create [type/name], /worktree dispose, /worktree destroy <branch>, /worktree list. When creating on the user's behalf, infer a conventional-commit type (feat/fix/chore/docs/refactor/...) from the conversation; it defaults to feat.",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/);
 			const sub = parts[0] || "";
@@ -897,6 +1033,8 @@ export default function (pi: ExtensionAPI) {
 							"  /worktree list            — List all worktrees\n" +
 							"  /worktree help            — Show this help\n" +
 							"\n" +
+							"Create overrides: --dir <path> (worktree base dir), --branch <name> " +
+							"(exact branch, bypasses conventional resolution), --base <ref> (branch from ref, default HEAD).\n" +
 							"Branch names follow conventional commits: <type>/<identifier>, e.g. feat/use-conventional-commits.\n" +
 							"Valid types: " +
 							CONVENTIONAL_TYPES.join(", ") +
@@ -939,8 +1077,11 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const repoRoot = await getRepoRoot(pi);
 			const config = loadConfig(repoRoot);
-			const branch = resolveBranch(nameArg ?? "", config);
-			const worktreePath = getWorktreePath(repoRoot, config, branch);
+			const { branch, worktreePath, base } = planCreate(
+				repoRoot,
+				config,
+				parseCreateArgs(nameArg ?? ""),
+			);
 
 			// Never re-create over an existing worktree/dir: that would risk
 			// clobbering a real branch or discarding an existing checkout.
@@ -952,7 +1093,11 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			await createWorktree(pi, ctx, repoRoot, config, branch);
+			await createWorktree(pi, ctx, repoRoot, config, {
+				branch,
+				worktreePath,
+				base,
+			});
 
 			// Fork the parent session so history follows the hop, plus a handoff note.
 			const sessionFile = currentSessionFile(ctx);
@@ -1195,9 +1340,9 @@ async function createWorktree(
 	ctx: ExtensionContext,
 	repoRoot: string,
 	config: WorktreeConfig,
-	branch: string,
+	plan: CreatePlan,
 ) {
-	const worktreePath = getWorktreePath(repoRoot, config, branch);
+	const { branch, worktreePath, base } = plan;
 
 	const step = (msg: string) => ctx.ui.setStatus("worktree", msg);
 	const run = async (cmd: string, timeout = 30_000) => {
@@ -1208,7 +1353,7 @@ async function createWorktree(
 
 	// 1. Git worktree
 	step(`⏳ Creating git worktree (${branch})...`);
-	await run(buildCreateScript(repoRoot, worktreePath, branch));
+	await run(buildCreateScript(repoRoot, worktreePath, branch, base));
 
 	// 2. Link env files
 	if (config.linkEnvFiles !== false) {
