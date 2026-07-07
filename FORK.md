@@ -123,6 +123,11 @@ the session across.
     - the `--worktree` flag "existing" shortcut verifies the directory is a
       worktree actually on the requested branch before relaunching, so a
       slug-colliding explicit `--branch` cannot mis-attach to another branch.
+14. **Confirmation re-review** (gpt-5.5 + glm-5.2): O1/O3/O4 RESOLVED; one
+    residual on O2 closed — `resolveDestroyTarget` now matches in candidate
+    priority order (literal input before its conventional form) rather than
+    git-list order, so `destroy foo` prefers a literal `foo` worktree over a
+    colliding `feat/foo` one. No new defects.
 
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.

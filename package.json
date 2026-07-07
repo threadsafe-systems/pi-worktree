@@ -1,6 +1,6 @@
 {
   "name": "pi-worktree",
-  "version": "1.3.3-loom.9",
+  "version": "1.3.3-loom.10",
   "description": "Git worktree management for Pi (local fork). Adds: sibling worktree layout (<repoRoot>.worktrees/<branch-slug>), conventional-commit branch names, /worktree dispose (leave+remove, reopen in main repo), and session-forking relaunch so history follows every hop with a one-turn orientation caveat.",
   "license": "MIT",
   "type": "module",

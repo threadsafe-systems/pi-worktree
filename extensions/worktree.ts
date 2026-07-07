@@ -535,9 +535,13 @@ export function resolveDestroyTarget(
 	branches: string[],
 	repoRoot: string,
 ): { path: string; branch: string } | { error: string } {
-	const entry = worktrees.find(
-		(w) => w.branch !== null && branches.includes(w.branch),
-	);
+	const entry =
+		// Match in candidate priority order (literal input before its conventional
+		// form), NOT git-list order, so `destroy foo` prefers a literal `foo`
+		// worktree over a colliding `feat/foo` one.
+		branches
+			.map((b) => worktrees.find((w) => w.branch === b))
+			.find((w): w is { path: string; branch: string } => w !== undefined);
 	if (!entry || entry.branch === null) {
 		const names = branches.map((b) => `"${b}"`).join(" or ") || "(none)";
 		return {
@@ -969,8 +973,7 @@ export default function (pi: ExtensionAPI) {
 					const here =
 						listed.code === 0
 							? parseWorktreeList(listed.stdout).find(
-									(w) =>
-										canonicalPath(w.path) === canonicalPath(worktreePath),
+									(w) => canonicalPath(w.path) === canonicalPath(worktreePath),
 								)
 							: undefined;
 					if (!here || here.branch !== branch) {

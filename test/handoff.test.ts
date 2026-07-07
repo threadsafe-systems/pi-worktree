@@ -406,11 +406,27 @@ check(
 	},
 );
 
-check("resolveDestroyTarget: matches any candidate branch (create/destroy symmetry)", () => {
-	const list = [{ path: "/repo.worktrees/release-2.0", branch: "release/2.0" }];
+check(
+	"resolveDestroyTarget: matches any candidate branch (create/destroy symmetry)",
+	() => {
+		const list = [
+			{ path: "/repo.worktrees/release-2.0", branch: "release/2.0" },
+		];
+		assert.deepEqual(
+			resolveDestroyTarget(list, ["feat/release/2.0", "release/2.0"], "/repo"),
+			{ path: "/repo.worktrees/release-2.0", branch: "release/2.0" },
+		);
+	},
+);
+
+check("resolveDestroyTarget: prefers the earlier candidate over git-list order", () => {
+	const list = [
+		{ path: "/repo.worktrees/feat-login-bug", branch: "feat/login-bug" },
+		{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
+	];
 	assert.deepEqual(
-		resolveDestroyTarget(list, ["feat/release/2.0", "release/2.0"], "/repo"),
-		{ path: "/repo.worktrees/release-2.0", branch: "release/2.0" },
+		resolveDestroyTarget(list, ["login-bug", "feat/login-bug"], "/repo"),
+		{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
 	);
 });
 
@@ -431,34 +447,61 @@ check("resolveDestroyTarget: refuses when no worktree is on the branch", () => {
 	assert.match((r as { error: string }).error, /No worktree/);
 });
 
-check("destroyCandidates: offers literal and conventional forms (O2 symmetry)", () => {
-	// bare name -> literal + conventional feat/ form
-	assert.deepEqual(destroyCandidates("login-bug", {}), ["login-bug", "feat/login-bug"]);
-	// explicit non-conventional branch -> literal only (resolveBranch would throw)
-	assert.deepEqual(destroyCandidates("release/2.0", {}), ["release/2.0"]);
-	// already conventional -> single form
-	assert.deepEqual(destroyCandidates("feat/x", {}), ["feat/x"]);
-});
+check(
+	"destroyCandidates: offers literal and conventional forms (O2 symmetry)",
+	() => {
+		// bare name -> literal + conventional feat/ form
+		assert.deepEqual(destroyCandidates("login-bug", {}), [
+			"login-bug",
+			"feat/login-bug",
+		]);
+		// explicit non-conventional branch -> literal only (resolveBranch would throw)
+		assert.deepEqual(destroyCandidates("release/2.0", {}), ["release/2.0"]);
+		// already conventional -> single form
+		assert.deepEqual(destroyCandidates("feat/x", {}), ["feat/x"]);
+	},
+);
 
-check("planCreate: refuses a --dir that lands the worktree inside the repo (O1)", () => {
-	assert.throws(() => planCreate("/repo", {}, { name: "x", dir: "." }), /inside the repos/i);
-	assert.throws(() => planCreate("/repo", {}, { name: "x", dir: ".git" }), /inside the repos/i);
-	assert.throws(
-		() => planCreate("/repo", {}, { name: "x", dir: "/repo/sub" }),
-		/inside the repos/i,
-	);
-	// sibling default and an unrelated absolute dir are allowed
-	assert.equal(planCreate("/repo", {}, { name: "x" }).worktreePath, "/repo.worktrees/feat-x");
-	assert.equal(
-		planCreate("/repo", {}, { name: "x", dir: "/tmp/wts" }).worktreePath,
-		"/tmp/wts/feat-x",
-	);
-});
+check(
+	"planCreate: refuses a --dir that lands the worktree inside the repo (O1)",
+	() => {
+		assert.throws(
+			() => planCreate("/repo", {}, { name: "x", dir: "." }),
+			/inside the repos/i,
+		);
+		assert.throws(
+			() => planCreate("/repo", {}, { name: "x", dir: ".git" }),
+			/inside the repos/i,
+		);
+		assert.throws(
+			() => planCreate("/repo", {}, { name: "x", dir: "/repo/sub" }),
+			/inside the repos/i,
+		);
+		// sibling default and an unrelated absolute dir are allowed
+		assert.equal(
+			planCreate("/repo", {}, { name: "x" }).worktreePath,
+			"/repo.worktrees/feat-x",
+		);
+		assert.equal(
+			planCreate("/repo", {}, { name: "x", dir: "/tmp/wts" }).worktreePath,
+			"/tmp/wts/feat-x",
+		);
+	},
+);
 
-check("parseCreateArgs: a value flag with no value throws, not silently drops (O4)", () => {
-	assert.throws(() => parseCreateArgs("hotfix --base"), /--base requires a value/);
-	assert.throws(() => parseCreateArgs("--dir --branch foo"), /--dir requires a value/);
-});
+check(
+	"parseCreateArgs: a value flag with no value throws, not silently drops (O4)",
+	() => {
+		assert.throws(
+			() => parseCreateArgs("hotfix --base"),
+			/--base requires a value/,
+		);
+		assert.throws(
+			() => parseCreateArgs("--dir --branch foo"),
+			/--dir requires a value/,
+		);
+	},
+);
 
 check(
 	"parseWorktreeList: extracts path + branch, handles slashes and detached",
