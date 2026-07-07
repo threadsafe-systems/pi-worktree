@@ -397,17 +397,24 @@ export function parseCreateArgs(raw: string): CreateOptions {
 		const eq = tok.indexOf("=");
 		const flag = eq >= 0 ? tok.slice(2, eq) : tok.slice(2);
 		const inlineVal = eq >= 0 ? tok.slice(eq + 1) : undefined;
-		const takeValue = (): string | undefined =>
-			inlineVal ?? (i + 1 < tokens.length ? tokens[++i] : undefined);
+		const takeValue = (name: string): string => {
+			if (inlineVal !== undefined) {
+				if (inlineVal === "") throw new Error(`--${name} requires a value.`);
+				return inlineVal;
+			}
+			const next = i + 1 < tokens.length ? tokens[i + 1] : undefined;
+			if (next === undefined || next.startsWith("--")) {
+				throw new Error(`--${name} requires a value.`);
+			}
+			i++;
+			return next;
+		};
 		if (flag === "dir") {
-			const v = takeValue();
-			if (v) opts.dir = v;
+			opts.dir = takeValue("dir");
 		} else if (flag === "branch") {
-			const v = takeValue();
-			if (v) opts.branch = v;
+			opts.branch = takeValue("branch");
 		} else if (flag === "base") {
-			const v = takeValue();
-			if (v) opts.base = v;
+			opts.base = takeValue("base");
 		}
 	}
 	if (positionals.length > 0) opts.name = positionals.join(" ");
@@ -446,9 +453,18 @@ export function planCreate(
 			`Invalid --base "${base}". Use a ref name (letters, digits, ., _, -, /, @, ~, ^) that does not start with "-".`,
 		);
 	}
+	const worktreePath = getWorktreePath(repoRoot, config, branch, opts.dir);
+	// The sibling-layout invariant (worktree lives OUTSIDE the repo) is what the
+	// detect/dispose/destroy design relies on. A `--dir` that lands the worktree
+	// inside the repo (or its .git) would break that and can corrupt git metadata.
+	if (isPathInside(worktreePath, repoRoot)) {
+		throw new Error(
+			`Refusing to create a worktree inside the repository (${worktreePath}). The worktree directory must live outside the repo (default: the sibling ${repoRoot}.worktrees).`,
+		);
+	}
 	return {
 		branch,
-		worktreePath: getWorktreePath(repoRoot, config, branch, opts.dir),
+		worktreePath,
 		base,
 	};
 }
@@ -511,24 +527,48 @@ export function parseWorktreeList(
 /** Choose the worktree to destroy for a branch from a parsed worktree list.
  *  Matches on the EXACT branch (so hyphen/slash slug collisions cannot pick the
  *  wrong checkout) and refuses the main working tree, whose removal would
- *  `rm -rf` the source repository. */
+ *  `rm -rf` the source repository. Matches on ANY of the candidate branch names
+ *  so `/worktree destroy` accepts both the literal branch and its conventional
+ *  form (create/destroy symmetry). */
 export function resolveDestroyTarget(
 	worktrees: { path: string; branch: string | null }[],
-	branch: string,
+	branches: string[],
 	repoRoot: string,
-): { path: string } | { error: string } {
-	const entry = worktrees.find((w) => w.branch === branch);
-	if (!entry) {
+): { path: string; branch: string } | { error: string } {
+	const entry = worktrees.find(
+		(w) => w.branch !== null && branches.includes(w.branch),
+	);
+	if (!entry || entry.branch === null) {
+		const names = branches.map((b) => `"${b}"`).join(" or ") || "(none)";
 		return {
-			error: `No worktree is checked out on branch "${branch}". Run /worktree list to see existing worktrees.`,
+			error: `No worktree is checked out on branch ${names}. Run /worktree list to see existing worktrees.`,
 		};
 	}
 	if (canonicalPath(entry.path) === canonicalPath(repoRoot)) {
 		return {
-			error: `Branch "${branch}" is checked out in the main working tree — refusing to destroy the main checkout.`,
+			error: `Branch "${entry.branch}" is checked out in the main working tree — refusing to destroy the main checkout.`,
 		};
 	}
-	return { path: entry.path };
+	return { path: entry.path, branch: entry.branch };
+}
+
+/** Candidate branch names to match when destroying: the literal input plus its
+ *  conventional-commit resolution (when that differs and is valid). Lets destroy
+ *  accept both `feat/foo` shorthand and an explicit `--branch` name. */
+export function destroyCandidates(
+	input: string,
+	config: WorktreeConfig,
+): string[] {
+	const t = (input ?? "").trim();
+	if (!t) return [];
+	const out = [t];
+	try {
+		const resolved = resolveBranch(t, config);
+		if (resolved !== t) out.push(resolved);
+	} catch {
+		// non-conventional explicit branch: literal is the only candidate
+	}
+	return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -917,6 +957,30 @@ export default function (pi: ExtensionAPI) {
 					});
 					ctx.ui.setStatus("worktree", `🌿 ${branch}`);
 				} else {
+					// The path exists: confirm it is really a worktree ON this branch
+					// before treating it as "existing". An explicit --branch can slug to a
+					// directory already occupied by a different branch's worktree; silently
+					// relaunching there would drop the agent on the wrong branch.
+					const listed = await pi.exec(
+						"git",
+						["worktree", "list", "--porcelain"],
+						{ cwd: repoRoot, timeout: 5_000 },
+					);
+					const here =
+						listed.code === 0
+							? parseWorktreeList(listed.stdout).find(
+									(w) =>
+										canonicalPath(w.path) === canonicalPath(worktreePath),
+								)
+							: undefined;
+					if (!here || here.branch !== branch) {
+						ctx.ui.setStatus("worktree", undefined);
+						ctx.ui.notify(
+							`${worktreePath} already exists but is ${here?.branch ? `checked out on branch "${here.branch}"` : "not a registered worktree"}, not "${branch}". Pick another name/--branch, or remove it first.`,
+							"error",
+						);
+						return;
+					}
 					ctx.ui.setStatus("worktree", `🌿 ${branch} (existing)`);
 				}
 
@@ -1227,13 +1291,14 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const repoRoot = await getRepoRoot(pi);
 			const config = loadConfig(repoRoot);
-			const branch = resolveBranch(nameArg, config);
+			// Accept both the literal branch and its conventional form so an
+			// explicit `--branch` worktree (e.g. release/2.0) is destroyable too.
+			const candidates = destroyCandidates(nameArg, config);
 
 			// Resolve the target from git's authoritative worktree list rather than
-			// reconstructing it from the branch slug. Two branches whose types differ
-			// only by a hyphen (e.g. feat/fix-foo vs feat-fix/foo, with custom types)
-			// slug to the same directory; looking up by exact branch removes that
-			// ambiguity so destroy can never act on the wrong checkout.
+			// reconstructing it from the branch slug. Looking up by exact branch
+			// removes any slug ambiguity so destroy can never act on the wrong
+			// checkout, and refuses the main working tree.
 			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
 				cwd: repoRoot,
 				timeout: 5_000,
@@ -1242,7 +1307,7 @@ export default function (pi: ExtensionAPI) {
 				listed.code === 0
 					? resolveDestroyTarget(
 							parseWorktreeList(listed.stdout),
-							branch,
+							candidates,
 							repoRoot,
 						)
 					: { error: "Could not read the git worktree list." };
@@ -1250,7 +1315,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(entry.error, "error");
 				return;
 			}
-			const worktreePath = entry.path;
+			const { path: worktreePath, branch } = entry;
 
 			// Refuse to remove the directory out from under a live session: destroy
 			// does not relaunch, so doing so would leave this pi with a dead cwd.

@@ -109,6 +109,20 @@ the session across.
     guarantees hold. Parsing (`parseCreateArgs`) and planning (`planCreate`) are
     pure and unit-tested. The digest `resume` mode from that lineage was
     deliberately NOT ported: this fork carries the full session via `pi --fork`.
+13. **Adversarial review of the overrides commit** (gpt-5.5 + glm-5.2; injection
+    surface came back clean) closed four issues:
+    - `--dir` is refused when it would place the worktree inside the repo or its
+      `.git` (`planCreate` uses `isPathInside`), preserving the sibling-layout
+      invariant.
+    - `/worktree destroy` now matches on candidate branches (`destroyCandidates`)
+      so an explicit `--branch` worktree (e.g. `release/2.0`) is destroyable,
+      not just conventional names; `resolveDestroyTarget` returns the matched
+      branch and takes a candidate list.
+    - `parseCreateArgs` throws on a value-flag with no value (or a following
+      `--flag`) instead of silently falling back to a random branch.
+    - the `--worktree` flag "existing" shortcut verifies the directory is a
+      worktree actually on the requested branch before relaunching, so a
+      slug-colliding explicit `--branch` cannot mis-attach to another branch.
 
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.
