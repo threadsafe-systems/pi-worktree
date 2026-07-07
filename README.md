@@ -1,8 +1,8 @@
-# pi-worktree
+# @threadsafe-systems/pi-worktree
 
-Git worktree management for [Pi Coding Agent](https://github.com/badlogic/pi-mono). Create isolated dev environments with one command — each with its own branch, database, dependencies, and ports.
+Git worktree management for [Pi Coding Agent](https://github.com/badlogic/pi-mono). Create isolated dev environments with one command — each with its own branch, database, dependencies, and ports — and carry your live agent session across the hop.
 
-Inspired by `claude --worktree` from Claude Code.
+A Threadsafe Systems project. It originated from [`xiaoyu2er/pi-worktree`](https://github.com/xiaoyu2er/pi-worktree) and has since been substantially rewritten; see [`PROVENANCE.md`](./PROVENANCE.md). Inspired by `claude --worktree` from Claude Code.
 
 ## Why?
 
@@ -19,11 +19,13 @@ When working on multiple features in parallel (or running multiple AI coding age
 
 ## Install
 
-```bash
-pi install pi-worktree
-```
+Not published to npm. Install from the repository — clone it and point Pi at the
+extension via `~/.pi/agent/settings.json` (an entry under `extensions` for the
+clone path), then `/reload` if Pi is already running.
 
-If Pi is already running, use `/reload` to pick up the new extension.
+```bash
+git clone https://github.com/threadsafe-systems/pi-worktree.git
+```
 
 ## Usage
 
@@ -163,9 +165,10 @@ This pattern works well for projects that derive dev server ports from the stage
 ## Update
 
 ```bash
-pi update pi-worktree
+git -C /path/to/pi-worktree pull
 ```
 
 ## License
 
-MIT
+MIT — see [`LICENSE`](./LICENSE). Copyright (c) Threadsafe Systems and the
+original pi-worktree contributors.

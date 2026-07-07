@@ -419,16 +419,19 @@ check(
 	},
 );
 
-check("resolveDestroyTarget: prefers the earlier candidate over git-list order", () => {
-	const list = [
-		{ path: "/repo.worktrees/feat-login-bug", branch: "feat/login-bug" },
-		{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
-	];
-	assert.deepEqual(
-		resolveDestroyTarget(list, ["login-bug", "feat/login-bug"], "/repo"),
-		{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
-	);
-});
+check(
+	"resolveDestroyTarget: prefers the earlier candidate over git-list order",
+	() => {
+		const list = [
+			{ path: "/repo.worktrees/feat-login-bug", branch: "feat/login-bug" },
+			{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
+		];
+		assert.deepEqual(
+			resolveDestroyTarget(list, ["login-bug", "feat/login-bug"], "/repo"),
+			{ path: "/repo.worktrees/login-bug", branch: "login-bug" },
+		);
+	},
+);
 
 check(
 	"resolveDestroyTarget: refuses the main working tree (regression guard)",

@@ -1,15 +1,21 @@
-# FORK.md — local fork of pi-worktree
+# PROVENANCE.md — Threadsafe Systems' pi-worktree
 
-This is a local fork of `pi-worktree` (based on upstream `1.3.3`), installed by
-path in `~/.pi/agent/settings.json` instead of `npm:pi-worktree`.
+`@threadsafe-systems/pi-worktree` is an independently developed git-worktree
+manager for the Pi coding agent. It **originated from**
+[`xiaoyu2er/pi-worktree`](https://github.com/xiaoyu2er/pi-worktree) (MIT, by
+package declaration) around its `1.3.3` line, and has since diverged
+substantially into its own project. Both copyrights are retained in `LICENSE`.
 
-## Why
+This document records how our version differs from that origin. Historically it
+was the fork's `FORK.md`; it is kept as a changelog of divergence.
+
+## Why it exists
 
 Upstream relaunches into a worktree with a **fresh** pi session (`cd <wt> && pi`),
-so the conversation you were having does not follow the hop. This fork carries
-the session across.
+so the conversation you were having does not follow the hop. This project carries
+the session across, and grew from there into the feature set below.
 
-## What changed (`extensions/worktree.ts`)
+## What differs (`extensions/worktree.ts`)
 
 1. **Fork the parent session on relaunch.** The relaunch command becomes
    `cd <wt> && PI_WT_HANDOFF=<b64> pi --fork <parentSessionFile>`, using
@@ -132,14 +138,14 @@ the session across.
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.
 
-## Test
+## Testing
 
 ```bash
 <loom>/node_modules/.bin/tsx test/handoff.test.ts
 ```
 
-## Caveat this does NOT solve
+## Known limitation
 
 Uncommitted work in the old checkout is not moved into the worktree; the caveat
-only warns about it. Starting work in a worktree from the outset (the discipline
-`pi-worktree-discipline` enforces) avoids the mid-edit-migration hazard entirely.
+only warns about it. Starting work in a worktree from the outset avoids the
+mid-edit-migration hazard entirely.
