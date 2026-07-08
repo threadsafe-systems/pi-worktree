@@ -1,7 +1,16 @@
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import {
+	basename,
+	dirname,
+	isAbsolute,
+	join,
+	relative,
+	resolve,
+	sep,
+} from "node:path";
+import { fileURLToPath } from "node:url";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -219,6 +228,87 @@ export function loadConfig(repoRoot: string): WorktreeConfig {
 		}
 	}
 	return {};
+}
+
+// ---------------------------------------------------------------------------
+// Worktree discipline: optional main-checkout write/edit guard
+// ---------------------------------------------------------------------------
+
+export interface WorktreeMarker {
+	enforce?: boolean;
+	allowPaths?: string[];
+}
+
+export const MARKER_REL = ".pi/worktree-discipline.json";
+export const LOCAL_MARKER_REL = ".pi/worktree-discipline.local.json";
+
+/** Read the effective discipline marker for a repo root. The local override wins. */
+export function readMarker(root: string): WorktreeMarker | null {
+	for (const rel of [LOCAL_MARKER_REL, MARKER_REL]) {
+		try {
+			return JSON.parse(
+				readFileSync(join(root, rel), "utf8"),
+			) as WorktreeMarker;
+		} catch {
+			// not present or unreadable: fall through to the next candidate
+		}
+	}
+	return null;
+}
+
+/**
+ * A linked worktree's `.git` is a FILE (a `gitdir:` pointer); the primary
+ * checkout's `.git` is a DIRECTORY. This works wherever the worktree lives on
+ * disk, so it is more robust than matching the configured worktree path.
+ */
+export function isMainCheckout(root: string): boolean {
+	try {
+		return statSync(join(root, ".git")).isDirectory();
+	} catch {
+		return false; // no .git at the root: do not gate
+	}
+}
+
+function nearestExistingDir(start: string): string | null {
+	let dir = start;
+	for (;;) {
+		try {
+			if (statSync(dir).isDirectory()) return dir;
+		} catch {
+			// keep walking up
+		}
+		const parent = dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+/** Does `relPath` sit under one of the allowPaths prefixes (repo-relative)? */
+function isAllowListed(relPath: string, allowPaths: string[]): boolean {
+	return allowPaths.some(
+		(a) => relPath === a || relPath.startsWith(a.endsWith("/") ? a : `${a}/`),
+	);
+}
+
+/**
+ * Pure discipline decision: block this tool call? No filesystem or git access;
+ * all facts are injected, so this remains trivially unit-testable.
+ */
+export function shouldBlock(opts: {
+	toolName: string;
+	mainCheckout: boolean;
+	marker: WorktreeMarker | null;
+	relPath: string;
+}): boolean {
+	const { toolName, mainCheckout, marker, relPath } = opts;
+	if (toolName !== "write" && toolName !== "edit") return false;
+	if (!marker || marker.enforce !== true) return false; // default off / not opted in
+	if (!mainCheckout) return false; // worktrees are always allowed
+	// The marker files are NOT exempt. Toggling enforcement goes through the
+	// worktree-enforce script / command (pi.exec, not the gated write/edit tools),
+	// so exempting them here would let an agent self-authorise by rewriting policy.
+	if (isAllowListed(relPath, marker.allowPaths ?? [])) return false;
+	return true;
 }
 
 /** Expand a leading `~` or `~/` to the user's home directory. */
@@ -911,6 +1001,47 @@ function relaunchInPlace(
 export default function (pi: ExtensionAPI) {
 	let worktreeBranch: string | null = null;
 
+	// --- Optional worktree-discipline guard ---
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "write" && event.toolName !== "edit") return;
+		const target = (event.input as { path?: unknown }).path;
+		if (typeof target !== "string" || target.length === 0) return;
+		const absPath = isAbsolute(target) ? target : resolve(ctx.cwd, target);
+
+		// Repo root that contains the target path. Use the nearest existing parent so
+		// writes to new subdirectories are still guarded.
+		const gitCwd = nearestExistingDir(dirname(absPath));
+		if (!gitCwd) return;
+		const res = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+			cwd: gitCwd,
+		});
+		if (res.code !== 0) return; // not a git repo: allow
+		const root = res.stdout.trim();
+		if (!root) return;
+
+		const marker = readMarker(root);
+		const relPath = relative(root, absPath);
+		if (
+			!shouldBlock({
+				toolName: event.toolName,
+				mainCheckout: isMainCheckout(root),
+				marker,
+				relPath,
+			})
+		) {
+			return;
+		}
+
+		return {
+			block: true,
+			reason:
+				`worktree-discipline: this repo enforces worktree-only edits and you are in its main checkout.\n` +
+				`Refused ${event.toolName} to ${relPath}. Create or enter a worktree first, e.g.\n` +
+				`  /worktree <name>\n` +
+				`Escape hatches: /worktree-enforce out, or add the path to allowPaths in ${MARKER_REL} from a worktree (the marker is not editable via write/edit in the enforced main checkout).`,
+		};
+	});
+
 	// --- Register --worktree flags ---
 	pi.registerFlag("worktree", {
 		description:
@@ -1066,6 +1197,22 @@ export default function (pi: ExtensionAPI) {
 		return { systemPrompt: event.systemPrompt + extra };
 	});
 
+	async function handleEnforce(
+		args: string | undefined,
+		ctx: ExtensionCommandContext,
+	) {
+		const sub = (args ?? "").trim() || "status";
+		const script = fileURLToPath(
+			new URL(
+				"../skills/worktree-enforce/scripts/worktree-enforce.sh",
+				import.meta.url,
+			),
+		);
+		const res = await pi.exec("bash", [script, sub], { cwd: ctx.cwd });
+		const out = `${res.stdout}${res.stderr ? `\n${res.stderr}` : ""}`.trim();
+		ctx.ui.notify(out || "(no output)", res.code === 0 ? "info" : "error");
+	}
+
 	// --- Commands ---
 	pi.registerCommand("worktree", {
 		description:
@@ -1090,6 +1237,9 @@ export default function (pi: ExtensionAPI) {
 				case "list":
 				case "ls":
 					return handleList(ctx);
+				case "enforce":
+				case "discipline":
+					return handleEnforce(subArg, ctx);
 				case "help":
 					ctx.ui.notify(
 						"Usage:\n" +
@@ -1098,6 +1248,7 @@ export default function (pi: ExtensionAPI) {
 							"  /worktree dispose         — Leave this worktree, remove it, reopen pi in the main repo\n" +
 							"  /worktree destroy <branch> — Destroy a worktree from the main checkout\n" +
 							"  /worktree list            — List all worktrees\n" +
+							"  /worktree enforce <cmd>   — in | out | status | doctor for worktree-only edit discipline\n" +
 							"  /worktree help            — Show this help\n" +
 							"\n" +
 							"Create overrides: --dir <path> (worktree base dir), --branch <name> " +
@@ -1106,7 +1257,7 @@ export default function (pi: ExtensionAPI) {
 							"Valid types: " +
 							CONVENTIONAL_TYPES.join(", ") +
 							" (default: feat).\n" +
-							"Shortcuts: /worktree-create, /worktree-dispose, /worktree-destroy, /worktree-list",
+							"Shortcuts: /worktree-create, /worktree-dispose, /worktree-destroy, /worktree-list, /worktree-enforce",
 						"info",
 					);
 					return;
@@ -1118,6 +1269,12 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// Shortcut commands
+	pi.registerCommand("worktree-enforce", {
+		description:
+			"Worktree discipline: in | out | status | doctor (manages .pi/worktree-discipline.json)",
+		handler: async (args, ctx) => handleEnforce(args, ctx),
+	});
+
 	pi.registerCommand("worktree-create", {
 		description: "Create a new git worktree (shortcut for /worktree create)",
 		handler: async (args, ctx) => handleCreate(args?.trim() || "", ctx),

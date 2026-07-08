@@ -1,7 +1,7 @@
 {
   "name": "@threadsafe-systems/pi-worktree",
   "version": "1.0.0",
-  "description": "Git worktree management for Pi: sibling worktree layout (<repoRoot>.worktrees/<branch-slug>), conventional-commit branch names, full-session /worktree dispose, and session-forking relaunch so the conversation follows every hop with a one-turn orientation caveat.",
+  "description": "Git worktree management for Pi: sibling worktree layout, conventional-commit branch names, session-forking relaunch, full-session /worktree dispose, and optional worktree-discipline guards for main-checkout write/edit tools.",
   "license": "MIT",
   "author": "Threadsafe Systems",
   "repository": {
@@ -19,6 +19,8 @@
     "pi-package",
     "git",
     "worktree",
+    "discipline",
+    "guardrail",
     "cmux",
     "tmux"
   ],

@@ -19,13 +19,16 @@ When working on multiple features in parallel (or running multiple AI coding age
 
 ## Install
 
-Not published to npm. Install from the repository — clone it and point Pi at the
-extension via `~/.pi/agent/settings.json` (an entry under `extensions` for the
-clone path), then `/reload` if Pi is already running.
+Not published to npm. Install it as a git-backed Pi package so `pi update --extensions`
+can pull updates:
 
 ```bash
-git clone https://github.com/threadsafe-systems/pi-worktree.git
+pi install git:github.com/threadsafe-systems/pi-worktree
 ```
+
+Then `/reload` if Pi is already running. This package includes both worktree
+management and the optional worktree-discipline guard; if you previously
+installed `pi-worktree-discipline`, remove it to avoid duplicate commands.
 
 ## Usage
 
@@ -50,6 +53,10 @@ pi --worktree my-feature --worktree-base develop
 /worktree dispose            # leave + remove this worktree, reopen Pi in the main repo
 /worktree destroy fix/login-bug
 /worktree list
+
+# Optional: enforce worktree-only write/edit operations for this repo
+/worktree enforce in
+/worktree enforce status
 ```
 
 **Create overrides** (both `/worktree ...` and the `--worktree-*` CLI flags):
@@ -97,6 +104,31 @@ Create `.pi/worktree.json` in your repo root (commit it so all contributors shar
 Branches follow conventional commits: `<type>/<identifier>`, e.g.
 `feat/use-conventional-commits`. Valid types: `feat`, `fix`, `chore`, `docs`,
 `refactor`, `test`, `perf`, `build`, `ci`, `style`, `revert`.
+
+## Optional worktree discipline
+
+`pi-worktree` can also guard opted-in repos against accidental edits in the main
+checkout. When `.pi/worktree-discipline.json` contains `{ "enforce": true }`,
+the extension refuses Pi's structured `write` and `edit` tools in the primary
+checkout. Linked worktrees are always allowed.
+
+```bash
+/worktree enforce in       # write and stage .pi/worktree-discipline.json
+/worktree enforce status   # show effective policy and checkout type
+/worktree enforce doctor   # also verify pi-worktree is wired into Pi settings
+/worktree enforce out      # local override if the policy is committed, else remove it
+```
+
+The legacy alias `/worktree-enforce in|out|status|doctor` is also registered.
+The marker supports `allowPaths`, for example:
+
+```json
+{ "enforce": true, "allowPaths": ["docs/", "CHANGELOG.md"] }
+```
+
+This is a guardrail, not a sandbox: shell commands (`bash`, redirects, `sed -i`)
+are not blocked. Commit `.pi/worktree-discipline.json` to share the policy; the
+local override `.pi/worktree-discipline.local.json` is gitignored by the helper.
 
 ## How it works
 
