@@ -57,15 +57,25 @@ Or, inside a pi session with the extension loaded, use either slash command:
 
 When a repo is opted in and you are in its **main** checkout, the extension
 refuses the `write` and `edit` tools with a message telling you to work from a
-worktree. Linked worktrees are always allowed. Paths under `allowPaths` stay
+worktree. It also injects a short per-turn prompt note in the main checkout with
+the resolved default worktree location (`<repoRoot>.worktrees/<branch-slug>` by
+default) and the preferred commands: `/worktree <type/name>` to create and
+relaunch, or `/worktree enter <type/name>` to re-camp into an existing linked
+worktree. For autonomous/headless agent turns, the model-callable
+`worktree_session` tool can create/enter a linked worktree, return the exact path
+to target, and dispose it after the agent commits. Linked worktrees are always allowed. Paths under `allowPaths` stay
 editable in the main checkout. The marker files are **not** exempt from the gate:
 toggle enforcement with `/worktree-enforce` or the script (which write the marker
 via the shell, not the gated `write`/`edit` tools), so an agent cannot
 self-authorise by rewriting the policy through the write tool.
 
 `bash` is **not** gated. A determined `sed -i` or shell redirect can still write
-in the main checkout. This is a guardrail against accidental main-checkout edits,
-not a sandbox. The Claude Code equivalent has the same Write/Edit-only limit.
+in the main checkout, and manually running `git worktree add` does not move the
+active Pi session into that checkout. The guard also refuses writes under the
+configured worktree base until that path is inside a real linked worktree, so an
+agent cannot accidentally pre-create the directory that `git worktree add` needs.
+This is a guardrail against accidental main-checkout edits, not a sandbox. The
+Claude Code equivalent has the same Write/Edit-only limit.
 
 ## Notes
 

@@ -40,10 +40,18 @@
     ]
   },
   "scripts": {
-    "lint": "npx tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/decision.test.ts && tsx test/handoff.test.ts",
+    "check": "npm run typecheck && npm test",
+    "lint": "npm run typecheck"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

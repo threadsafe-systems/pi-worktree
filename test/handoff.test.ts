@@ -22,7 +22,11 @@ import {
 	planCreate,
 	resolveBranch,
 	resolveDestroyTarget,
+	resolveEnterTarget,
 	type WtHandoff,
+	worktreeDisciplineBlockReason,
+	worktreeDisciplinePrompt,
+	worktreeLocationHint,
 } from "../extensions/worktree.ts";
 
 let fail = 0;
@@ -138,6 +142,46 @@ check("getWorktreeDir: explicit dir resolves relative to repo root", () => {
 		getWorktreeDir("/home/x/repo", { dir: ".wt" }),
 		"/home/x/repo/.wt",
 	);
+});
+
+check("worktreeLocationHint: shows the configured base plus branch-slug placeholder", () => {
+	assert.equal(
+		worktreeLocationHint("/home/x/repo", {}),
+		"/home/x/repo.worktrees/<branch-slug>",
+	);
+});
+
+check("worktreeDisciplinePrompt: explains location and session migration", () => {
+	const p = worktreeDisciplinePrompt("/repo", {});
+	assert.match(p, /Default worktree location: \/repo\.worktrees\/<branch-slug>/);
+	assert.match(p, /\/worktree <type\/name>/);
+	assert.match(p, /\/worktree enter <type\/name>/);
+	assert.match(p, /does not move this pi session/);
+});
+
+check("worktreeDisciplineBlockReason: includes computed location and re-camp command", () => {
+	const r = worktreeDisciplineBlockReason({
+		toolName: "write",
+		relPath: "src/x.ts",
+		repoRoot: "/repo",
+		config: {},
+	});
+	assert.match(r, /Refused write to src\/x\.ts/);
+	assert.match(r, /Default location: \/repo\.worktrees\/<branch-slug>/);
+	assert.match(r, /\/worktree enter <type\/name>/);
+	assert.match(r, /restart pi from that worktree/);
+	assert.match(r, /Do not write files directly under the worktree base/);
+});
+
+check("worktreeDisciplineBlockReason: includes optional detail", () => {
+	const r = worktreeDisciplineBlockReason({
+		toolName: "write",
+		relPath: "../repo.worktrees/feat-x/file.txt",
+		repoRoot: "/repo",
+		config: {},
+		detail: "The target is under the configured worktree base.",
+	});
+	assert.match(r, /The target is under the configured worktree base\./);
 });
 
 check("branchToDirName: slashes collapse to hyphens", () => {
@@ -448,6 +492,31 @@ check("resolveDestroyTarget: refuses when no worktree is on the branch", () => {
 	const r = resolveDestroyTarget(list, ["feat/nope"], "/repo");
 	assert.ok("error" in r);
 	assert.match((r as { error: string }).error, /No worktree/);
+});
+
+check("resolveEnterTarget: picks an existing linked worktree", () => {
+	const list = [
+		{ path: "/repo", branch: "main" },
+		{ path: "/repo.worktrees/feat-x", branch: "feat/x" },
+	];
+	assert.deepEqual(resolveEnterTarget(list, ["feat/x"], "/repo"), {
+		path: "/repo.worktrees/feat-x",
+		branch: "feat/x",
+	});
+});
+
+check("resolveEnterTarget: refuses the main working tree", () => {
+	const list = [{ path: "/repo", branch: "main" }];
+	const r = resolveEnterTarget(list, ["main"], "/repo");
+	assert.ok("error" in r);
+	assert.match((r as { error: string }).error, /main working tree/);
+});
+
+check("resolveEnterTarget: reports missing linked worktree", () => {
+	const list = [{ path: "/repo", branch: "main" }];
+	const r = resolveEnterTarget(list, ["feat/nope"], "/repo");
+	assert.ok("error" in r);
+	assert.match((r as { error: string }).error, /No linked worktree/);
 });
 
 check(

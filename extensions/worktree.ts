@@ -16,6 +16,7 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 // ---------------------------------------------------------------------------
 // Name generator (adjective-noun)
@@ -438,6 +439,55 @@ export function getWorktreePath(
 	);
 }
 
+/** Human-facing default location hint for created worktrees. The branch part is
+ *  deliberately a placeholder because exact branch resolution depends on the
+ *  requested name and optional --branch override. */
+export function worktreeLocationHint(
+	repoRoot: string,
+	config: WorktreeConfig,
+): string {
+	return join(getWorktreeDir(repoRoot, config), "<branch-slug>");
+}
+
+/** System-prompt note injected only when a repo opted in and the current
+ *  session is still in the primary checkout. This keeps worktree discipline a
+ *  per-repo/private choice without requiring AGENTS.md or global prompt text. */
+export function worktreeDisciplinePrompt(
+	repoRoot: string,
+	config: WorktreeConfig,
+): string {
+	const location = worktreeLocationHint(repoRoot, config);
+	return (
+		`## Worktree Discipline\n` +
+		`This repo enforces worktree-only edits in its main checkout. The write/edit tools will be refused here until the session is in a linked git worktree.\n` +
+		`Default worktree location: ${location}\n` +
+		`Use \`/worktree <type/name>\` to create a worktree and relaunch pi there in one step. If a worktree already exists, use \`/worktree enter <type/name>\` to re-camp this session into it.\n` +
+		`Manually running \`git worktree add\` creates a checkout but does not move this pi session; tools will still resolve relative paths from the main checkout until pi is relaunched in the worktree.`
+	);
+}
+
+/** Reactive block reason for write/edit attempts in an enforced main checkout. */
+export function worktreeDisciplineBlockReason(opts: {
+	toolName: string;
+	relPath: string;
+	repoRoot: string;
+	config: WorktreeConfig;
+	detail?: string;
+}): string {
+	const location = worktreeLocationHint(opts.repoRoot, opts.config);
+	return (
+		`worktree-discipline: this repo enforces worktree-only edits and you are in its main checkout.\n` +
+		`Refused ${opts.toolName} to ${opts.relPath}. Create or enter a worktree first.\n` +
+		(opts.detail ? `${opts.detail}\n` : "") +
+		`Preferred: /worktree <type/name>  (creates and relaunches pi there)\n` +
+		`Existing checkout: /worktree enter <type/name>  (re-camps this session into it)\n` +
+		`Default location: ${location}\n` +
+		`Manual fallback: git worktree add ${location} -b <branch-name>, then restart pi from that worktree. Running git worktree add alone does not move this session.\n` +
+		`Do not write files directly under the worktree base before git has created the linked worktree; that pre-creates the directory and makes git worktree add fail.\n` +
+		`Escape hatches: /worktree-enforce out, or add the path to allowPaths in ${MARKER_REL} from a worktree (the marker is not editable via write/edit in the enforced main checkout).`
+	);
+}
+
 /** A git-ref-safe, shell-safe explicit branch name (for `--branch`). Allows
  *  slashes and mixed case but forbids shell metacharacters and the git ref
  *  patterns git itself rejects. */
@@ -641,6 +691,29 @@ export function resolveDestroyTarget(
 	if (canonicalPath(entry.path) === canonicalPath(repoRoot)) {
 		return {
 			error: `Branch "${entry.branch}" is checked out in the main working tree — refusing to destroy the main checkout.`,
+		};
+	}
+	return { path: entry.path, branch: entry.branch };
+}
+
+/** Choose an existing linked worktree to enter/re-camp into for a branch. */
+export function resolveEnterTarget(
+	worktrees: { path: string; branch: string | null }[],
+	branches: string[],
+	repoRoot: string,
+): { path: string; branch: string } | { error: string } {
+	const entry = branches
+		.map((b) => worktrees.find((w) => w.branch === b))
+		.find((w): w is { path: string; branch: string } => w !== undefined);
+	if (!entry || entry.branch === null) {
+		const names = branches.map((b) => `"${b}"`).join(" or ") || "(none)";
+		return {
+			error: `No linked worktree is checked out on branch ${names}. Run /worktree list to see existing worktrees, or /worktree <type/name> to create one.`,
+		};
+	}
+	if (canonicalPath(entry.path) === canonicalPath(repoRoot)) {
+		return {
+			error: `Branch "${entry.branch}" is checked out in the main working tree. Create a linked worktree first with /worktree <type/name>.`,
 		};
 	}
 	return { path: entry.path, branch: entry.branch };
@@ -1000,6 +1073,46 @@ function relaunchInPlace(
 
 export default function (pi: ExtensionAPI) {
 	let worktreeBranch: string | null = null;
+	let agentWorktree: { repoRoot: string; branch: string; path: string } | null =
+		null;
+
+	// --- Model-callable worktree session helper ---
+	pi.registerTool({
+		name: "worktree_session",
+		label: "Worktree Session",
+		description:
+			"Create, enter, inspect, or dispose git worktrees using this repo's pi-worktree conventions.",
+		promptSnippet:
+			"Manage git worktree discipline: create/enter a linked worktree, then dispose it after committing.",
+		promptGuidelines: [
+			"Use worktree_session when a repo enforces worktree discipline and you need to write/edit from the main checkout.",
+			"After worktree_session create/enter returns a worktreePath, target write/edit tools at absolute paths inside that worktree and prefix bash commands with `cd <worktreePath> &&`.",
+			"Call worktree_session dispose after committing when the task asks you to step back out to the main git directory; it refuses to remove a dirty worktree.",
+		],
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("status"),
+				Type.Literal("create"),
+				Type.Literal("enter"),
+				Type.Literal("dispose"),
+			]),
+			name: Type.Optional(
+				Type.String({
+					description:
+						"Conventional worktree name such as feat/my-feature or my-feature.",
+				}),
+			),
+			branch: Type.Optional(
+				Type.String({ description: "Exact branch name, bypassing name resolution." }),
+			),
+			base: Type.Optional(
+				Type.String({ description: "Base ref for create. Defaults to HEAD." }),
+			),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			return handleWorktreeSessionTool(params, ctx);
+		},
+	});
 
 	// --- Optional worktree-discipline guard ---
 	pi.on("tool_call", async (event, ctx) => {
@@ -1015,7 +1128,37 @@ export default function (pi: ExtensionAPI) {
 		const res = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
 			cwd: gitCwd,
 		});
-		if (res.code !== 0) return; // not a git repo: allow
+		if (res.code !== 0) {
+			// The target is outside any existing git repo. If the current session is in
+			// an enforced main checkout and the target sits under that repo's configured
+			// worktree base, block the write: pre-creating files there turns the future
+			// `git worktree add` target into an occupied directory.
+			const session = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+				cwd: ctx.cwd,
+			});
+			const sessionRoot = session.code === 0 ? session.stdout.trim() : "";
+			const sessionMarker = sessionRoot ? readMarker(sessionRoot) : null;
+			const sessionConfig = sessionRoot ? loadConfig(sessionRoot) : {};
+			if (
+				sessionRoot &&
+				sessionMarker?.enforce === true &&
+				isMainCheckout(sessionRoot) &&
+				isPathInside(absPath, getWorktreeDir(sessionRoot, sessionConfig))
+			) {
+				return {
+					block: true,
+					reason: worktreeDisciplineBlockReason({
+						toolName: event.toolName,
+						relPath: relative(sessionRoot, absPath),
+						repoRoot: sessionRoot,
+						config: sessionConfig,
+						detail:
+							"The target is under the configured worktree base, but it is not inside an existing linked git worktree yet.",
+					}),
+				};
+			}
+			return; // not a git repo and not the configured worktree base: allow
+		}
 		const root = res.stdout.trim();
 		if (!root) return;
 
@@ -1034,11 +1177,12 @@ export default function (pi: ExtensionAPI) {
 
 		return {
 			block: true,
-			reason:
-				`worktree-discipline: this repo enforces worktree-only edits and you are in its main checkout.\n` +
-				`Refused ${event.toolName} to ${relPath}. Create or enter a worktree first, e.g.\n` +
-				`  /worktree <name>\n` +
-				`Escape hatches: /worktree-enforce out, or add the path to allowPaths in ${MARKER_REL} from a worktree (the marker is not editable via write/edit in the enforced main checkout).`,
+			reason: worktreeDisciplineBlockReason({
+				toolName: event.toolName,
+				relPath,
+				repoRoot: root,
+				config: loadConfig(root),
+			}),
 		};
 	});
 
@@ -1183,6 +1327,22 @@ export default function (pi: ExtensionAPI) {
 				`The current directory is the worktree root. All tools resolve paths relative to it.\n` +
 				`Branch: ${worktreeBranch}\n` +
 				`Commit your work to this branch when done.`;
+		} else {
+			// If this repo has opted in while we are still in the main checkout, tell
+			// the agent before it attempts a blocked write. This is intentionally
+			// dynamic per repo/session rather than shared AGENTS.md prompt text.
+			const currentRoot = await pi.exec(
+				"git",
+				["rev-parse", "--path-format=absolute", "--show-toplevel"],
+				{ timeout: 5_000 },
+			);
+			if (currentRoot.code === 0) {
+				const root = currentRoot.stdout.trim();
+				const marker = root ? readMarker(root) : null;
+				if (root && marker?.enforce === true && isMainCheckout(root)) {
+					extra += `\n\n${worktreeDisciplinePrompt(root, loadConfig(root))}`;
+				}
+			}
 		}
 		// One-turn orientation when this session was forked across a worktree hop.
 		const handoffEnv = process.env.PI_WT_HANDOFF;
@@ -1213,10 +1373,161 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(out || "(no output)", res.code === 0 ? "info" : "error");
 	}
 
+	async function handleWorktreeSessionTool(
+		params: {
+			action: "status" | "create" | "enter" | "dispose";
+			name?: string;
+			branch?: string;
+			base?: string;
+		},
+		ctx: ExtensionContext,
+	) {
+		const repoRoot = await getRepoRoot(pi);
+		const config = loadConfig(repoRoot);
+		const text = (message: string) => ({
+			content: [{ type: "text" as const, text: message }],
+			details: {},
+		});
+		const resolveRequestedBranches = (): string[] => {
+			if (params.branch) {
+				const branch = params.branch.trim();
+				if (!isValidExplicitBranch(branch)) {
+					throw new Error(
+						`Invalid branch "${branch}". Use a git-ref-safe name (letters, digits, ., _, -, /); no shell metacharacters, "..", "//", or trailing "/"/".lock".`,
+					);
+				}
+				return [branch];
+			}
+			return destroyCandidates(params.name ?? "", config);
+		};
+
+		if (params.action === "status") {
+			const marker = readMarker(repoRoot);
+			const detected = await detectWorktree(pi);
+			return text(
+				`repoRoot: ${repoRoot}\n` +
+					`discipline: ${marker?.enforce === true ? "on" : "off"}\n` +
+					`defaultWorktreeBase: ${getWorktreeDir(repoRoot, config)}\n` +
+					`processWorktree: ${detected ? `${detected.branch} at ${detected.worktreePath}` : "main checkout"}\n` +
+					`selectedWorktree: ${agentWorktree ? `${agentWorktree.branch} at ${agentWorktree.path}` : "none"}`,
+			);
+		}
+
+		if (params.action === "create") {
+			const plan = planCreate(repoRoot, config, {
+				name: params.name ?? "",
+				branch: params.branch,
+				base: params.base,
+			});
+			if (existsSync(plan.worktreePath)) {
+				const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+					cwd: repoRoot,
+					timeout: 5_000,
+				});
+				const here =
+					listed.code === 0
+						? parseWorktreeList(listed.stdout).find(
+								(w) => canonicalPath(w.path) === canonicalPath(plan.worktreePath),
+							)
+						: undefined;
+				if (!here || here.branch !== plan.branch) {
+					throw new Error(
+						`${plan.worktreePath} already exists but is ${here?.branch ? `checked out on branch "${here.branch}"` : "not a registered worktree"}, not "${plan.branch}".`,
+					);
+				}
+			} else {
+				await createWorktree(pi, ctx, repoRoot, config, plan);
+			}
+			agentWorktree = {
+				repoRoot,
+				branch: plan.branch,
+				path: plan.worktreePath,
+			};
+			return text(
+				`Worktree ready.\n` +
+					`branch: ${plan.branch}\n` +
+					`worktreePath: ${plan.worktreePath}\n` +
+					`Next: write/edit absolute paths under worktreePath and run bash commands as: cd ${plan.worktreePath} && <command>. Commit there before dispose.`,
+			);
+		}
+
+		if (params.action === "enter") {
+			const branches = resolveRequestedBranches();
+			if (branches.length === 0) throw new Error("enter requires name or branch");
+			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+				cwd: repoRoot,
+				timeout: 5_000,
+			});
+			const entry =
+				listed.code === 0
+					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					: { error: "Could not read the git worktree list." };
+			if ("error" in entry) throw new Error(entry.error);
+			agentWorktree = { repoRoot, branch: entry.branch, path: entry.path };
+			return text(
+				`Selected existing worktree.\n` +
+					`branch: ${entry.branch}\n` +
+					`worktreePath: ${entry.path}\n` +
+					`Next: write/edit absolute paths under worktreePath and run bash commands as: cd ${entry.path} && <command>.`,
+			);
+		}
+
+		const target = params.name || params.branch ? null : agentWorktree;
+		let entry: { path: string; branch: string };
+		if (target) {
+			entry = { path: target.path, branch: target.branch };
+		} else {
+			const branches = resolveRequestedBranches();
+			if (branches.length === 0) {
+				throw new Error(
+					"dispose requires an active selected worktree, name, or branch",
+				);
+			}
+			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+				cwd: repoRoot,
+				timeout: 5_000,
+			});
+			const resolved =
+				listed.code === 0
+					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					: { error: "Could not read the git worktree list." };
+			if ("error" in resolved) throw new Error(resolved.error);
+			entry = resolved;
+		}
+
+		const dirty = await pi.exec("git", ["status", "--porcelain"], {
+			cwd: entry.path,
+			timeout: 5_000,
+		});
+		if (dirty.code !== 0) throw new Error("Could not read worktree status");
+		if (dirty.stdout.trim()) {
+			throw new Error(
+				`Refusing to dispose dirty worktree ${entry.path}. Commit or discard changes first.`,
+			);
+		}
+		await pi.exec(
+			"bash",
+			["-c", buildDisposeScript(repoRoot, entry.path, entry.branch, config.preRemove)],
+			{ timeout: 130_000 },
+		);
+		if (agentWorktree?.path === entry.path) agentWorktree = null;
+		const branchRef = await pi.exec(
+			"git",
+			["show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`],
+			{ cwd: repoRoot, timeout: 5_000 },
+		);
+		return text(
+			`Disposed worktree and returned to main git directory.\n` +
+				`removedPath: ${entry.path}\n` +
+				`branch: ${entry.branch} (${branchRef.code === 0 ? "kept" : "deleted"})\n` +
+				`repoRoot: ${repoRoot}`,
+		);
+	}
+
 	// --- Commands ---
 	pi.registerCommand("worktree", {
 		description:
-			"Git worktree management. Usage: /worktree [type/name] [--dir <path>] [--branch <name>] [--base <ref>], /worktree create [type/name], /worktree dispose, /worktree destroy <branch>, /worktree list. When creating on the user's behalf, infer a conventional-commit type (feat/fix/chore/docs/refactor/...) from the conversation; it defaults to feat.",
+			"Git worktree management. Usage: /worktree [type/name] [--dir <path>] [--branch <name>] [--base <ref>], /worktree create [type/name], /worktree enter <type/name>, /worktree dispose, /worktree destroy <branch>, /worktree list. When creating on the user's behalf, infer a conventional-commit type (feat/fix/chore/docs/refactor/...) from the conversation; it defaults to feat.",
 		handler: async (args, ctx) => {
 			const parts = (args ?? "").trim().split(/\s+/);
 			const sub = parts[0] || "";
@@ -1226,6 +1537,10 @@ export default function (pi: ExtensionAPI) {
 				case "create":
 				case "new":
 					return handleCreate(subArg, ctx);
+				case "enter":
+				case "resume":
+				case "camp":
+					return handleEnter(subArg, ctx);
 				case "dispose":
 				case "back":
 				case "pop":
@@ -1245,6 +1560,7 @@ export default function (pi: ExtensionAPI) {
 						"Usage:\n" +
 							"  /worktree [type/name]     — Create a worktree (auto-generates name if omitted)\n" +
 							"  /worktree create [type/name] — Same as above\n" +
+							"  /worktree enter <type/name> — Reopen pi inside an existing linked worktree\n" +
 							"  /worktree dispose         — Leave this worktree, remove it, reopen pi in the main repo\n" +
 							"  /worktree destroy <branch> — Destroy a worktree from the main checkout\n" +
 							"  /worktree list            — List all worktrees\n" +
@@ -1257,7 +1573,7 @@ export default function (pi: ExtensionAPI) {
 							"Valid types: " +
 							CONVENTIONAL_TYPES.join(", ") +
 							" (default: feat).\n" +
-							"Shortcuts: /worktree-create, /worktree-dispose, /worktree-destroy, /worktree-list, /worktree-enforce",
+							"Shortcuts: /worktree-create, /worktree-enter, /worktree-dispose, /worktree-destroy, /worktree-list, /worktree-enforce",
 						"info",
 					);
 					return;
@@ -1280,6 +1596,12 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => handleCreate(args?.trim() || "", ctx),
 	});
 
+	pi.registerCommand("worktree-enter", {
+		description:
+			"Enter an existing linked git worktree, reopening pi there (shortcut for /worktree enter)",
+		handler: async (args, ctx) => handleEnter(args?.trim() || "", ctx),
+	});
+
 	pi.registerCommand("worktree-dispose", {
 		description:
 			"Leave and remove the current worktree, reopening pi in the main repo (shortcut for /worktree dispose)",
@@ -1296,6 +1618,82 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => handleList(ctx),
 	});
 
+	// --- Enter handler (re-camp into an existing linked worktree) ---
+	async function handleEnter(nameArg: string, ctx: ExtensionCommandContext) {
+		if (!nameArg) {
+			ctx.ui.notify("Usage: /worktree enter <type/name>", "error");
+			return;
+		}
+
+		try {
+			const repoRoot = await getRepoRoot(pi);
+			const config = loadConfig(repoRoot);
+			const opts = parseCreateArgs(nameArg ?? "");
+			let branches: string[];
+			if (opts.branch) {
+				const branch = opts.branch.trim();
+				if (!isValidExplicitBranch(branch)) {
+					throw new Error(
+						`Invalid --branch "${branch}". Use a git-ref-safe name (letters, digits, ., _, -, /); no shell metacharacters, "..", "//", or trailing "/"/".lock".`,
+					);
+				}
+				branches = [branch];
+			} else {
+				branches = destroyCandidates(opts.name ?? "", config);
+			}
+			if (branches.length === 0) {
+				ctx.ui.notify("Usage: /worktree enter <type/name>", "error");
+				return;
+			}
+
+			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+				cwd: repoRoot,
+				timeout: 5_000,
+			});
+			const entry =
+				listed.code === 0
+					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					: { error: "Could not read the git worktree list." };
+			if ("error" in entry) {
+				ctx.ui.notify(entry.error, "error");
+				return;
+			}
+
+			const detected = await detectWorktree(pi);
+			if (detected && resolve(detected.worktreePath) === resolve(entry.path)) {
+				worktreeBranch = entry.branch;
+				pi.setSessionName(`wt:${entry.branch}`);
+				ctx.ui.setStatus("worktree", `🌿 ${entry.branch}`);
+				ctx.ui.notify(
+					`Already inside worktree "${entry.branch}" at ${entry.path}`,
+					"info",
+				);
+				return;
+			}
+
+			const sessionFile = currentSessionFile(ctx);
+			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
+			const relaunched = relaunchInPlace(entry.path, sessionFile, handoffB64);
+			if (!relaunched) {
+				ctx.ui.notify(
+					`✅ Worktree "${entry.branch}" found.\n` +
+						`   Path:   ${entry.path}\n` +
+						`   Branch: ${entry.branch}\n` +
+						`   Start PI: cd ${entry.path} && pi`,
+					"info",
+				);
+				return;
+			}
+			ctx.shutdown();
+		} catch (err) {
+			ctx.ui.setStatus("worktree", undefined);
+			ctx.ui.notify(
+				`Failed to enter worktree: ${(err as Error).message}`,
+				"error",
+			);
+		}
+	}
+
 	// --- Create handler ---
 	async function handleCreate(nameArg: string, ctx: ExtensionCommandContext) {
 		try {
@@ -1311,7 +1709,7 @@ export default function (pi: ExtensionAPI) {
 			// clobbering a real branch or discarding an existing checkout.
 			if (existsSync(worktreePath)) {
 				ctx.ui.notify(
-					`Worktree "${branch}" already exists at ${worktreePath}. Use /worktree destroy ${branch} first, or pick another name.`,
+					`Worktree "${branch}" already exists at ${worktreePath}. Use /worktree enter ${branch} to re-camp this session there, /worktree destroy ${branch} first, or pick another name.`,
 					"error",
 				);
 				return;
