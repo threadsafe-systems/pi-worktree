@@ -23,7 +23,10 @@ import {
 	resolveBranch,
 	resolveDestroyTarget,
 	resolveEnterTarget,
+	shouldBlockWorktreeBaseWrite,
+	summarizeWorktreeStatus,
 	type WtHandoff,
+	unsafeDisposeReason,
 	worktreeDisciplineBlockReason,
 	worktreeDisciplinePrompt,
 	worktreeLocationHint,
@@ -182,6 +185,89 @@ check("worktreeDisciplineBlockReason: includes optional detail", () => {
 		detail: "The target is under the configured worktree base.",
 	});
 	assert.match(r, /The target is under the configured worktree base\./);
+});
+
+check("shouldBlockWorktreeBaseWrite: blocks missing or unrelated target repos under base", () => {
+	assert.equal(
+		shouldBlockWorktreeBaseWrite({
+			absPath: "/repo.worktrees/feat-x/file.txt",
+			worktreeBase: "/repo.worktrees",
+		}),
+		true,
+	);
+	// Nested/outer repo case: rev-parse found /repo.worktrees' parent, not a
+	// linked worktree root under the base.
+	assert.equal(
+		shouldBlockWorktreeBaseWrite({
+			absPath: "/repo.worktrees/feat-x/file.txt",
+			worktreeBase: "/repo.worktrees",
+			targetRoot: "/",
+			targetMainCheckout: true,
+		}),
+		true,
+	);
+});
+
+check("shouldBlockWorktreeBaseWrite: allows an existing linked worktree under base", () => {
+	assert.equal(
+		shouldBlockWorktreeBaseWrite({
+			absPath: "/repo.worktrees/feat-x/file.txt",
+			worktreeBase: "/repo.worktrees",
+			targetRoot: "/repo.worktrees/feat-x",
+			targetMainCheckout: false,
+		}),
+		false,
+	);
+	assert.equal(
+		shouldBlockWorktreeBaseWrite({
+			absPath: "/tmp/elsewhere/file.txt",
+			worktreeBase: "/repo.worktrees",
+		}),
+		false,
+	);
+});
+
+check("summarizeWorktreeStatus: counts uncommitted and ignored porcelain lines", () => {
+	assert.deepEqual(summarizeWorktreeStatus(" M src/x.ts\n?? y\n!! .env.local\n"), {
+		uncommitted: 2,
+		ignored: 1,
+	});
+});
+
+check("unsafeDisposeReason: refuses live cwd, session file, uncommitted and ignored files", () => {
+	assert.match(
+		unsafeDisposeReason({
+			cwd: "/repo.worktrees/feat-x/sub",
+			worktreePath: "/repo.worktrees/feat-x",
+			porcelainWithIgnored: "",
+		}) ?? "",
+		/running inside/,
+	);
+	assert.match(
+		unsafeDisposeReason({
+			cwd: "/repo",
+			sessionFile: "/repo.worktrees/feat-x/.pi/session.jsonl",
+			worktreePath: "/repo.worktrees/feat-x",
+			porcelainWithIgnored: "",
+		}) ?? "",
+		/session file/,
+	);
+	assert.match(
+		unsafeDisposeReason({
+			cwd: "/repo",
+			worktreePath: "/repo.worktrees/feat-x",
+			porcelainWithIgnored: " M x\n!! .env.local\n",
+		}) ?? "",
+		/uncommitted\/untracked file\(s\).*ignored file\(s\)/,
+	);
+	assert.equal(
+		unsafeDisposeReason({
+			cwd: "/repo",
+			worktreePath: "/repo.worktrees/feat-x",
+			porcelainWithIgnored: "",
+		}),
+		null,
+	);
 });
 
 check("branchToDirName: slashes collapse to hyphens", () => {

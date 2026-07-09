@@ -488,6 +488,60 @@ export function worktreeDisciplineBlockReason(opts: {
 	);
 }
 
+/** Writes under a configured worktree base are safe only after git has created
+ *  an actual linked worktree there. This catches both the no-repo case and the
+ *  nested-outer-repo case where rev-parse succeeds against an unrelated repo. */
+export function shouldBlockWorktreeBaseWrite(opts: {
+	absPath: string;
+	worktreeBase: string;
+	targetRoot?: string;
+	targetMainCheckout?: boolean;
+}): boolean {
+	if (!isPathInside(opts.absPath, opts.worktreeBase)) return false;
+	if (!opts.targetRoot) return true;
+	return !(
+		isPathInside(opts.targetRoot, opts.worktreeBase) &&
+		isPathInside(opts.absPath, opts.targetRoot) &&
+		opts.targetMainCheckout === false
+	);
+}
+
+export function summarizeWorktreeStatus(
+	porcelainWithIgnored: string,
+): { uncommitted: number; ignored: number } {
+	let uncommitted = 0;
+	let ignored = 0;
+	for (const line of porcelainWithIgnored.split("\n")) {
+		if (!line.trim()) continue;
+		if (line.startsWith("!!")) ignored++;
+		else uncommitted++;
+	}
+	return { uncommitted, ignored };
+}
+
+export function unsafeDisposeReason(opts: {
+	cwd: string;
+	sessionFile?: string;
+	worktreePath: string;
+	porcelainWithIgnored: string;
+}): string | null {
+	if (isPathInside(opts.cwd, opts.worktreePath)) {
+		return `Refusing to dispose ${opts.worktreePath} because the current pi session is running inside that worktree.`;
+	}
+	if (opts.sessionFile && isPathInside(opts.sessionFile, opts.worktreePath)) {
+		return `Refusing to dispose ${opts.worktreePath} because the session file (${opts.sessionFile}) is inside that worktree.`;
+	}
+	const { uncommitted, ignored } = summarizeWorktreeStatus(
+		opts.porcelainWithIgnored,
+	);
+	const dirty: string[] = [];
+	if (uncommitted > 0) dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
+	if (ignored > 0) dirty.push(`${ignored} ignored file(s)`);
+	return dirty.length
+		? `Refusing to dispose dirty worktree ${opts.worktreePath}: ${dirty.join(" and ")}. Commit, remove, or move those files first.`
+		: null;
+}
+
 /** A git-ref-safe, shell-safe explicit branch name (for `--branch`). Allows
  *  slashes and mixed case but forbids shell metacharacters and the git ref
  *  patterns git itself rejects. */
@@ -918,14 +972,15 @@ export function buildCreateScript(
  *  relaunch. Returns undefined when there is no session to fork. */
 async function buildHandoff(
 	pi: ExtensionAPI,
-	repoRoot: string,
+	sourceCwd: string,
 	sessionFile: string | undefined,
+	parentCwd = sourceCwd,
 ): Promise<string | undefined> {
 	if (!sessionFile) return undefined;
 	let parentBranch = "";
 	try {
 		const b = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-			cwd: repoRoot,
+			cwd: sourceCwd,
 			timeout: 5_000,
 		});
 		if (b.code === 0) parentBranch = b.stdout.trim();
@@ -935,7 +990,7 @@ async function buildHandoff(
 	let uncommitted = 0;
 	try {
 		const st = await pi.exec("git", ["status", "--porcelain"], {
-			cwd: repoRoot,
+			cwd: sourceCwd,
 			timeout: 5_000,
 		});
 		if (st.code === 0) {
@@ -947,7 +1002,7 @@ async function buildHandoff(
 		// best-effort
 	}
 	return encodeHandoff({
-		parentCwd: process.cwd(),
+		parentCwd,
 		parentBranch,
 		uncommitted,
 		kind: "enter",
@@ -1121,6 +1176,20 @@ export default function (pi: ExtensionAPI) {
 		if (typeof target !== "string" || target.length === 0) return;
 		const absPath = isAbsolute(target) ? target : resolve(ctx.cwd, target);
 
+		const session = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+			cwd: ctx.cwd,
+		});
+		const sessionRoot = session.code === 0 ? session.stdout.trim() : "";
+		const sessionMarker = sessionRoot ? readMarker(sessionRoot) : null;
+		const sessionConfig = sessionRoot ? loadConfig(sessionRoot) : {};
+		const sessionWorktreeBase = sessionRoot
+			? getWorktreeDir(sessionRoot, sessionConfig)
+			: "";
+		const enforcedMainSession =
+			sessionRoot &&
+			sessionMarker?.enforce === true &&
+			isMainCheckout(sessionRoot);
+
 		// Repo root that contains the target path. Use the nearest existing parent so
 		// writes to new subdirectories are still guarded.
 		const gitCwd = nearestExistingDir(dirname(absPath));
@@ -1128,38 +1197,29 @@ export default function (pi: ExtensionAPI) {
 		const res = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
 			cwd: gitCwd,
 		});
-		if (res.code !== 0) {
-			// The target is outside any existing git repo. If the current session is in
-			// an enforced main checkout and the target sits under that repo's configured
-			// worktree base, block the write: pre-creating files there turns the future
-			// `git worktree add` target into an occupied directory.
-			const session = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
-				cwd: ctx.cwd,
-			});
-			const sessionRoot = session.code === 0 ? session.stdout.trim() : "";
-			const sessionMarker = sessionRoot ? readMarker(sessionRoot) : null;
-			const sessionConfig = sessionRoot ? loadConfig(sessionRoot) : {};
-			if (
-				sessionRoot &&
-				sessionMarker?.enforce === true &&
-				isMainCheckout(sessionRoot) &&
-				isPathInside(absPath, getWorktreeDir(sessionRoot, sessionConfig))
-			) {
-				return {
-					block: true,
-					reason: worktreeDisciplineBlockReason({
-						toolName: event.toolName,
-						relPath: relative(sessionRoot, absPath),
-						repoRoot: sessionRoot,
-						config: sessionConfig,
-						detail:
-							"The target is under the configured worktree base, but it is not inside an existing linked git worktree yet.",
-					}),
-				};
-			}
-			return; // not a git repo and not the configured worktree base: allow
+		const root = res.code === 0 ? res.stdout.trim() : "";
+		if (
+			enforcedMainSession &&
+			shouldBlockWorktreeBaseWrite({
+				absPath,
+				worktreeBase: sessionWorktreeBase,
+				targetRoot: root || undefined,
+				targetMainCheckout: root ? isMainCheckout(root) : undefined,
+			})
+		) {
+			return {
+				block: true,
+				reason: worktreeDisciplineBlockReason({
+					toolName: event.toolName,
+					relPath: relative(sessionRoot, absPath),
+					repoRoot: sessionRoot,
+					config: sessionConfig,
+					detail:
+						"The target is under the configured worktree base, but it is not inside an existing linked git worktree yet.",
+				}),
+			};
 		}
-		const root = res.stdout.trim();
+		if (res.code !== 0) return; // not a git repo and not the configured worktree base: allow
 		if (!root) return;
 
 		const marker = readMarker(root);
@@ -1495,21 +1555,33 @@ export default function (pi: ExtensionAPI) {
 			entry = resolved;
 		}
 
-		const dirty = await pi.exec("git", ["status", "--porcelain"], {
+		const dirty = await pi.exec("git", ["status", "--porcelain", "--ignored"], {
 			cwd: entry.path,
 			timeout: 5_000,
 		});
 		if (dirty.code !== 0) throw new Error("Could not read worktree status");
-		if (dirty.stdout.trim()) {
-			throw new Error(
-				`Refusing to dispose dirty worktree ${entry.path}. Commit or discard changes first.`,
-			);
-		}
-		await pi.exec(
+		const unsafeReason = unsafeDisposeReason({
+			cwd: ctx.cwd,
+			sessionFile: currentSessionFile(ctx),
+			worktreePath: entry.path,
+			porcelainWithIgnored: dirty.stdout,
+		});
+		if (unsafeReason) throw new Error(unsafeReason);
+		const dispose = await pi.exec(
 			"bash",
 			["-c", buildDisposeScript(repoRoot, entry.path, entry.branch, config.preRemove)],
 			{ timeout: 130_000 },
 		);
+		if (dispose.code !== 0) {
+			throw new Error(
+				`Failed to dispose worktree ${entry.path}: ${(dispose.stderr || dispose.stdout || "unknown error").trim()}`,
+			);
+		}
+		if (existsSync(entry.path)) {
+			throw new Error(
+				`Failed to dispose worktree ${entry.path}: path still exists after teardown.`,
+			);
+		}
 		if (agentWorktree?.path === entry.path) agentWorktree = null;
 		const branchRef = await pi.exec(
 			"git",
@@ -1672,7 +1744,14 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const sessionFile = currentSessionFile(ctx);
-			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
+			const current = await detectWorktree(pi);
+			const handoffSource = current?.worktreePath ?? ctx.cwd;
+			const handoffB64 = await buildHandoff(
+				pi,
+				handoffSource,
+				sessionFile,
+				handoffSource,
+			);
 			const relaunched = relaunchInPlace(entry.path, sessionFile, handoffB64);
 			if (!relaunched) {
 				ctx.ui.notify(
