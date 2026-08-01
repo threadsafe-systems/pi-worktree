@@ -506,9 +506,10 @@ export function shouldBlockWorktreeBaseWrite(opts: {
 	);
 }
 
-export function summarizeWorktreeStatus(
-	porcelainWithIgnored: string,
-): { uncommitted: number; ignored: number } {
+export function summarizeWorktreeStatus(porcelainWithIgnored: string): {
+	uncommitted: number;
+	ignored: number;
+} {
 	let uncommitted = 0;
 	let ignored = 0;
 	for (const line of porcelainWithIgnored.split("\n")) {
@@ -535,7 +536,8 @@ export function unsafeDisposeReason(opts: {
 		opts.porcelainWithIgnored,
 	);
 	const dirty: string[] = [];
-	if (uncommitted > 0) dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
+	if (uncommitted > 0)
+		dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
 	if (ignored > 0) dirty.push(`${ignored} ignored file(s)`);
 	return dirty.length
 		? `Refusing to dispose dirty worktree ${opts.worktreePath}: ${dirty.join(" and ")}. Commit, remove, or move those files first.`
@@ -882,15 +884,44 @@ export function handoffCaveat(
 
 /** Build the shell command typed into the pane to relaunch pi in a directory.
  *  Optionally forks the parent session (to carry history) and passes a base64
- *  handoff payload via PI_WT_HANDOFF for the new session to decode. */
+ *  handoff payload via PI_WT_HANDOFF for the new session to decode.
+ *
+ *  `continuation` is passed as pi's positional initial message. A forked
+ *  session otherwise loads history and waits at the editor, so this is the
+ *  only thing that makes an interrupted task resume without a human nudge. */
 export function buildRelaunchCommand(
 	targetDir: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
+	continuation?: string,
 ): string {
 	const envPrefix = handoffB64 ? `PI_WT_HANDOFF=${shQuote(handoffB64)} ` : "";
 	const forkArg = forkSessionFile ? ` --fork ${shQuote(forkSessionFile)}` : "";
-	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}`;
+	const msgArg = continuation?.trim() ? ` ${shQuote(continuation.trim())}` : "";
+	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}${msgArg}`;
+}
+
+/** Initial message for a session that hopped while the agent was mid-task.
+ *
+ *  `ctx.shutdown()` aborts the turn in flight, so the carried history can end
+ *  on an unanswered tool call or a side effect whose result was never seen.
+ *  The message therefore tells the agent to re-establish state before acting:
+ *  a bare "continue" invites it to redo work that already succeeded. */
+export function buildContinuationMessage(
+	kind: WtHandoff["kind"],
+	targetCwd: string,
+): string {
+	const where =
+		kind === "dispose"
+			? `back to the main checkout at ${targetCwd}, and the worktree you were in has been removed`
+			: `into the worktree at ${targetCwd}`;
+	return (
+		`[automatic] Your session was moved ${where}. The turn you were running ` +
+		`was interrupted by that hop, so work may be half-finished.\n\n` +
+		`Re-establish where you actually got to before doing anything: check ` +
+		`git status and the files you were editing. Do not redo steps that ` +
+		`already completed. Then carry on with the task you were working on.`
+	);
 }
 
 /** Shared worktree-teardown script builder (used by dispose and destroy). All
@@ -1017,39 +1048,91 @@ function currentSessionFile(ctx: unknown): string | undefined {
 	)?.sessionManager?.getSessionFile?.();
 }
 
+/** Environment facts for multiplexer detection, injected for testability. */
+export interface MuxEnv {
+	CMUX_SURFACE_ID?: string;
+	HERDR_PANE_ID?: string;
+	HERDR_WORKSPACE_ID?: string;
+	TMUX?: string;
+	TMUX_PANE?: string;
+}
+
+/** Where a re-camped session should land: a new tab at `targetCwd`, named
+ *  after the branch being camped on. */
+export interface RecampTarget {
+	targetCwd: string;
+	tabLabel: string;
+}
+
+/** Pick the terminal multiplexer that owns the current pane, if any.
+ *
+ *  Precedence: cmux, then herdr, then tmux. cmux and herdr both set a
+ *  per-surface/per-pane id on the processes they spawn, so their presence is
+ *  definitive for THIS process. TMUX is checked last because it can leak into
+ *  herdr panes (e.g. when the herdr server was started from inside a tmux
+ *  session); typing into that stale outer pane would land the relaunch
+ *  command somewhere unrelated. */
+export function pickRelaunchMux(
+	env: MuxEnv,
+):
+	| { kind: "cmux"; target: string }
+	| { kind: "herdr"; target: string; workspaceId: string }
+	| { kind: "tmux"; target: string }
+	| null {
+	if (env.CMUX_SURFACE_ID) return { kind: "cmux", target: env.CMUX_SURFACE_ID };
+	if (env.HERDR_PANE_ID)
+		return {
+			kind: "herdr",
+			target: env.HERDR_PANE_ID,
+			workspaceId: env.HERDR_WORKSPACE_ID ?? "",
+		};
+	if (env.TMUX) return { kind: "tmux", target: env.TMUX_PANE ?? "" };
+	return null;
+}
+
 /**
  * Schedule a pi relaunch in the current terminal pane by injecting a command
- * via cmux or tmux once this pi process has exited.
+ * via cmux, herdr, or tmux once this pi process has exited.
  *
  * Reliability notes (these were all bugs in the original implementation):
  *  - We wait for THIS pi process to actually exit before sending keys, instead
  *    of a blind `sleep 0.3` that raced pi's TUI teardown. Keys sent while pi
  *    still owns the pane in raw mode are swallowed.
- *  - We target the originating pane explicitly ($TMUX_PANE / surface id) so the
- *    keys cannot land in some other active pane.
- *  - We send the command text with `send-keys -l` (literal) and then a SEPARATE
- *    `Enter` key, instead of relying on a trailing "\n" character.
+ *  - We target the originating pane explicitly ($TMUX_PANE / $HERDR_PANE_ID /
+ *    surface id) so the keys cannot land in some other active pane.
+ *  - We send the command text literally (`send-keys -l` / `pane send-text`)
+ *    and then a SEPARATE `Enter` key, instead of relying on a trailing "\n"
+ *    character.
  *  - Dynamic values are passed as positional args to `bash -c`, never
  *    interpolated into the script body, so paths with spaces/quotes are safe.
  *  - An optional preScript runs (from the detached waiter, after pi exits and
  *    before the keys are sent) to perform teardown such as removing a worktree.
+ *
+ * Under herdr with a `recamp` target, the session moves to a NEW TAB in the
+ * same workspace, labelled with the branch, and the originating pane is closed
+ * (herdr collapses the tab when that was its last pane, so a split-out pane the
+ * user owns is left alone). The wait-for-exit is still required even though a
+ * new tab could be spawned eagerly: `pi --fork` snapshots the session file as
+ * of its last flush, so forking before the origin has exited would truncate the
+ * carried history.
  *
  * Returns true if a relaunch was scheduled, false if not in a known multiplexer.
  */
 function scheduleRelaunch(opts: {
 	typedCmd: string;
 	preScript?: string;
+	recamp?: RecampTarget;
 }): boolean {
 	const parentPid = String(process.pid);
 	const pre = opts.preScript ?? "";
 
-	const surfaceId = process.env.CMUX_SURFACE_ID;
-	const inTmux = !!process.env.TMUX;
+	const mux = pickRelaunchMux(process.env);
+	if (!mux) return false;
 
 	let script: string;
-	let args: string[];
+	let dynamic: string[];
 
-	if (surfaceId) {
+	if (mux.kind === "cmux") {
 		// cmux: wait for pi to exit, run teardown, then type the command.
 		script = `
       parent="$1"; surface="$2"; cmd="$3"; pre="$4"
@@ -1059,19 +1142,48 @@ function scheduleRelaunch(opts: {
       cmux send --surface "$surface" -- "$cmd"
       cmux send --surface "$surface" -- $'\\r'
     `;
-		args = [
-			"-c",
-			script,
-			"pi-worktree-relaunch",
-			parentPid,
-			surfaceId,
+		dynamic = [mux.target, opts.typedCmd, pre];
+	} else if (mux.kind === "herdr" && opts.recamp) {
+		// herdr: re-camp into a new tab in the same workspace, named after the
+		// branch. If tab creation fails we fall back to typing into the
+		// originating pane rather than stranding a session that has already exited.
+		script = `
+      parent="$1"; ws="$2"; target="$3"; label="$4"; origin="$5"; cmd="$6"; pre="$7"
+      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
+      sleep 0.15
+      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      created=$(herdr tab create --workspace "$ws" --cwd "$target" --label "$label" --focus 2>/dev/null)
+      pane=$(printf '%s' "$created" | sed -n 's/.*"pane_id":"\\([^"]*\\)".*/\\1/p' | head -1)
+      if [ -n "$pane" ]; then
+        herdr pane run "$pane" "$cmd"
+        herdr pane close "$origin" >/dev/null 2>&1
+      else
+        herdr pane send-text "$origin" "$cmd"
+        herdr pane send-keys "$origin" enter
+      fi
+    `;
+		dynamic = [
+			mux.workspaceId,
+			opts.recamp.targetCwd,
+			opts.recamp.tabLabel,
+			mux.target,
 			opts.typedCmd,
 			pre,
 		];
-	} else if (inTmux) {
+	} else if (mux.kind === "herdr") {
+		// herdr without a re-camp target: type into the originating pane.
+		script = `
+      parent="$1"; target="$2"; cmd="$3"; pre="$4"
+      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
+      sleep 0.15
+      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      herdr pane send-text "$target" "$cmd"
+      herdr pane send-keys "$target" enter
+    `;
+		dynamic = [mux.target, opts.typedCmd, pre];
+	} else {
 		// tmux: target the originating pane when known; -l types literally; a
 		// separate Enter submits.
-		const target = process.env.TMUX_PANE ?? "";
 		script = `
       parent="$1"; target="$2"; cmd="$3"; pre="$4"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
@@ -1085,18 +1197,10 @@ function scheduleRelaunch(opts: {
         tmux send-keys Enter
       fi
     `;
-		args = [
-			"-c",
-			script,
-			"pi-worktree-relaunch",
-			parentPid,
-			target,
-			opts.typedCmd,
-			pre,
-		];
-	} else {
-		return false;
+		dynamic = [mux.target, opts.typedCmd, pre];
 	}
+
+	const args = ["-c", script, "pi-worktree-relaunch", parentPid, ...dynamic];
 
 	// Detached + unref so the waiter outlives pi's shutdown.
 	const child = spawn("bash", args, {
@@ -1108,18 +1212,40 @@ function scheduleRelaunch(opts: {
 	return true;
 }
 
-/** Relaunch pi in a worktree, forking the parent session and passing a handoff. */
+/** Continuation message for a hop, or undefined when the agent was idle.
+ *
+ *  Gating on `isIdle()` matters: hopping from an idle prompt (the usual
+ *  `/worktree feat/x` case) must NOT submit a message, or the new session
+ *  opens by burning a turn asking what task it is supposed to resume. */
+function continuationFor(
+	ctx: ExtensionContext,
+	kind: WtHandoff["kind"],
+	targetCwd: string,
+): string | undefined {
+	return ctx.isIdle()
+		? undefined
+		: buildContinuationMessage(kind, targetCwd);
+}
+
+/** Relaunch pi in a worktree, forking the parent session and passing a handoff.
+ *  Under herdr this re-camps into a new tab named after `branch`. */
 function relaunchInPlace(
 	worktreePath: string,
+	branch: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
+	continuation?: string,
 ): boolean {
 	const typedCmd = buildRelaunchCommand(
 		worktreePath,
 		forkSessionFile,
 		handoffB64,
+		continuation,
 	);
-	return scheduleRelaunch({ typedCmd });
+	return scheduleRelaunch({
+		typedCmd,
+		recamp: { targetCwd: worktreePath, tabLabel: branch },
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,7 +1284,9 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			branch: Type.Optional(
-				Type.String({ description: "Exact branch name, bypassing name resolution." }),
+				Type.String({
+					description: "Exact branch name, bypassing name resolution.",
+				}),
 			),
 			base: Type.Optional(
 				Type.String({ description: "Base ref for create. Defaults to HEAD." }),
@@ -1338,8 +1466,10 @@ export default function (pi: ExtensionAPI) {
 					const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
 					const relaunched = relaunchInPlace(
 						worktreePath,
+						branch,
 						sessionFile,
 						handoffB64,
+						continuationFor(ctx, "enter", worktreePath),
 					);
 					if (!relaunched) {
 						ctx.ui.notify(
@@ -1480,14 +1610,19 @@ export default function (pi: ExtensionAPI) {
 				base: params.base,
 			});
 			if (existsSync(plan.worktreePath)) {
-				const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
-					cwd: repoRoot,
-					timeout: 5_000,
-				});
+				const listed = await pi.exec(
+					"git",
+					["worktree", "list", "--porcelain"],
+					{
+						cwd: repoRoot,
+						timeout: 5_000,
+					},
+				);
 				const here =
 					listed.code === 0
 						? parseWorktreeList(listed.stdout).find(
-								(w) => canonicalPath(w.path) === canonicalPath(plan.worktreePath),
+								(w) =>
+									canonicalPath(w.path) === canonicalPath(plan.worktreePath),
 							)
 						: undefined;
 				if (!here || here.branch !== plan.branch) {
@@ -1513,14 +1648,19 @@ export default function (pi: ExtensionAPI) {
 
 		if (params.action === "enter") {
 			const branches = resolveRequestedBranches();
-			if (branches.length === 0) throw new Error("enter requires name or branch");
+			if (branches.length === 0)
+				throw new Error("enter requires name or branch");
 			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
 				cwd: repoRoot,
 				timeout: 5_000,
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) throw new Error(entry.error);
 			agentWorktree = { repoRoot, branch: entry.branch, path: entry.path };
@@ -1549,7 +1689,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const resolved =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in resolved) throw new Error(resolved.error);
 			entry = resolved;
@@ -1569,7 +1713,15 @@ export default function (pi: ExtensionAPI) {
 		if (unsafeReason) throw new Error(unsafeReason);
 		const dispose = await pi.exec(
 			"bash",
-			["-c", buildDisposeScript(repoRoot, entry.path, entry.branch, config.preRemove)],
+			[
+				"-c",
+				buildDisposeScript(
+					repoRoot,
+					entry.path,
+					entry.branch,
+					config.preRemove,
+				),
+			],
 			{ timeout: 130_000 },
 		);
 		if (dispose.code !== 0) {
@@ -1724,7 +1876,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) {
 				ctx.ui.notify(entry.error, "error");
@@ -1752,7 +1908,13 @@ export default function (pi: ExtensionAPI) {
 				sessionFile,
 				handoffSource,
 			);
-			const relaunched = relaunchInPlace(entry.path, sessionFile, handoffB64);
+			const relaunched = relaunchInPlace(
+				entry.path,
+				entry.branch,
+				sessionFile,
+				handoffB64,
+				continuationFor(ctx, "enter", entry.path),
+			);
 			if (!relaunched) {
 				ctx.ui.notify(
 					`✅ Worktree "${entry.branch}" found.\n` +
@@ -1803,7 +1965,13 @@ export default function (pi: ExtensionAPI) {
 			// Fork the parent session so history follows the hop, plus a handoff note.
 			const sessionFile = currentSessionFile(ctx);
 			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
-			const relaunched = relaunchInPlace(worktreePath, sessionFile, handoffB64);
+			const relaunched = relaunchInPlace(
+				worktreePath,
+				branch,
+				sessionFile,
+				handoffB64,
+				continuationFor(ctx, "enter", worktreePath),
+			);
 			if (!relaunched) {
 				ctx.ui.notify(
 					`✅ Worktree "${branch}" ready\n` +
@@ -1890,17 +2058,39 @@ export default function (pi: ExtensionAPI) {
 				ignored,
 				kind: "dispose",
 			});
-			const typedCmd = buildRelaunchCommand(repoRoot, sessionFile, handoffB64);
+			const typedCmd = buildRelaunchCommand(
+				repoRoot,
+				sessionFile,
+				handoffB64,
+				continuationFor(ctx, "dispose", repoRoot),
+			);
 			const preScript = buildDisposeScript(
 				repoRoot,
 				worktreePath,
 				branch,
 				config.preRemove,
 			);
-			const scheduled = scheduleRelaunch({ typedCmd, preScript });
+			// Dispose lands back in the main checkout, so the new tab is named
+			// after the branch checked out THERE, not the worktree being removed.
+			const destBranch = await pi.exec(
+				"git",
+				["rev-parse", "--abbrev-ref", "HEAD"],
+				{ cwd: repoRoot, timeout: 5_000 },
+			);
+			const scheduled = scheduleRelaunch({
+				typedCmd,
+				preScript,
+				recamp: {
+					targetCwd: repoRoot,
+					tabLabel:
+						destBranch.code === 0 && destBranch.stdout.trim()
+							? destBranch.stdout.trim()
+							: basename(repoRoot),
+				},
+			});
 			if (!scheduled) {
 				ctx.ui.notify(
-					`No tmux/cmux detected — cannot carry the session automatically.\n` +
+					`No cmux/herdr/tmux detected — cannot carry the session automatically.\n` +
 						`Do it manually:\n` +
 						`  cd ${repoRoot} && pi${sessionFile ? ` --fork ${sessionFile}` : ""}\n` +
 						`  /worktree destroy ${branch}`,
