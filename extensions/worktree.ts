@@ -506,9 +506,10 @@ export function shouldBlockWorktreeBaseWrite(opts: {
 	);
 }
 
-export function summarizeWorktreeStatus(
-	porcelainWithIgnored: string,
-): { uncommitted: number; ignored: number } {
+export function summarizeWorktreeStatus(porcelainWithIgnored: string): {
+	uncommitted: number;
+	ignored: number;
+} {
 	let uncommitted = 0;
 	let ignored = 0;
 	for (const line of porcelainWithIgnored.split("\n")) {
@@ -535,7 +536,8 @@ export function unsafeDisposeReason(opts: {
 		opts.porcelainWithIgnored,
 	);
 	const dirty: string[] = [];
-	if (uncommitted > 0) dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
+	if (uncommitted > 0)
+		dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
 	if (ignored > 0) dirty.push(`${ignored} ignored file(s)`);
 	return dirty.length
 		? `Refusing to dispose dirty worktree ${opts.worktreePath}: ${dirty.join(" and ")}. Commit, remove, or move those files first.`
@@ -1158,7 +1160,9 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			branch: Type.Optional(
-				Type.String({ description: "Exact branch name, bypassing name resolution." }),
+				Type.String({
+					description: "Exact branch name, bypassing name resolution.",
+				}),
 			),
 			base: Type.Optional(
 				Type.String({ description: "Base ref for create. Defaults to HEAD." }),
@@ -1480,14 +1484,19 @@ export default function (pi: ExtensionAPI) {
 				base: params.base,
 			});
 			if (existsSync(plan.worktreePath)) {
-				const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
-					cwd: repoRoot,
-					timeout: 5_000,
-				});
+				const listed = await pi.exec(
+					"git",
+					["worktree", "list", "--porcelain"],
+					{
+						cwd: repoRoot,
+						timeout: 5_000,
+					},
+				);
 				const here =
 					listed.code === 0
 						? parseWorktreeList(listed.stdout).find(
-								(w) => canonicalPath(w.path) === canonicalPath(plan.worktreePath),
+								(w) =>
+									canonicalPath(w.path) === canonicalPath(plan.worktreePath),
 							)
 						: undefined;
 				if (!here || here.branch !== plan.branch) {
@@ -1513,14 +1522,19 @@ export default function (pi: ExtensionAPI) {
 
 		if (params.action === "enter") {
 			const branches = resolveRequestedBranches();
-			if (branches.length === 0) throw new Error("enter requires name or branch");
+			if (branches.length === 0)
+				throw new Error("enter requires name or branch");
 			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
 				cwd: repoRoot,
 				timeout: 5_000,
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) throw new Error(entry.error);
 			agentWorktree = { repoRoot, branch: entry.branch, path: entry.path };
@@ -1549,7 +1563,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const resolved =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in resolved) throw new Error(resolved.error);
 			entry = resolved;
@@ -1569,7 +1587,15 @@ export default function (pi: ExtensionAPI) {
 		if (unsafeReason) throw new Error(unsafeReason);
 		const dispose = await pi.exec(
 			"bash",
-			["-c", buildDisposeScript(repoRoot, entry.path, entry.branch, config.preRemove)],
+			[
+				"-c",
+				buildDisposeScript(
+					repoRoot,
+					entry.path,
+					entry.branch,
+					config.preRemove,
+				),
+			],
 			{ timeout: 130_000 },
 		);
 		if (dispose.code !== 0) {
@@ -1724,7 +1750,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) {
 				ctx.ui.notify(entry.error, "error");
