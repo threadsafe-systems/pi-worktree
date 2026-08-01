@@ -241,6 +241,26 @@ Formatting and linting are pinned via [biome](https://biomejs.dev) in
 reformat commit is listed in `.git-blame-ignore-revs`; enable it locally with
 `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
 
+### Branch protection
+
+`main` is protected, because a ref-less install tracks it — anything landing
+there reaches those users on their next `pi update`. The rules:
+
+| Rule                                      | Setting                |
+| ----------------------------------------- | ---------------------- |
+| Required checks                           | `check (node 20 \| 24)` |
+| Branches up to date before merge (strict) | yes                    |
+| Pull request required                     | yes, 0 approvals       |
+| Conversation resolution required          | yes                    |
+| Force push / delete                       | no                     |
+| Applies to admins                         | yes                    |
+
+Zero approvals because a sole maintainer cannot approve their own pull
+request; the gate here is CI, not a second pair of eyes. Admins are included
+deliberately — an admin exemption silently lets a direct push through and the
+protection stops meaning anything. To land an emergency fix, turn the rule off
+explicitly rather than relying on a standing bypass.
+
 ### Releasing
 
 Releases are cut by [semantic-release](https://semantic-release.gitbook.io) from
