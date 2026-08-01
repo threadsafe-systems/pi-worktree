@@ -5,3 +5,6 @@
 
 # style: format codebase with biome
 433118ec4e0bb17db2afc309bf44c81f903ef938
+
+# style: format files missed by the biome adoption merge
+50760104b9fbfbfe14d539e4515ebd61eb83824c

@@ -1,5 +1,8 @@
 # @threadsafe-systems/pi-worktree
 
+[![CI](https://github.com/threadsafe-systems/pi-worktree/actions/workflows/ci.yml/badge.svg)](https://github.com/threadsafe-systems/pi-worktree/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/threadsafe-systems/pi-worktree)](https://github.com/threadsafe-systems/pi-worktree/releases)
+
 Git worktree management for [Pi Coding Agent](https://github.com/badlogic/pi-mono). Create isolated dev environments with one command — each with its own branch, database, dependencies, and ports — and carry your live agent session across the hop.
 
 A Threadsafe Systems project. It originated from [`xiaoyu2er/pi-worktree`](https://github.com/xiaoyu2er/pi-worktree) and has since been substantially rewritten; see [`PROVENANCE.md`](./PROVENANCE.md). Inspired by `claude --worktree` from Claude Code.
@@ -23,8 +26,18 @@ Not published to npm. Install it as a git-backed Pi package so `pi update --exte
 can pull updates:
 
 ```bash
+# Track the default branch
 pi install git:github.com/threadsafe-systems/pi-worktree
+
+# Or pin a published release (recommended)
+pi install git:github.com/threadsafe-systems/pi-worktree@v1.0.0
 ```
+
+Pi treats a package ref as a pin: `pi update --extensions` reconciles your clone
+to the configured ref but never moves it to a newer one. To take a new release,
+re-run `pi install` with the new tag. Releases and their notes are on the
+[releases page](https://github.com/threadsafe-systems/pi-worktree/releases), and
+[`CHANGELOG.md`](./CHANGELOG.md) carries the same history in-repo.
 
 Then `/reload` if Pi is already running. This package includes both worktree
 management and the optional worktree-discipline guard; if you previously
@@ -223,10 +236,40 @@ Formatting and linting are pinned via [biome](https://biomejs.dev) in
 reformat commit is listed in `.git-blame-ignore-revs`; enable it locally with
 `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
 
-## Update
+### Releasing
+
+Releases are cut by [semantic-release](https://semantic-release.gitbook.io) from
+CI (`.github/workflows/ci.yml`, config in `.releaserc.json`). Every push to
+`main` that passes `npm run check` is analysed, and if it contains a releasable
+commit, CI tags it, updates `CHANGELOG.md` and the `package.json` version, and
+publishes a GitHub Release. Nothing is published to npm.
+
+Version bumps are derived from commit messages, so
+[Conventional Commits](https://www.conventionalcommits.org) are mandatory:
+
+| Commit                           | Bump  |
+| -------------------------------- | ----- |
+| `fix: ...`                       | patch |
+| `feat: ...`                      | minor |
+| `BREAKING CHANGE:` body footer   | major |
+| `chore:`, `docs:`, `ci:`, ...    | none  |
+
+Signal a breaking change with the `BREAKING CHANGE:` footer, never the `feat!:`
+shorthand — the default angular preset does not parse `!`, so a `feat!:` squash
+silently produces no release instead of a major bump.
+
+Dry-run the decision locally before merging:
 
 ```bash
-git -C /path/to/pi-worktree pull
+GITHUB_TOKEN=$(gh auth token) npx semantic-release --dry-run --no-ci
+```
+
+## Update
+
+Pin the release you want and let Pi reconcile the clone:
+
+```bash
+pi install git:github.com/threadsafe-systems/pi-worktree@v1.2.3
 ```
 
 ## License
