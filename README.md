@@ -73,7 +73,7 @@ Worktrees are created in a **sibling** directory next to the repo
 For example `feat/my-feature` lives at `../my-repo.worktrees/feat-my-feature`.
 Because it sits outside the repo tree, there is nothing to add to `.gitignore`.
 
-When cmux or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Without a multiplexer, it prints the path for manual `cd && pi`. If a worktree already exists because it was created manually or by another session, use `/worktree enter <type/name>` to relaunch Pi inside that existing linked checkout.
+When cmux, [herdr](https://herdr.dev), or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Without a multiplexer, it prints the path for manual `cd && pi`. If a worktree already exists because it was created manually or by another session, use `/worktree enter <type/name>` to relaunch Pi inside that existing linked checkout.
 
 ## Project configuration
 
@@ -164,7 +164,7 @@ with `cd <worktreePath> &&` until it calls `worktree_session` `dispose`.
 2. `git worktree remove --force <repoRoot>.worktrees/feat-my-feature`
 3. `git branch -D feat/my-feature`
 
-**Relaunch strategy:** Pi's tools (bash, read, edit, etc.) bind to the working directory at startup via closure — there is no way to change it mid-session. When a worktree is created from the main repo, Pi shuts down and injects `cd <worktree> && pi` into the terminal via `cmux send` or `tmux send-keys`, so Pi restarts with the correct cwd.
+**Relaunch strategy:** Pi's tools (bash, read, edit, etc.) bind to the working directory at startup via closure — there is no way to change it mid-session. When a worktree is created from the main repo, Pi shuts down and injects `cd <worktree> && pi` into the terminal via `cmux send`, `herdr pane send-text`, or `tmux send-keys`, so Pi restarts with the correct cwd. Detection prefers cmux, then herdr, then tmux — cmux and herdr stamp a per-pane id on the processes they spawn, whereas `$TMUX` can leak into herdr panes from an outer session.
 
 ## Examples
 

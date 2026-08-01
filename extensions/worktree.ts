@@ -1017,18 +1017,44 @@ function currentSessionFile(ctx: unknown): string | undefined {
 	)?.sessionManager?.getSessionFile?.();
 }
 
+/** Environment facts for multiplexer detection, injected for testability. */
+export interface MuxEnv {
+	CMUX_SURFACE_ID?: string;
+	HERDR_PANE_ID?: string;
+	TMUX?: string;
+	TMUX_PANE?: string;
+}
+
+/** Pick the terminal multiplexer that owns the current pane, if any.
+ *
+ *  Precedence: cmux, then herdr, then tmux. cmux and herdr both set a
+ *  per-surface/per-pane id on the processes they spawn, so their presence is
+ *  definitive for THIS process. TMUX is checked last because it can leak into
+ *  herdr panes (e.g. when the herdr server was started from inside a tmux
+ *  session); typing into that stale outer pane would land the relaunch
+ *  command somewhere unrelated. */
+export function pickRelaunchMux(
+	env: MuxEnv,
+): { kind: "cmux" | "herdr" | "tmux"; target: string } | null {
+	if (env.CMUX_SURFACE_ID) return { kind: "cmux", target: env.CMUX_SURFACE_ID };
+	if (env.HERDR_PANE_ID) return { kind: "herdr", target: env.HERDR_PANE_ID };
+	if (env.TMUX) return { kind: "tmux", target: env.TMUX_PANE ?? "" };
+	return null;
+}
+
 /**
  * Schedule a pi relaunch in the current terminal pane by injecting a command
- * via cmux or tmux once this pi process has exited.
+ * via cmux, herdr, or tmux once this pi process has exited.
  *
  * Reliability notes (these were all bugs in the original implementation):
  *  - We wait for THIS pi process to actually exit before sending keys, instead
  *    of a blind `sleep 0.3` that raced pi's TUI teardown. Keys sent while pi
  *    still owns the pane in raw mode are swallowed.
- *  - We target the originating pane explicitly ($TMUX_PANE / surface id) so the
- *    keys cannot land in some other active pane.
- *  - We send the command text with `send-keys -l` (literal) and then a SEPARATE
- *    `Enter` key, instead of relying on a trailing "\n" character.
+ *  - We target the originating pane explicitly ($TMUX_PANE / $HERDR_PANE_ID /
+ *    surface id) so the keys cannot land in some other active pane.
+ *  - We send the command text literally (`send-keys -l` / `pane send-text`)
+ *    and then a SEPARATE `Enter` key, instead of relying on a trailing "\n"
+ *    character.
  *  - Dynamic values are passed as positional args to `bash -c`, never
  *    interpolated into the script body, so paths with spaces/quotes are safe.
  *  - An optional preScript runs (from the detached waiter, after pi exits and
@@ -1043,13 +1069,12 @@ function scheduleRelaunch(opts: {
 	const parentPid = String(process.pid);
 	const pre = opts.preScript ?? "";
 
-	const surfaceId = process.env.CMUX_SURFACE_ID;
-	const inTmux = !!process.env.TMUX;
+	const mux = pickRelaunchMux(process.env);
+	if (!mux) return false;
 
 	let script: string;
-	let args: string[];
 
-	if (surfaceId) {
+	if (mux.kind === "cmux") {
 		// cmux: wait for pi to exit, run teardown, then type the command.
 		script = `
       parent="$1"; surface="$2"; cmd="$3"; pre="$4"
@@ -1059,19 +1084,20 @@ function scheduleRelaunch(opts: {
       cmux send --surface "$surface" -- "$cmd"
       cmux send --surface "$surface" -- $'\\r'
     `;
-		args = [
-			"-c",
-			script,
-			"pi-worktree-relaunch",
-			parentPid,
-			surfaceId,
-			opts.typedCmd,
-			pre,
-		];
-	} else if (inTmux) {
+	} else if (mux.kind === "herdr") {
+		// herdr: same shape as tmux — send-text types literally into the
+		// originating pane's shell; a separate enter key submits.
+		script = `
+      parent="$1"; target="$2"; cmd="$3"; pre="$4"
+      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
+      sleep 0.15
+      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      herdr pane send-text "$target" "$cmd"
+      herdr pane send-keys "$target" enter
+    `;
+	} else {
 		// tmux: target the originating pane when known; -l types literally; a
 		// separate Enter submits.
-		const target = process.env.TMUX_PANE ?? "";
 		script = `
       parent="$1"; target="$2"; cmd="$3"; pre="$4"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
@@ -1085,18 +1111,17 @@ function scheduleRelaunch(opts: {
         tmux send-keys Enter
       fi
     `;
-		args = [
-			"-c",
-			script,
-			"pi-worktree-relaunch",
-			parentPid,
-			target,
-			opts.typedCmd,
-			pre,
-		];
-	} else {
-		return false;
 	}
+
+	const args = [
+		"-c",
+		script,
+		"pi-worktree-relaunch",
+		parentPid,
+		mux.target,
+		opts.typedCmd,
+		pre,
+	];
 
 	// Detached + unref so the waiter outlives pi's shutdown.
 	const child = spawn("bash", args, {
@@ -1900,7 +1925,7 @@ export default function (pi: ExtensionAPI) {
 			const scheduled = scheduleRelaunch({ typedCmd, preScript });
 			if (!scheduled) {
 				ctx.ui.notify(
-					`No tmux/cmux detected — cannot carry the session automatically.\n` +
+					`No cmux/herdr/tmux detected — cannot carry the session automatically.\n` +
 						`Do it manually:\n` +
 						`  cd ${repoRoot} && pi${sessionFile ? ` --fork ${sessionFile}` : ""}\n` +
 						`  /worktree destroy ${branch}`,

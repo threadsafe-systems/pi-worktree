@@ -19,6 +19,7 @@ import {
 	isValidExplicitBranch,
 	parseCreateArgs,
 	parseWorktreeList,
+	pickRelaunchMux,
 	planCreate,
 	resolveBranch,
 	resolveDestroyTarget,
@@ -54,6 +55,54 @@ check("relaunch command: fork + handoff env, safely quoted", () => {
 
 check("relaunch command: no session -> plain pi (back-compat)", () => {
 	assert.equal(buildRelaunchCommand("/wt"), "cd '/wt' && pi");
+});
+
+check("relaunch mux: cmux wins over herdr and tmux", () => {
+	assert.deepEqual(
+		pickRelaunchMux({
+			CMUX_SURFACE_ID: "s1",
+			HERDR_PANE_ID: "wG:p1",
+			TMUX: "/tmp/tmux-1/default,123,0",
+			TMUX_PANE: "%5",
+		}),
+		{ kind: "cmux", target: "s1" },
+	);
+});
+
+check("relaunch mux: herdr pane id detected", () => {
+	assert.deepEqual(pickRelaunchMux({ HERDR_PANE_ID: "wG:p1" }), {
+		kind: "herdr",
+		target: "wG:p1",
+	});
+});
+
+check("relaunch mux: herdr beats a leaked outer TMUX", () => {
+	assert.deepEqual(
+		pickRelaunchMux({
+			HERDR_PANE_ID: "wG:p1",
+			TMUX: "/tmp/tmux-1/default,123,0",
+			TMUX_PANE: "%5",
+		}),
+		{ kind: "herdr", target: "wG:p1" },
+	);
+});
+
+check("relaunch mux: tmux with originating pane", () => {
+	assert.deepEqual(
+		pickRelaunchMux({ TMUX: "/tmp/tmux-1/default,123,0", TMUX_PANE: "%5" }),
+		{ kind: "tmux", target: "%5" },
+	);
+});
+
+check("relaunch mux: tmux without pane falls back to empty target", () => {
+	assert.deepEqual(pickRelaunchMux({ TMUX: "/tmp/tmux-1/default,123,0" }), {
+		kind: "tmux",
+		target: "",
+	});
+});
+
+check("relaunch mux: no multiplexer -> null", () => {
+	assert.equal(pickRelaunchMux({}), null);
 });
 
 check("relaunch command: fork without handoff", () => {
