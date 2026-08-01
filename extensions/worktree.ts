@@ -1222,9 +1222,7 @@ function continuationFor(
 	kind: WtHandoff["kind"],
 	targetCwd: string,
 ): string | undefined {
-	return ctx.isIdle()
-		? undefined
-		: buildContinuationMessage(kind, targetCwd);
+	return ctx.isIdle() ? undefined : buildContinuationMessage(kind, targetCwd);
 }
 
 /** Relaunch pi in a worktree, forking the parent session and passing a handoff.

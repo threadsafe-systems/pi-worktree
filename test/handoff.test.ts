@@ -84,24 +84,33 @@ check("continuation: real message survives shell quoting intact", () => {
 	const quoted = cmd.slice(cmd.indexOf("--fork '/s.jsonl' ") + 18);
 	assert.ok(quoted.startsWith("'") && quoted.endsWith("'"));
 	// every embedded ' must be escaped as the '\'' idiom
-	assert.equal(/(?<!\\)'/g.test(quoted.slice(1, -1).replace(/'\\''/g, "")), false);
+	assert.equal(
+		/(?<!\\)'/g.test(quoted.slice(1, -1).replace(/'\\''/g, "")),
+		false,
+	);
 });
 
-check("continuation: dispose wording names the removed worktree situation", () => {
-	const d = buildContinuationMessage("dispose", "/repo");
-	assert.match(d, /main checkout at \/repo/);
-	assert.match(d, /has been removed/);
-	const e = buildContinuationMessage("enter", "/repo.worktrees/feat-x");
-	assert.match(e, /worktree at \/repo\.worktrees\/feat-x/);
-	assert.doesNotMatch(e, /has been removed/);
-});
+check(
+	"continuation: dispose wording names the removed worktree situation",
+	() => {
+		const d = buildContinuationMessage("dispose", "/repo");
+		assert.match(d, /main checkout at \/repo/);
+		assert.match(d, /has been removed/);
+		const e = buildContinuationMessage("enter", "/repo.worktrees/feat-x");
+		assert.match(e, /worktree at \/repo\.worktrees\/feat-x/);
+		assert.doesNotMatch(e, /has been removed/);
+	},
+);
 
-check("continuation: tells the agent to re-verify rather than blindly redo", () => {
-	const m = buildContinuationMessage("enter", "/wt");
-	assert.match(m, /interrupted/i);
-	assert.match(m, /git status/);
-	assert.match(m, /[Dd]o not redo/);
-});
+check(
+	"continuation: tells the agent to re-verify rather than blindly redo",
+	() => {
+		const m = buildContinuationMessage("enter", "/wt");
+		assert.match(m, /interrupted/i);
+		assert.match(m, /git status/);
+		assert.match(m, /[Dd]o not redo/);
+	},
+);
 
 check("relaunch mux: cmux wins over herdr and tmux", () => {
 	assert.deepEqual(
