@@ -33,11 +33,16 @@ pi install git:github.com/threadsafe-systems/pi-worktree
 pi install git:github.com/threadsafe-systems/pi-worktree@v1.0.0
 ```
 
-Pi treats a package ref as a pin: `pi update --extensions` reconciles your clone
-to the configured ref but never moves it to a newer one. To take a new release,
-re-run `pi install` with the new tag. Releases and their notes are on the
-[releases page](https://github.com/threadsafe-systems/pi-worktree/releases), and
-[`CHANGELOG.md`](./CHANGELOG.md) carries the same history in-repo.
+The two forms behave differently on `pi update --extensions`:
+
+- **With a ref** (`@v1.0.0`) pi pins you. Update reconciles the clone to that
+  exact ref and never moves it forward; re-run `pi install` with a new tag to
+  take a new release.
+- **Without a ref** pi tracks the default branch, hard-resetting the clone to
+  `origin/main` on every update. You get unreleased commits as they land.
+
+Pin unless you are developing the extension itself. Release notes are on the
+[releases page](https://github.com/threadsafe-systems/pi-worktree/releases).
 
 Then `/reload` if Pi is already running. This package includes both worktree
 management and the optional worktree-discipline guard; if you previously
@@ -241,8 +246,16 @@ reformat commit is listed in `.git-blame-ignore-revs`; enable it locally with
 Releases are cut by [semantic-release](https://semantic-release.gitbook.io) from
 CI (`.github/workflows/ci.yml`, config in `.releaserc.json`). Every push to
 `main` that passes `npm run check` is analysed, and if it contains a releasable
-commit, CI tags it, updates `CHANGELOG.md` and the `package.json` version, and
-publishes a GitHub Release. Nothing is published to npm.
+commit, CI tags it and publishes a GitHub Release whose notes are the changelog.
+Nothing is published to npm.
+
+The release job deliberately makes **no commit back to `main`**. `main` is a
+protected branch requiring the `check` contexts, and a required status check
+rejects any direct push — including one carrying a bumped `package.json` or
+`CHANGELOG.md`, and including one authenticated with a PAT. Pi identifies a
+git-installed package by commit SHA and never reads its `package.json` version,
+so the bump bought nothing anyway. Tags and Releases are unaffected by branch
+protection.
 
 Version bumps are derived from commit messages, so
 [Conventional Commits](https://www.conventionalcommits.org) are mandatory:
