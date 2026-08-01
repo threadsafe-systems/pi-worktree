@@ -62,6 +62,7 @@ check("relaunch mux: cmux wins over herdr and tmux", () => {
 		pickRelaunchMux({
 			CMUX_SURFACE_ID: "s1",
 			HERDR_PANE_ID: "wG:p1",
+			HERDR_WORKSPACE_ID: "wG",
 			TMUX: "/tmp/tmux-1/default,123,0",
 			TMUX_PANE: "%5",
 		}),
@@ -69,10 +70,18 @@ check("relaunch mux: cmux wins over herdr and tmux", () => {
 	);
 });
 
-check("relaunch mux: herdr pane id detected", () => {
+check("relaunch mux: herdr pane id detected, with workspace", () => {
+	assert.deepEqual(
+		pickRelaunchMux({ HERDR_PANE_ID: "wG:p1", HERDR_WORKSPACE_ID: "wG" }),
+		{ kind: "herdr", target: "wG:p1", workspaceId: "wG" },
+	);
+});
+
+check("relaunch mux: herdr without workspace id degrades to empty", () => {
 	assert.deepEqual(pickRelaunchMux({ HERDR_PANE_ID: "wG:p1" }), {
 		kind: "herdr",
 		target: "wG:p1",
+		workspaceId: "",
 	});
 });
 
@@ -80,10 +89,11 @@ check("relaunch mux: herdr beats a leaked outer TMUX", () => {
 	assert.deepEqual(
 		pickRelaunchMux({
 			HERDR_PANE_ID: "wG:p1",
+			HERDR_WORKSPACE_ID: "wG",
 			TMUX: "/tmp/tmux-1/default,123,0",
 			TMUX_PANE: "%5",
 		}),
-		{ kind: "herdr", target: "wG:p1" },
+		{ kind: "herdr", target: "wG:p1", workspaceId: "wG" },
 	);
 });
 
