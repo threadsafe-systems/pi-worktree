@@ -211,10 +211,17 @@ This pattern works well for projects that derive dev server ports from the stage
 
 ```bash
 npm install
-npm run check   # typecheck + pure tests
-npm run lint    # typecheck only
-npm test        # pure decision/handoff tests
+npm run check     # typecheck + biome lint + pure tests
+npm run typecheck # tsc --noEmit only
+npm run lint      # biome check (format + lint, read-only)
+npm run format    # biome check --write (apply fixes)
+npm test          # pure decision/handoff tests
 ```
+
+Formatting and linting are pinned via [biome](https://biomejs.dev) in
+`biome.json` (tab indent, `lineWidth` 80, double quotes). The one-time
+reformat commit is listed in `.git-blame-ignore-revs`; enable it locally with
+`git config blame.ignoreRevsFile .git-blame-ignore-revs`.
 
 ## Update
 
