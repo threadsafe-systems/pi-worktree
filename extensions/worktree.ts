@@ -506,9 +506,10 @@ export function shouldBlockWorktreeBaseWrite(opts: {
 	);
 }
 
-export function summarizeWorktreeStatus(
-	porcelainWithIgnored: string,
-): { uncommitted: number; ignored: number } {
+export function summarizeWorktreeStatus(porcelainWithIgnored: string): {
+	uncommitted: number;
+	ignored: number;
+} {
 	let uncommitted = 0;
 	let ignored = 0;
 	for (const line of porcelainWithIgnored.split("\n")) {
@@ -535,7 +536,8 @@ export function unsafeDisposeReason(opts: {
 		opts.porcelainWithIgnored,
 	);
 	const dirty: string[] = [];
-	if (uncommitted > 0) dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
+	if (uncommitted > 0)
+		dirty.push(`${uncommitted} uncommitted/untracked file(s)`);
 	if (ignored > 0) dirty.push(`${ignored} ignored file(s)`);
 	return dirty.length
 		? `Refusing to dispose dirty worktree ${opts.worktreePath}: ${dirty.join(" and ")}. Commit, remove, or move those files first.`
@@ -882,15 +884,44 @@ export function handoffCaveat(
 
 /** Build the shell command typed into the pane to relaunch pi in a directory.
  *  Optionally forks the parent session (to carry history) and passes a base64
- *  handoff payload via PI_WT_HANDOFF for the new session to decode. */
+ *  handoff payload via PI_WT_HANDOFF for the new session to decode.
+ *
+ *  `continuation` is passed as pi's positional initial message. A forked
+ *  session otherwise loads history and waits at the editor, so this is the
+ *  only thing that makes an interrupted task resume without a human nudge. */
 export function buildRelaunchCommand(
 	targetDir: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
+	continuation?: string,
 ): string {
 	const envPrefix = handoffB64 ? `PI_WT_HANDOFF=${shQuote(handoffB64)} ` : "";
 	const forkArg = forkSessionFile ? ` --fork ${shQuote(forkSessionFile)}` : "";
-	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}`;
+	const msgArg = continuation?.trim() ? ` ${shQuote(continuation.trim())}` : "";
+	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}${msgArg}`;
+}
+
+/** Initial message for a session that hopped while the agent was mid-task.
+ *
+ *  `ctx.shutdown()` aborts the turn in flight, so the carried history can end
+ *  on an unanswered tool call or a side effect whose result was never seen.
+ *  The message therefore tells the agent to re-establish state before acting:
+ *  a bare "continue" invites it to redo work that already succeeded. */
+export function buildContinuationMessage(
+	kind: WtHandoff["kind"],
+	targetCwd: string,
+): string {
+	const where =
+		kind === "dispose"
+			? `back to the main checkout at ${targetCwd}, and the worktree you were in has been removed`
+			: `into the worktree at ${targetCwd}`;
+	return (
+		`[automatic] Your session was moved ${where}. The turn you were running ` +
+		`was interrupted by that hop, so work may be half-finished.\n\n` +
+		`Re-establish where you actually got to before doing anything: check ` +
+		`git status and the files you were editing. Do not redo steps that ` +
+		`already completed. Then carry on with the task you were working on.`
+	);
 }
 
 /** Shared worktree-teardown script builder (used by dispose and destroy). All
@@ -1181,6 +1212,21 @@ function scheduleRelaunch(opts: {
 	return true;
 }
 
+/** Continuation message for a hop, or undefined when the agent was idle.
+ *
+ *  Gating on `isIdle()` matters: hopping from an idle prompt (the usual
+ *  `/worktree feat/x` case) must NOT submit a message, or the new session
+ *  opens by burning a turn asking what task it is supposed to resume. */
+function continuationFor(
+	ctx: ExtensionContext,
+	kind: WtHandoff["kind"],
+	targetCwd: string,
+): string | undefined {
+	return ctx.isIdle()
+		? undefined
+		: buildContinuationMessage(kind, targetCwd);
+}
+
 /** Relaunch pi in a worktree, forking the parent session and passing a handoff.
  *  Under herdr this re-camps into a new tab named after `branch`. */
 function relaunchInPlace(
@@ -1188,11 +1234,13 @@ function relaunchInPlace(
 	branch: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
+	continuation?: string,
 ): boolean {
 	const typedCmd = buildRelaunchCommand(
 		worktreePath,
 		forkSessionFile,
 		handoffB64,
+		continuation,
 	);
 	return scheduleRelaunch({
 		typedCmd,
@@ -1236,7 +1284,9 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 			branch: Type.Optional(
-				Type.String({ description: "Exact branch name, bypassing name resolution." }),
+				Type.String({
+					description: "Exact branch name, bypassing name resolution.",
+				}),
 			),
 			base: Type.Optional(
 				Type.String({ description: "Base ref for create. Defaults to HEAD." }),
@@ -1419,6 +1469,7 @@ export default function (pi: ExtensionAPI) {
 						branch,
 						sessionFile,
 						handoffB64,
+						continuationFor(ctx, "enter", worktreePath),
 					);
 					if (!relaunched) {
 						ctx.ui.notify(
@@ -1559,14 +1610,19 @@ export default function (pi: ExtensionAPI) {
 				base: params.base,
 			});
 			if (existsSync(plan.worktreePath)) {
-				const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
-					cwd: repoRoot,
-					timeout: 5_000,
-				});
+				const listed = await pi.exec(
+					"git",
+					["worktree", "list", "--porcelain"],
+					{
+						cwd: repoRoot,
+						timeout: 5_000,
+					},
+				);
 				const here =
 					listed.code === 0
 						? parseWorktreeList(listed.stdout).find(
-								(w) => canonicalPath(w.path) === canonicalPath(plan.worktreePath),
+								(w) =>
+									canonicalPath(w.path) === canonicalPath(plan.worktreePath),
 							)
 						: undefined;
 				if (!here || here.branch !== plan.branch) {
@@ -1592,14 +1648,19 @@ export default function (pi: ExtensionAPI) {
 
 		if (params.action === "enter") {
 			const branches = resolveRequestedBranches();
-			if (branches.length === 0) throw new Error("enter requires name or branch");
+			if (branches.length === 0)
+				throw new Error("enter requires name or branch");
 			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
 				cwd: repoRoot,
 				timeout: 5_000,
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) throw new Error(entry.error);
 			agentWorktree = { repoRoot, branch: entry.branch, path: entry.path };
@@ -1628,7 +1689,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const resolved =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in resolved) throw new Error(resolved.error);
 			entry = resolved;
@@ -1648,7 +1713,15 @@ export default function (pi: ExtensionAPI) {
 		if (unsafeReason) throw new Error(unsafeReason);
 		const dispose = await pi.exec(
 			"bash",
-			["-c", buildDisposeScript(repoRoot, entry.path, entry.branch, config.preRemove)],
+			[
+				"-c",
+				buildDisposeScript(
+					repoRoot,
+					entry.path,
+					entry.branch,
+					config.preRemove,
+				),
+			],
 			{ timeout: 130_000 },
 		);
 		if (dispose.code !== 0) {
@@ -1803,7 +1876,11 @@ export default function (pi: ExtensionAPI) {
 			});
 			const entry =
 				listed.code === 0
-					? resolveEnterTarget(parseWorktreeList(listed.stdout), branches, repoRoot)
+					? resolveEnterTarget(
+							parseWorktreeList(listed.stdout),
+							branches,
+							repoRoot,
+						)
 					: { error: "Could not read the git worktree list." };
 			if ("error" in entry) {
 				ctx.ui.notify(entry.error, "error");
@@ -1836,6 +1913,7 @@ export default function (pi: ExtensionAPI) {
 				entry.branch,
 				sessionFile,
 				handoffB64,
+				continuationFor(ctx, "enter", entry.path),
 			);
 			if (!relaunched) {
 				ctx.ui.notify(
@@ -1892,6 +1970,7 @@ export default function (pi: ExtensionAPI) {
 				branch,
 				sessionFile,
 				handoffB64,
+				continuationFor(ctx, "enter", worktreePath),
 			);
 			if (!relaunched) {
 				ctx.ui.notify(
@@ -1979,7 +2058,12 @@ export default function (pi: ExtensionAPI) {
 				ignored,
 				kind: "dispose",
 			});
-			const typedCmd = buildRelaunchCommand(repoRoot, sessionFile, handoffB64);
+			const typedCmd = buildRelaunchCommand(
+				repoRoot,
+				sessionFile,
+				handoffB64,
+				continuationFor(ctx, "dispose", repoRoot),
+			);
 			const preScript = buildDisposeScript(
 				repoRoot,
 				worktreePath,

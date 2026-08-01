@@ -7,6 +7,7 @@ import {
 	buildCreateScript,
 	buildDestroyScript,
 	buildDisposeScript,
+	buildContinuationMessage,
 	buildRelaunchCommand,
 	decodeHandoff,
 	destroyCandidates,
@@ -55,6 +56,51 @@ check("relaunch command: fork + handoff env, safely quoted", () => {
 
 check("relaunch command: no session -> plain pi (back-compat)", () => {
 	assert.equal(buildRelaunchCommand("/wt"), "cd '/wt' && pi");
+});
+
+check("continuation: appended as pi's positional initial message", () => {
+	const cmd = buildRelaunchCommand("/wt", "/s.jsonl", undefined, "carry on");
+	assert.equal(cmd, "cd '/wt' && pi --fork '/s.jsonl' 'carry on'");
+});
+
+check("continuation: omitted when absent or blank (no spurious turn)", () => {
+	assert.equal(
+		buildRelaunchCommand("/wt", "/s.jsonl"),
+		"cd '/wt' && pi --fork '/s.jsonl'",
+	);
+	assert.equal(
+		buildRelaunchCommand("/wt", "/s.jsonl", undefined, "   "),
+		"cd '/wt' && pi --fork '/s.jsonl'",
+	);
+});
+
+check("continuation: real message survives shell quoting intact", () => {
+	// The message spans newlines and contains an apostrophe, which is exactly
+	// what naive quoting breaks: a single stray quote would split it into
+	// extra argv entries or leave the shell waiting for a terminator.
+	const msg = buildContinuationMessage("enter", "/wt path/x");
+	const cmd = buildRelaunchCommand("/wt path/x", "/s.jsonl", undefined, msg);
+	assert.match(msg, /\n/);
+	const quoted = cmd.slice(cmd.indexOf("--fork '/s.jsonl' ") + 18);
+	assert.ok(quoted.startsWith("'") && quoted.endsWith("'"));
+	// every embedded ' must be escaped as the '\'' idiom
+	assert.equal(/(?<!\\)'/g.test(quoted.slice(1, -1).replace(/'\\''/g, "")), false);
+});
+
+check("continuation: dispose wording names the removed worktree situation", () => {
+	const d = buildContinuationMessage("dispose", "/repo");
+	assert.match(d, /main checkout at \/repo/);
+	assert.match(d, /has been removed/);
+	const e = buildContinuationMessage("enter", "/repo.worktrees/feat-x");
+	assert.match(e, /worktree at \/repo\.worktrees\/feat-x/);
+	assert.doesNotMatch(e, /has been removed/);
+});
+
+check("continuation: tells the agent to re-verify rather than blindly redo", () => {
+	const m = buildContinuationMessage("enter", "/wt");
+	assert.match(m, /interrupted/i);
+	assert.match(m, /git status/);
+	assert.match(m, /[Dd]o not redo/);
 });
 
 check("relaunch mux: cmux wins over herdr and tmux", () => {
@@ -206,34 +252,46 @@ check("getWorktreeDir: explicit dir resolves relative to repo root", () => {
 	);
 });
 
-check("worktreeLocationHint: shows the configured base plus branch-slug placeholder", () => {
-	assert.equal(
-		worktreeLocationHint("/home/x/repo", {}),
-		"/home/x/repo.worktrees/<branch-slug>",
-	);
-});
+check(
+	"worktreeLocationHint: shows the configured base plus branch-slug placeholder",
+	() => {
+		assert.equal(
+			worktreeLocationHint("/home/x/repo", {}),
+			"/home/x/repo.worktrees/<branch-slug>",
+		);
+	},
+);
 
-check("worktreeDisciplinePrompt: explains location and session migration", () => {
-	const p = worktreeDisciplinePrompt("/repo", {});
-	assert.match(p, /Default worktree location: \/repo\.worktrees\/<branch-slug>/);
-	assert.match(p, /\/worktree <type\/name>/);
-	assert.match(p, /\/worktree enter <type\/name>/);
-	assert.match(p, /does not move this pi session/);
-});
+check(
+	"worktreeDisciplinePrompt: explains location and session migration",
+	() => {
+		const p = worktreeDisciplinePrompt("/repo", {});
+		assert.match(
+			p,
+			/Default worktree location: \/repo\.worktrees\/<branch-slug>/,
+		);
+		assert.match(p, /\/worktree <type\/name>/);
+		assert.match(p, /\/worktree enter <type\/name>/);
+		assert.match(p, /does not move this pi session/);
+	},
+);
 
-check("worktreeDisciplineBlockReason: includes computed location and re-camp command", () => {
-	const r = worktreeDisciplineBlockReason({
-		toolName: "write",
-		relPath: "src/x.ts",
-		repoRoot: "/repo",
-		config: {},
-	});
-	assert.match(r, /Refused write to src\/x\.ts/);
-	assert.match(r, /Default location: \/repo\.worktrees\/<branch-slug>/);
-	assert.match(r, /\/worktree enter <type\/name>/);
-	assert.match(r, /restart pi from that worktree/);
-	assert.match(r, /Do not write files directly under the worktree base/);
-});
+check(
+	"worktreeDisciplineBlockReason: includes computed location and re-camp command",
+	() => {
+		const r = worktreeDisciplineBlockReason({
+			toolName: "write",
+			relPath: "src/x.ts",
+			repoRoot: "/repo",
+			config: {},
+		});
+		assert.match(r, /Refused write to src\/x\.ts/);
+		assert.match(r, /Default location: \/repo\.worktrees\/<branch-slug>/);
+		assert.match(r, /\/worktree enter <type\/name>/);
+		assert.match(r, /restart pi from that worktree/);
+		assert.match(r, /Do not write files directly under the worktree base/);
+	},
+);
 
 check("worktreeDisciplineBlockReason: includes optional detail", () => {
 	const r = worktreeDisciplineBlockReason({
@@ -246,88 +304,103 @@ check("worktreeDisciplineBlockReason: includes optional detail", () => {
 	assert.match(r, /The target is under the configured worktree base\./);
 });
 
-check("shouldBlockWorktreeBaseWrite: blocks missing or unrelated target repos under base", () => {
-	assert.equal(
-		shouldBlockWorktreeBaseWrite({
-			absPath: "/repo.worktrees/feat-x/file.txt",
-			worktreeBase: "/repo.worktrees",
-		}),
-		true,
-	);
-	// Nested/outer repo case: rev-parse found /repo.worktrees' parent, not a
-	// linked worktree root under the base.
-	assert.equal(
-		shouldBlockWorktreeBaseWrite({
-			absPath: "/repo.worktrees/feat-x/file.txt",
-			worktreeBase: "/repo.worktrees",
-			targetRoot: "/",
-			targetMainCheckout: true,
-		}),
-		true,
-	);
-});
+check(
+	"shouldBlockWorktreeBaseWrite: blocks missing or unrelated target repos under base",
+	() => {
+		assert.equal(
+			shouldBlockWorktreeBaseWrite({
+				absPath: "/repo.worktrees/feat-x/file.txt",
+				worktreeBase: "/repo.worktrees",
+			}),
+			true,
+		);
+		// Nested/outer repo case: rev-parse found /repo.worktrees' parent, not a
+		// linked worktree root under the base.
+		assert.equal(
+			shouldBlockWorktreeBaseWrite({
+				absPath: "/repo.worktrees/feat-x/file.txt",
+				worktreeBase: "/repo.worktrees",
+				targetRoot: "/",
+				targetMainCheckout: true,
+			}),
+			true,
+		);
+	},
+);
 
-check("shouldBlockWorktreeBaseWrite: allows an existing linked worktree under base", () => {
-	assert.equal(
-		shouldBlockWorktreeBaseWrite({
-			absPath: "/repo.worktrees/feat-x/file.txt",
-			worktreeBase: "/repo.worktrees",
-			targetRoot: "/repo.worktrees/feat-x",
-			targetMainCheckout: false,
-		}),
-		false,
-	);
-	assert.equal(
-		shouldBlockWorktreeBaseWrite({
-			absPath: "/tmp/elsewhere/file.txt",
-			worktreeBase: "/repo.worktrees",
-		}),
-		false,
-	);
-});
+check(
+	"shouldBlockWorktreeBaseWrite: allows an existing linked worktree under base",
+	() => {
+		assert.equal(
+			shouldBlockWorktreeBaseWrite({
+				absPath: "/repo.worktrees/feat-x/file.txt",
+				worktreeBase: "/repo.worktrees",
+				targetRoot: "/repo.worktrees/feat-x",
+				targetMainCheckout: false,
+			}),
+			false,
+		);
+		assert.equal(
+			shouldBlockWorktreeBaseWrite({
+				absPath: "/tmp/elsewhere/file.txt",
+				worktreeBase: "/repo.worktrees",
+			}),
+			false,
+		);
+	},
+);
 
-check("summarizeWorktreeStatus: counts uncommitted and ignored porcelain lines", () => {
-	assert.deepEqual(summarizeWorktreeStatus(" M src/x.ts\n?? y\n!! .env.local\n"), {
-		uncommitted: 2,
-		ignored: 1,
-	});
-});
+check(
+	"summarizeWorktreeStatus: counts uncommitted and ignored porcelain lines",
+	() => {
+		assert.deepEqual(
+			summarizeWorktreeStatus(" M src/x.ts\n?? y\n!! .env.local\n"),
+			{
+				uncommitted: 2,
+				ignored: 1,
+			},
+		);
+	},
+);
 
-check("unsafeDisposeReason: refuses live cwd, session file, uncommitted and ignored files", () => {
-	assert.match(
-		unsafeDisposeReason({
-			cwd: "/repo.worktrees/feat-x/sub",
-			worktreePath: "/repo.worktrees/feat-x",
-			porcelainWithIgnored: "",
-		}) ?? "",
-		/running inside/,
-	);
-	assert.match(
-		unsafeDisposeReason({
-			cwd: "/repo",
-			sessionFile: "/repo.worktrees/feat-x/.pi/session.jsonl",
-			worktreePath: "/repo.worktrees/feat-x",
-			porcelainWithIgnored: "",
-		}) ?? "",
-		/session file/,
-	);
-	assert.match(
-		unsafeDisposeReason({
-			cwd: "/repo",
-			worktreePath: "/repo.worktrees/feat-x",
-			porcelainWithIgnored: " M x\n!! .env.local\n",
-		}) ?? "",
-		/uncommitted\/untracked file\(s\).*ignored file\(s\)/,
-	);
-	assert.equal(
-		unsafeDisposeReason({
-			cwd: "/repo",
-			worktreePath: "/repo.worktrees/feat-x",
-			porcelainWithIgnored: "",
-		}),
-		null,
-	);
-});
+check(
+	"unsafeDisposeReason: refuses live cwd, session file, uncommitted and ignored files",
+	() => {
+		assert.match(
+			unsafeDisposeReason({
+				cwd: "/repo.worktrees/feat-x/sub",
+				worktreePath: "/repo.worktrees/feat-x",
+				porcelainWithIgnored: "",
+			}) ?? "",
+			/running inside/,
+		);
+		assert.match(
+			unsafeDisposeReason({
+				cwd: "/repo",
+				sessionFile: "/repo.worktrees/feat-x/.pi/session.jsonl",
+				worktreePath: "/repo.worktrees/feat-x",
+				porcelainWithIgnored: "",
+			}) ?? "",
+			/session file/,
+		);
+		assert.match(
+			unsafeDisposeReason({
+				cwd: "/repo",
+				worktreePath: "/repo.worktrees/feat-x",
+				porcelainWithIgnored: " M x\n!! .env.local\n",
+			}) ?? "",
+			/uncommitted\/untracked file\(s\).*ignored file\(s\)/,
+		);
+		assert.equal(
+			unsafeDisposeReason({
+				cwd: "/repo",
+				worktreePath: "/repo.worktrees/feat-x",
+				porcelainWithIgnored: "",
+			}),
+			null,
+		);
+	},
+);
 
 check("branchToDirName: slashes collapse to hyphens", () => {
 	assert.equal(
