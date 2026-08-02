@@ -17,7 +17,25 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
+import type {
+	BranchDisposition,
+	TransitionHandoffV2,
+	WtHandoff,
+} from "./worktree-handoff.ts";
+import {
+	buildContinuationMessage as buildContinuation,
+	buildRelaunchCommand as buildRelaunch,
+	encodeHandoff as encodeLegacyHandoff,
+	decodeTransitionHandoff,
+	encodeTransitionHandoff,
+	handoffCaveat as legacyCaveat,
+	legacyVerification,
+	transitionCaveat,
+	verifyDispose,
+	verifyEnter,
+} from "./worktree-handoff.ts";
 import { Type } from "typebox";
+import { shQuote } from "./worktree-shell.ts";
 import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
 import {
 	acquireClaim,
@@ -28,6 +46,7 @@ import {
 	failedReceipt,
 	newReceipt,
 	readReceipt,
+	readTeardownReport,
 	readyReceipt,
 	releaseClaim,
 	removeReceipt,
@@ -36,8 +55,9 @@ import {
 import type {
 	CheckoutState,
 	ExecutionPreference,
-	ProvisioningState,
 	PendingTransition,
+	ProvisioningState,
+	SuccessorVerification,
 	TransitionCode,
 	TransitionDetails,
 	TransitionIntent,
@@ -838,131 +858,18 @@ export function destroyCandidates(
 // Relaunch helpers
 // ---------------------------------------------------------------------------
 
-/** Single-quote a string for safe literal use inside a POSIX shell command. */
-function shQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Handoff payload carried across a worktree relaunch, decoded by the new
- *  session to orient the agent. `kind` distinguishes entering a worktree from
- *  disposing one and returning to the main checkout. */
-export interface WtHandoff {
-	parentCwd: string;
-	parentBranch: string;
-	uncommitted: number;
-	/** Count of gitignored local files destroyed on dispose (e.g. .env.local). */
-	ignored?: number;
-	kind?: "enter" | "dispose";
-}
-
-export function encodeHandoff(h: WtHandoff): string {
-	return Buffer.from(JSON.stringify(h)).toString("base64");
-}
-
-export function decodeHandoff(b64: string): WtHandoff | null {
-	try {
-		const h = JSON.parse(Buffer.from(b64, "base64").toString("utf-8"));
-		if (
-			h &&
-			typeof h.parentCwd === "string" &&
-			typeof h.parentBranch === "string" &&
-			typeof h.uncommitted === "number"
-		) {
-			return {
-				parentCwd: h.parentCwd,
-				parentBranch: h.parentBranch,
-				uncommitted: h.uncommitted,
-				...(typeof h.ignored === "number" ? { ignored: h.ignored } : {}),
-				kind: h.kind === "dispose" ? "dispose" : "enter",
-			};
-		}
-	} catch {
-		// fall through to null
-	}
-	return null;
-}
-
-/** The one-turn orientation note injected into the relaunched session. */
-export function handoffCaveat(
-	h: WtHandoff,
-	currentCwd: string,
-	currentBranch: string,
-): string {
-	if (h.kind === "dispose") {
-		const lost: string[] = [];
-		if (h.uncommitted > 0)
-			lost.push(`${h.uncommitted} uncommitted/untracked file(s)`);
-		if ((h.ignored ?? 0) > 0)
-			lost.push(
-				`${h.ignored} gitignored file(s) (e.g. .env.local / local DBs)`,
-			);
-		const wip = lost.length
-			? `- WARNING: the disposed worktree had ${lost.join(" and ")} that were destroyed with it — they are gone.`
-			: `- The disposed worktree had no uncommitted or gitignored local files.`;
-		return (
-			`## Session moved back to the main checkout\n` +
-			`This session was forked out of the worktree at ${h.parentCwd} (branch ${h.parentBranch}) back into the main repository at ${currentCwd}. Removal of that worktree and a soft-delete (git branch -d) of branch ${h.parentBranch} were requested during shutdown — verify with \`git worktree list\` and \`git branch\`, and re-run cleanup if either remains (an unmerged branch is deliberately kept).\n` +
-			`- Repo-relative paths are unchanged (\`src/foo.ts\` is still \`src/foo.ts\`).\n` +
-			`- Absolute paths, and any path under the old worktree directory, no longer resolve.\n` +
-			`${wip}\n` +
-			`Continue the task here on ${currentBranch || "the main branch"}.`
-		);
-	}
-	const wip =
-		h.uncommitted > 0
-			? `- WARNING: ${h.uncommitted} file(s) had uncommitted changes in ${h.parentCwd}. A worktree is a fresh checkout, so those changes are NOT present here — retrieve them from ${h.parentCwd} if this work depends on them.`
-			: `- The previous checkout had no uncommitted changes.`;
-	return (
-		`## Session migrated into a worktree\n` +
-		`This session was forked from ${h.parentCwd} (branch ${h.parentBranch}) into this git worktree at ${currentCwd} (branch ${currentBranch}).\n` +
-		`- Repo-relative paths are unchanged (\`src/foo.ts\` is still \`src/foo.ts\`).\n` +
-		`- Absolute paths, and any path relative to the previous working directory, now resolve under this worktree.\n` +
-		`${wip}\n` +
-		`Continue the task here and commit to ${currentBranch}.`
-	);
-}
-
-/** Build the shell command typed into the pane to relaunch pi in a directory.
- *  Optionally forks the parent session (to carry history) and passes a base64
- *  handoff payload via PI_WT_HANDOFF for the new session to decode.
- *
- *  `continuation` is passed as pi's positional initial message. A forked
- *  session otherwise loads history and waits at the editor, so this is the
- *  only thing that makes an interrupted task resume without a human nudge. */
-export function buildRelaunchCommand(
-	targetDir: string,
-	forkSessionFile?: string,
-	handoffB64?: string,
-	continuation?: string,
-): string {
-	const envPrefix = handoffB64 ? `PI_WT_HANDOFF=${shQuote(handoffB64)} ` : "";
-	const forkArg = forkSessionFile ? ` --fork ${shQuote(forkSessionFile)}` : "";
-	const msgArg = continuation?.trim() ? ` ${shQuote(continuation.trim())}` : "";
-	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}${msgArg}`;
-}
-
-/** Initial message for a session that hopped while the agent was mid-task.
- *
- *  `ctx.shutdown()` aborts the turn in flight, so the carried history can end
- *  on an unanswered tool call or a side effect whose result was never seen.
- *  The message therefore tells the agent to re-establish state before acting:
- *  a bare "continue" invites it to redo work that already succeeded. */
-export function buildContinuationMessage(
-	kind: WtHandoff["kind"],
-	targetCwd: string,
-): string {
-	const where =
-		kind === "dispose"
-			? `back to the main checkout at ${targetCwd}, and the worktree you were in has been removed`
-			: `into the worktree at ${targetCwd}`;
-	return (
-		`[automatic] Your session was moved ${where}. The turn you were running ` +
-		`was interrupted by that hop, so work may be half-finished.\n\n` +
-		`Re-establish where you actually got to before doing anything: check ` +
-		`git status and the files you were editing. Do not redo steps that ` +
-		`already completed. Then carry on with the task you were working on.`
-	);
-}
+/**
+ * Handoff encoding and successor verification live in the handoff module.
+ * Re-exported because they are part of this extension's tested public surface.
+ */
+export type { WtHandoff } from "./worktree-handoff.ts";
+export {
+	buildContinuationMessage,
+	buildRelaunchCommand,
+	decodeHandoff,
+	encodeHandoff,
+	handoffCaveat,
+} from "./worktree-handoff.ts";
 
 /** Shared worktree-teardown script builder (used by dispose and destroy). All
  *  paths and the branch name are shQuote'd. `hardDelete` selects `git branch -D`
@@ -1072,7 +979,7 @@ async function buildHandoff(
 	} catch {
 		// best-effort
 	}
-	return encodeHandoff({
+	return encodeLegacyHandoff({
 		parentCwd,
 		parentBranch,
 		uncommitted,
@@ -1160,7 +1067,7 @@ function continuationFor(
 	kind: WtHandoff["kind"],
 	targetCwd: string,
 ): string | undefined {
-	return ctx.isIdle() ? undefined : buildContinuationMessage(kind, targetCwd);
+	return ctx.isIdle() ? undefined : buildContinuation(kind, targetCwd);
 }
 
 /** Relaunch pi in a worktree, forking the parent session and passing a handoff.
@@ -1172,7 +1079,7 @@ async function relaunchInPlace(
 	handoffB64?: string,
 	continuation?: string,
 ): Promise<boolean> {
-	const typedCmd = buildRelaunchCommand(
+	const typedCmd = buildRelaunch(
 		worktreePath,
 		forkSessionFile,
 		handoffB64,
@@ -1197,6 +1104,8 @@ export default function (pi: ExtensionAPI) {
 	 * side effect belongs to the replacement session, not this one.
 	 */
 	let pendingTransition: PendingTransition | null = null;
+	/** Result of checking the hand-off this session woke up with, if any. */
+	let lastVerification: SuccessorVerification | null = null;
 
 	// --- Model-callable worktree session helper ---
 	pi.registerTool({
@@ -1499,10 +1408,35 @@ export default function (pi: ExtensionAPI) {
 		// One-turn orientation when this session was forked across a worktree hop.
 		const handoffEnv = process.env.PI_WT_HANDOFF;
 		if (!handoffShown && handoffEnv) {
-			const h = decodeHandoff(handoffEnv);
-			if (h) {
+			const decoded = decodeTransitionHandoff(handoffEnv);
+			if (decoded?.version === 1) {
 				handoffShown = true;
-				extra += `\n\n${handoffCaveat(h, process.cwd(), worktreeBranch ?? "")}`;
+				lastVerification = legacyVerification(
+					await currentCheckoutState(await getRepoRoot(pi)),
+					new Date().toISOString(),
+					decoded.legacy.kind ?? "enter",
+				);
+				extra += `\n\n${legacyCaveat(decoded.legacy, process.cwd(), worktreeBranch ?? "")}`;
+			} else if (decoded?.version === 2) {
+				handoffShown = true;
+				// The predecessor's claim is only a claim; check it before letting
+				// the agent act as though the move succeeded.
+				lastVerification = await verifyTransition(decoded.handoff);
+				extra += `\n\n${legacyCaveat(
+					{
+						parentCwd: decoded.handoff.source.path,
+						parentBranch: decoded.handoff.source.branch ?? "",
+						uncommitted: decoded.handoff.uncommitted,
+						...(decoded.handoff.ignored === undefined
+							? {}
+							: { ignored: decoded.handoff.ignored }),
+						kind: decoded.handoff.kind,
+					},
+					process.cwd(),
+					worktreeBranch ?? "",
+				)}`;
+				const caveat = transitionCaveat(lastVerification);
+				if (caveat) extra += `\n\n${caveat}`;
 			}
 		}
 		if (!extra) return;
@@ -1543,6 +1477,145 @@ export default function (pi: ExtensionAPI) {
 					: null;
 		}
 		return { path, branch, kind: detected ? "linked" : "main" };
+	}
+
+	/**
+	 * Build the payload the replacement session will check itself against.
+	 *
+	 * The target's provisioning identity is captured here, at scheduling time,
+	 * so a receipt that is replaced or removed before the successor starts shows
+	 * up as a mismatch rather than passing as a different but plausible state.
+	 */
+	async function buildTransitionHandoff(opts: {
+		operationId: string;
+		kind: "enter" | "dispose";
+		source: CheckoutState;
+		target: CheckoutState;
+		provisioning: ProvisioningState;
+		store: ReceiptStore;
+		sessionFile: string | undefined;
+		dispose?: { removedPath: string; branch: string };
+	}): Promise<string> {
+		let uncommitted = 0;
+		let ignored = 0;
+		const status = await pi.exec(
+			"git",
+			["status", "--porcelain", "--ignored"],
+			{
+				cwd: opts.source.path,
+				timeout: 5_000,
+			},
+		);
+		if (status.code === 0) {
+			for (const line of status.stdout.split("\n")) {
+				if (!line.trim()) continue;
+				if (line.startsWith("!!")) ignored++;
+				else uncommitted++;
+			}
+		}
+
+		const receipt = readReceipt(opts.store, opts.target.path);
+		const ready = opts.provisioning === "ready" && receipt.kind === "present";
+		return encodeTransitionHandoff({
+			schemaVersion: 2,
+			operationId: opts.operationId,
+			kind: opts.kind,
+			source: opts.source,
+			target: opts.target,
+			targetProvisioning: ready ? "ready" : "unmanaged",
+			...(ready ? { expectedReceiptHash: receipt.hash } : {}),
+			sessionCarry: opts.sessionFile ? "fork" : "fresh",
+			uncommitted,
+			...(ignored > 0 ? { ignored } : {}),
+			...(opts.dispose ? { dispose: opts.dispose } : {}),
+		});
+	}
+
+	/**
+	 * Check a v2 hand-off against what this session can actually observe.
+	 *
+	 * Reads git and the receipt store directly rather than trusting any field
+	 * the predecessor wrote, so a transition that went somewhere unexpected is
+	 * reported as a mismatch instead of being narrated as success.
+	 */
+	async function verifyTransition(
+		handoff: TransitionHandoffV2,
+	): Promise<SuccessorVerification> {
+		const now = new Date().toISOString();
+		const repoRoot = await getRepoRoot(pi);
+		const actual = await currentCheckoutState(repoRoot);
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		const worktrees = await listWorktrees(repoRoot).catch(() => []);
+
+		if (handoff.kind === "enter") {
+			const receipt = readReceipt(store, handoff.target.path);
+			return verifyEnter(
+				handoff,
+				{
+					actual,
+					registrationPresent: worktrees.some(
+						(w) => canonicalPath(w.path) === canonicalPath(handoff.target.path),
+					),
+					provisioning: classifyProvisioning(receipt, {
+						worktreePath: handoff.target.path,
+						...(handoff.target.branch ? { branch: handoff.target.branch } : {}),
+					}),
+					...(receipt.kind === "present" ? { receiptHash: receipt.hash } : {}),
+				},
+				now,
+			);
+		}
+
+		const removed = handoff.dispose?.removedPath ?? "";
+		const branch = handoff.dispose?.branch ?? "";
+		const branchRef = branch
+			? await pi.exec(
+					"git",
+					["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+					{
+						cwd: repoRoot,
+						timeout: 5_000,
+					},
+				)
+			: { code: 1 };
+		let branchDisposition: BranchDisposition = "unknown";
+		if (branchRef.code !== 0) {
+			branchDisposition = "deleted";
+		} else {
+			// A branch git could safely delete but did not means teardown fell short;
+			// a branch it refused to delete is the intended soft-dispose outcome.
+			const merged = await pi.exec(
+				"git",
+				["branch", "--merged", "HEAD", "--format=%(refname:short)"],
+				{
+					cwd: repoRoot,
+					timeout: 5_000,
+				},
+			);
+			branchDisposition =
+				merged.code === 0 &&
+				merged.stdout.split("\n").some((l) => l.trim() === branch)
+					? "delete-failed"
+					: "kept-unmerged";
+		}
+
+		return verifyDispose(
+			handoff,
+			{
+				actual,
+				pathPresent: removed ? existsSync(removed) : false,
+				registrationPresent: worktrees.some(
+					(w) => canonicalPath(w.path) === canonicalPath(removed),
+				),
+				receiptPresent: removed
+					? readReceipt(store, removed).kind !== "absent"
+					: false,
+				branchDisposition,
+				reportPresent:
+					readTeardownReport(store, handoff.operationId).kind === "present",
+			},
+			now,
+		);
 	}
 
 	/**
@@ -1796,14 +1869,18 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const action = request.intent === "enter" ? "enter" : "create";
-		const handoffB64 = await buildHandoff(
-			pi,
-			processState.path,
+		const operationId = newOperationId();
+		const handoffB64 = await buildTransitionHandoff({
+			operationId,
+			kind: "enter",
+			source: processState,
+			target,
+			provisioning,
+			store,
 			sessionFile,
-			processState.path,
-		);
+		});
 		const continuation = continuationFor(ctx, "enter", target.path);
-		const recoveryCommand = buildRelaunchCommand(
+		const recoveryCommand = buildRelaunch(
 			target.path,
 			sessionFile,
 			handoffB64,
@@ -1811,7 +1888,6 @@ export default function (pi: ExtensionAPI) {
 		);
 
 		if (decision.kind === "recamp") {
-			const operationId = newOperationId();
 			const started = await startRecamp({
 				targetCwd: target.path,
 				tabLabel: target.branch ?? basename(target.path),
@@ -2583,14 +2659,14 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (!ok) return;
 
-			const handoffB64 = encodeHandoff({
+			const handoffB64 = encodeLegacyHandoff({
 				parentCwd: worktreePath,
 				parentBranch: branch,
 				uncommitted,
 				ignored,
 				kind: "dispose",
 			});
-			const typedCmd = buildRelaunchCommand(
+			const typedCmd = buildRelaunch(
 				repoRoot,
 				sessionFile,
 				handoffB64,
