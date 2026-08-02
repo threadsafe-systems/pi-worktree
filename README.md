@@ -296,14 +296,14 @@ reformat commit is listed in `.git-blame-ignore-revs`; enable it locally with
 `main` is protected, because a ref-less install tracks it — anything landing
 there reaches those users on their next `pi update`. The rules:
 
-| Rule                                      | Setting                |
-| ----------------------------------------- | ---------------------- |
+| Rule                                      | Setting                 |
+| ----------------------------------------- | ----------------------- |
 | Required checks                           | `check (node 20 \| 24)` |
-| Branches up to date before merge (strict) | yes                    |
-| Pull request required                     | yes, 0 approvals       |
-| Conversation resolution required          | yes                    |
-| Force push / delete                       | no                     |
-| Applies to admins                         | yes                    |
+| Branches up to date before merge (strict) | yes                     |
+| Pull request required                     | yes, 0 approvals        |
+| Conversation resolution required          | yes                     |
+| Force push / delete                       | no                      |
+| Applies to admins                         | yes                     |
 
 Zero approvals because a sole maintainer cannot approve their own pull
 request; the gate here is CI, not a second pair of eyes. Admins are included

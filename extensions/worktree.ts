@@ -61,6 +61,7 @@ import type {
 	ExecutionPreference,
 	PendingTransition,
 	ProvisioningState,
+	SessionMode,
 	SuccessorVerification,
 	TransitionCode,
 	TransitionDetails,
@@ -1675,6 +1676,17 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(out || "(no output)", res.code === 0 ? "info" : "error");
 	}
 
+	/**
+	 * How this session currently reaches the worktree it is working on.
+	 *
+	 * A pending hand-off outranks a path target: once shutdown is requested the
+	 * replacement session owns the work, whatever this one had selected.
+	 */
+	function currentSessionMode(): SessionMode {
+		if (pendingTransition) return "relaunch-pending";
+		return agentWorktree ? "path-target" : "process";
+	}
+
 	/** Canonical description of the checkout this process is standing in. */
 	async function currentCheckoutState(
 		repoRoot: string,
@@ -1761,7 +1773,14 @@ export default function (pi: ExtensionAPI) {
 		const repoRoot = await getRepoRoot(pi);
 		const actual = await currentCheckoutState(repoRoot);
 		const store = createStore(await resolveGitCommonDir(repoRoot));
-		const worktrees = await listWorktrees(repoRoot).catch(() => []);
+		// A repository that cannot be listed is evidence of nothing, so verification
+		// continues with no registrations rather than failing the whole check.
+		let worktrees: { path: string; branch: string | null }[] = [];
+		try {
+			worktrees = await listWorktrees(repoRoot);
+		} catch {
+			worktrees = [];
+		}
 
 		if (handoff.kind === "enter") {
 			const receipt = readReceipt(store, handoff.target.path);
@@ -1997,11 +2016,7 @@ export default function (pi: ExtensionAPI) {
 				action: "status",
 				outcome: "status",
 				process: processState,
-				sessionMode: pendingTransition
-					? "relaunch-pending"
-					: agentWorktree
-						? "path-target"
-						: "process",
+				sessionMode: currentSessionMode(),
 				...(agentWorktree
 					? {
 							target: {
@@ -2303,17 +2318,23 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const targetPath = canonicalPath(plan.worktreePath);
-		const registered = (await listWorktrees(repoRoot)).find(
+		const worktrees = await listWorktrees(repoRoot);
+		const registered = worktrees.find(
 			(w) => canonicalPath(w.path) === targetPath,
 		);
 		if (existsSync(plan.worktreePath) || registered) {
+			if (registered?.branch === plan.branch) {
+				return refuse(
+					"target-exists",
+					`${plan.worktreePath} already exists on branch "${plan.branch}". Use enter to work in it.`,
+				);
+			}
+			const occupant = registered?.branch
+				? `checked out on branch "${registered.branch}"`
+				: "not a registered worktree";
 			return refuse(
-				registered && registered.branch === plan.branch
-					? "target-exists"
-					: "target-conflict",
-				registered && registered.branch === plan.branch
-					? `${plan.worktreePath} already exists on branch "${plan.branch}". Use enter to work in it.`
-					: `${plan.worktreePath} already exists but is ${registered?.branch ? `checked out on branch "${registered.branch}"` : "not a registered worktree"}, not "${plan.branch}".`,
+				"target-conflict",
+				`${plan.worktreePath} already exists but is ${occupant}, not "${plan.branch}".`,
 			);
 		}
 
@@ -2532,7 +2553,8 @@ export default function (pi: ExtensionAPI) {
 		} finally {
 			releaseClaim(store, canonicalPath(entry.path), owner);
 		}
-		const registrationGone = !(await listWorktrees(repoRoot)).some(
+		const remaining = await listWorktrees(repoRoot);
+		const registrationGone = !remaining.some(
 			(w) => canonicalPath(w.path) === canonicalPath(entry.path),
 		);
 		const pathGone = !existsSync(entry.path);
@@ -2549,34 +2571,48 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const complete = pathGone && registrationGone && dispose.code === 0;
+
+		if (complete) {
+			const branchNote = branchKept ? "kept: unmerged commits" : "deleted";
+			return toolResult(
+				buildDetails({
+					action: "dispose",
+					outcome: "disposed",
+					process: processState,
+					target,
+					remoteProcessLiveness: "unknown",
+					requestedExecution: request.execution,
+				}),
+				`Disposed ${entry.branch}.\n` +
+					`removedPath: ${entry.path}\n` +
+					`branch: ${entry.branch} (${branchNote})\n` +
+					`This process stayed in ${processState.path}.\n` +
+					"Note: whether another pi session was using that checkout could not be determined.",
+			);
+		}
+
+		const residue: string[] = [];
+		if (!pathGone) residue.push(`${entry.path} still exists`);
+		if (!registrationGone) {
+			residue.push("the worktree is still registered with git");
+		}
 		return toolResult(
 			buildDetails({
 				action: "dispose",
-				outcome: complete ? "disposed" : "dispose-partial",
+				outcome: "dispose-partial",
 				process: processState,
 				target,
 				remoteProcessLiveness: "unknown",
 				requestedExecution: request.execution,
-				...(complete ? {} : { code: "dispose-partial" as const }),
-				...(complete
-					? {}
-					: {
-							partialEffects: [
-								...(pathGone ? [] : [`${entry.path} still exists`]),
-								...(registrationGone
-									? []
-									: ["the worktree is still registered with git"]),
-							],
-							recovery: {
-								instructions: [
-									"Check `git worktree list` and the path above, then clean up manually.",
-								],
-							},
-						}),
+				code: "dispose-partial",
+				partialEffects: residue,
+				recovery: {
+					instructions: [
+						"Check `git worktree list` and the path above, then clean up manually.",
+					],
+				},
 			}),
-			complete
-				? `Disposed ${entry.branch}.\nremovedPath: ${entry.path}\nbranch: ${entry.branch} (${branchKept ? "kept: unmerged commits" : "deleted"})\nThis process stayed in ${processState.path}.\nNote: whether another pi session was using that checkout could not be determined.`
-				: `Teardown of ${entry.path} did not complete. ${(dispose.stderr || dispose.stdout || "").trim()}`.trim(),
+			`Teardown of ${entry.path} did not complete. ${(dispose.stderr || dispose.stdout || "").trim()}`.trim(),
 		);
 	}
 
