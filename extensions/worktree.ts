@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -16,7 +16,76 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import type {
+	BranchDisposition,
+	TransitionHandoffV2,
+	WtHandoff,
+} from "./worktree-handoff.ts";
+import {
+	buildContinuationMessage as buildContinuation,
+	buildRelaunchCommand as buildRelaunch,
+	encodeHandoff as encodeLegacyHandoff,
+	decodeTransitionHandoff,
+	encodeTransitionHandoff,
+	handoffCaveat as legacyCaveat,
+	legacyVerification,
+	transitionCaveat,
+	verifyDispose,
+	verifyEnter,
+} from "./worktree-handoff.ts";
 import { Type } from "typebox";
+import { shQuote } from "./worktree-shell.ts";
+import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
+import {
+	acquireClaim,
+	advanceReceipt,
+	claimPath,
+	classifyProvisioning,
+	configDigest,
+	createStore,
+	failedReceipt,
+	newReceipt,
+	readReceipt,
+	readTeardownReport,
+	readyReceipt,
+	receiptPath,
+	reportPath,
+	releaseClaim,
+	removeReceipt,
+	transferClaim,
+	writeReceipt,
+} from "./worktree-receipt.ts";
+import type {
+	CheckoutState,
+	ExecutionPreference,
+	PendingTransition,
+	ProvisioningState,
+	SessionMode,
+	SuccessorVerification,
+	TransitionCode,
+	TransitionDetails,
+	TransitionIntent,
+} from "./worktree-transition.ts";
+import {
+	buildDetails,
+	decidePendingToolCall,
+	orderedBranchCandidates,
+	refusedDetails,
+	selectExecution,
+	sessionCarryFor,
+	validateTransitionRequest,
+} from "./worktree-transition.ts";
+import type {
+	ProbeDeps,
+	RecampTarget,
+	WaiterHandle,
+} from "./worktree-transport.ts";
+import {
+	buildWaiterInvocation,
+	scheduleWaiter,
+	selectTransport,
+} from "./worktree-transport.ts";
 
 // ---------------------------------------------------------------------------
 // Name generator (adjective-noun)
@@ -303,7 +372,7 @@ export function shouldBlock(opts: {
 }): boolean {
 	const { toolName, mainCheckout, marker, relPath } = opts;
 	if (toolName !== "write" && toolName !== "edit") return false;
-	if (!marker || marker.enforce !== true) return false; // default off / not opted in
+	if (marker?.enforce !== true) return false; // default off / not opted in
 	if (!mainCheckout) return false; // worktrees are always allowed
 	// The marker files are NOT exempt. Toggling enforcement goes through the
 	// worktree-enforce script / command (pi.exec, not the gated write/edit tools),
@@ -798,131 +867,18 @@ export function destroyCandidates(
 // Relaunch helpers
 // ---------------------------------------------------------------------------
 
-/** Single-quote a string for safe literal use inside a POSIX shell command. */
-function shQuote(value: string): string {
-	return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-/** Handoff payload carried across a worktree relaunch, decoded by the new
- *  session to orient the agent. `kind` distinguishes entering a worktree from
- *  disposing one and returning to the main checkout. */
-export interface WtHandoff {
-	parentCwd: string;
-	parentBranch: string;
-	uncommitted: number;
-	/** Count of gitignored local files destroyed on dispose (e.g. .env.local). */
-	ignored?: number;
-	kind?: "enter" | "dispose";
-}
-
-export function encodeHandoff(h: WtHandoff): string {
-	return Buffer.from(JSON.stringify(h)).toString("base64");
-}
-
-export function decodeHandoff(b64: string): WtHandoff | null {
-	try {
-		const h = JSON.parse(Buffer.from(b64, "base64").toString("utf-8"));
-		if (
-			h &&
-			typeof h.parentCwd === "string" &&
-			typeof h.parentBranch === "string" &&
-			typeof h.uncommitted === "number"
-		) {
-			return {
-				parentCwd: h.parentCwd,
-				parentBranch: h.parentBranch,
-				uncommitted: h.uncommitted,
-				...(typeof h.ignored === "number" ? { ignored: h.ignored } : {}),
-				kind: h.kind === "dispose" ? "dispose" : "enter",
-			};
-		}
-	} catch {
-		// fall through to null
-	}
-	return null;
-}
-
-/** The one-turn orientation note injected into the relaunched session. */
-export function handoffCaveat(
-	h: WtHandoff,
-	currentCwd: string,
-	currentBranch: string,
-): string {
-	if (h.kind === "dispose") {
-		const lost: string[] = [];
-		if (h.uncommitted > 0)
-			lost.push(`${h.uncommitted} uncommitted/untracked file(s)`);
-		if ((h.ignored ?? 0) > 0)
-			lost.push(
-				`${h.ignored} gitignored file(s) (e.g. .env.local / local DBs)`,
-			);
-		const wip = lost.length
-			? `- WARNING: the disposed worktree had ${lost.join(" and ")} that were destroyed with it — they are gone.`
-			: `- The disposed worktree had no uncommitted or gitignored local files.`;
-		return (
-			`## Session moved back to the main checkout\n` +
-			`This session was forked out of the worktree at ${h.parentCwd} (branch ${h.parentBranch}) back into the main repository at ${currentCwd}. Removal of that worktree and a soft-delete (git branch -d) of branch ${h.parentBranch} were requested during shutdown — verify with \`git worktree list\` and \`git branch\`, and re-run cleanup if either remains (an unmerged branch is deliberately kept).\n` +
-			`- Repo-relative paths are unchanged (\`src/foo.ts\` is still \`src/foo.ts\`).\n` +
-			`- Absolute paths, and any path under the old worktree directory, no longer resolve.\n` +
-			`${wip}\n` +
-			`Continue the task here on ${currentBranch || "the main branch"}.`
-		);
-	}
-	const wip =
-		h.uncommitted > 0
-			? `- WARNING: ${h.uncommitted} file(s) had uncommitted changes in ${h.parentCwd}. A worktree is a fresh checkout, so those changes are NOT present here — retrieve them from ${h.parentCwd} if this work depends on them.`
-			: `- The previous checkout had no uncommitted changes.`;
-	return (
-		`## Session migrated into a worktree\n` +
-		`This session was forked from ${h.parentCwd} (branch ${h.parentBranch}) into this git worktree at ${currentCwd} (branch ${currentBranch}).\n` +
-		`- Repo-relative paths are unchanged (\`src/foo.ts\` is still \`src/foo.ts\`).\n` +
-		`- Absolute paths, and any path relative to the previous working directory, now resolve under this worktree.\n` +
-		`${wip}\n` +
-		`Continue the task here and commit to ${currentBranch}.`
-	);
-}
-
-/** Build the shell command typed into the pane to relaunch pi in a directory.
- *  Optionally forks the parent session (to carry history) and passes a base64
- *  handoff payload via PI_WT_HANDOFF for the new session to decode.
- *
- *  `continuation` is passed as pi's positional initial message. A forked
- *  session otherwise loads history and waits at the editor, so this is the
- *  only thing that makes an interrupted task resume without a human nudge. */
-export function buildRelaunchCommand(
-	targetDir: string,
-	forkSessionFile?: string,
-	handoffB64?: string,
-	continuation?: string,
-): string {
-	const envPrefix = handoffB64 ? `PI_WT_HANDOFF=${shQuote(handoffB64)} ` : "";
-	const forkArg = forkSessionFile ? ` --fork ${shQuote(forkSessionFile)}` : "";
-	const msgArg = continuation?.trim() ? ` ${shQuote(continuation.trim())}` : "";
-	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}${msgArg}`;
-}
-
-/** Initial message for a session that hopped while the agent was mid-task.
- *
- *  `ctx.shutdown()` aborts the turn in flight, so the carried history can end
- *  on an unanswered tool call or a side effect whose result was never seen.
- *  The message therefore tells the agent to re-establish state before acting:
- *  a bare "continue" invites it to redo work that already succeeded. */
-export function buildContinuationMessage(
-	kind: WtHandoff["kind"],
-	targetCwd: string,
-): string {
-	const where =
-		kind === "dispose"
-			? `back to the main checkout at ${targetCwd}, and the worktree you were in has been removed`
-			: `into the worktree at ${targetCwd}`;
-	return (
-		`[automatic] Your session was moved ${where}. The turn you were running ` +
-		`was interrupted by that hop, so work may be half-finished.\n\n` +
-		`Re-establish where you actually got to before doing anything: check ` +
-		`git status and the files you were editing. Do not redo steps that ` +
-		`already completed. Then carry on with the task you were working on.`
-	);
-}
+/**
+ * Handoff encoding and successor verification live in the handoff module.
+ * Re-exported because they are part of this extension's tested public surface.
+ */
+export type { WtHandoff } from "./worktree-handoff.ts";
+export {
+	buildContinuationMessage,
+	buildRelaunchCommand,
+	decodeHandoff,
+	encodeHandoff,
+	handoffCaveat,
+} from "./worktree-handoff.ts";
 
 /** Shared worktree-teardown script builder (used by dispose and destroy). All
  *  paths and the branch name are shQuote'd. `hardDelete` selects `git branch -D`
@@ -934,16 +890,36 @@ function buildTeardownScript(
 	preRemove: string[] | undefined,
 	hardDelete: boolean,
 ): string {
+	// Dispose promises never to destroy work, so it re-checks cleanliness before
+	// --force. Destroy makes the opposite promise: the caller has already
+	// confirmed they want the checkout and its ignored files gone, so rechecking
+	// would strand every worktree that has a node_modules in it.
+	const recheckClean = !hardDelete;
 	const lines: string[] = [];
 	const hooks = preRemove ?? [];
 	if (hooks.length) {
 		// Fail-fast: a failing preRemove hook (e.g. a backup) must abort before the
-		// irreversible worktree/branch removal below.
+		// irreversible removal below. Each hook runs in a subshell, because a
+		// project hook containing `exit` would otherwise end this script at the
+		// hook step and skip every check between it and the caller's report.
 		lines.push("set -e");
 		for (const cmd of hooks) {
-			lines.push(`cd ${shQuote(worktreePath)} && ${cmd}`);
+			lines.push(`( cd ${shQuote(worktreePath)} && ${cmd} )`);
 		}
 		lines.push("set +e");
+	}
+	if (recheckClean) {
+		// Hooks are arbitrary project commands and may leave work behind, and the
+		// caller's dirty check happened before this script started, so what was
+		// clean then may not be clean now. `--force` would destroy it silently.
+		lines.push(
+			`if [ -n "$(git -C ${shQuote(worktreePath)} status --porcelain --ignored 2>/dev/null)" ]; then`,
+		);
+		lines.push(
+			`  echo "refusing to remove ${worktreePath}: it is no longer clean" >&2`,
+		);
+		lines.push("  exit 1");
+		lines.push("fi");
 	}
 	lines.push(`cd ${shQuote(repoRoot)}`);
 	// NB: no `rm -rf` fallback. If `git worktree remove` refuses (e.g. the path
@@ -957,6 +933,169 @@ function buildTeardownScript(
 		`git branch -${hardDelete ? "D" : "d"} ${shQuote(branch)} 2>/dev/null || true`,
 	);
 	return lines.join("\n");
+}
+
+/**
+ * Teardown script for a worktree the exiting pi process is standing in.
+ *
+ * Everything destructive here runs after pi is gone, in a detached shell, with
+ * nobody watching. So it re-establishes its right to act rather than assuming
+ * it: it proves it still owns the target's lifecycle claim, that the repository
+ * is on the branch the transition planned for, and that the worktree is still
+ * clean — each immediately before the step that depends on it. A soft branch
+ * delete gets a second destination check, because that is the one step whose
+ * safety is judged relative to whatever HEAD happens to be.
+ *
+ * It always writes a teardown report. The successor reads that instead of
+ * inferring success from the mere fact that it was relaunched.
+ */
+export function buildVerifiedTeardownScript(opts: {
+	repoRoot: string;
+	worktreePath: string;
+	branch: string;
+	preRemove?: string[];
+	operationId: string;
+	waiterOwnerFile: string;
+	receiptFile: string;
+	reportFile: string;
+	expectedDestinationBranch: string;
+}): string {
+	// Each hook runs in a subshell: project hooks are arbitrary trusted commands,
+	// and one containing `exit` would otherwise kill the waiter before it could
+	// record what happened or leave the worktree in a known state.
+	const hooks = (opts.preRemove ?? [])
+		.map(
+			(cmd) => `if [ "$abort" = "" ]; then
+  ( cd ${shQuote(opts.worktreePath)} && ${cmd} ) || abort="pre-remove"
+fi`,
+		)
+		.join("\n");
+
+	return `
+set -u
+repo=${shQuote(opts.repoRoot)}
+wt=${shQuote(opts.worktreePath)}
+branch=${shQuote(opts.branch)}
+op=${shQuote(opts.operationId)}
+owner=${shQuote(opts.waiterOwnerFile)}
+receipt=${shQuote(opts.receiptFile)}
+report=${shQuote(opts.reportFile)}
+dest=${shQuote(opts.expectedDestinationBranch)}
+# The waiter's pid, passed in by the waiter itself. This teardown runs as its
+# own shell, so $$ here belongs to the child, not to the process the origin
+# handed the claim to.
+waiter_pid="\${1:-}"
+abort=""
+stages=""
+
+record() { stages="\${stages}\${stages:+,}{\\"name\\":\\"$1\\",\\"status\\":\\"$2\\"}"; }
+
+# This detached shell is the claim owner only if the origin persisted the
+# hand-off to exactly this pid. Without that, it must not touch anything.
+if [ -z "$waiter_pid" ] ||
+   ! grep -qF "\\"operationId\\":\\"$op\\"" "$owner" 2>/dev/null ||
+   ! grep -qF "\\"pid\\":$waiter_pid," "$owner" 2>/dev/null ||
+   ! grep -qF "\\"role\\":\\"waiter\\"" "$owner" 2>/dev/null; then
+  abort="claim"
+  record claim failed
+else
+  record claim ok
+fi
+
+# The soft delete below is judged against the destination HEAD, so a repository
+# that moved since scheduling is not the repository this teardown planned for.
+if [ "$abort" = "" ]; then
+  actual_dest=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$actual_dest" != "$dest" ]; then
+    abort="destination"
+    record destination failed
+  else
+    record destination ok
+  fi
+fi
+
+if [ "$abort" = "" ]; then
+  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
+    abort="dirty"
+    record dirty failed
+  else
+    record dirty ok
+  fi
+fi
+
+${hooks}
+if [ "$abort" = "pre-remove" ]; then
+  record pre-remove failed
+elif [ "$abort" = "" ]; then
+  record pre-remove ok
+fi
+
+if [ "$abort" = "" ]; then
+  cd "$repo" || abort="repo-cwd"
+fi
+
+if [ "$abort" = "" ]; then
+  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
+    abort="dirty-after-hooks"
+    record dirty-recheck failed
+  else
+    record dirty-recheck ok
+  fi
+fi
+
+if [ "$abort" = "" ]; then
+  git worktree remove --force "$wt" 2>/dev/null || git worktree prune 2>/dev/null || true
+  if [ -e "$wt" ]; then record remove failed; else record remove ok; fi
+fi
+
+# Only delete the branch once the checkout is really gone, and only if the
+# destination is still the one this teardown checked against.
+branch_disposition="skipped"
+if [ "$abort" = "" ] && [ ! -e "$wt" ]; then
+  recheck=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$recheck" = "$dest" ]; then
+    # "git branch -d" refuses an unmerged branch, which is the intended
+    # soft-dispose outcome. Deciding that here, while the facts are current,
+    # avoids the successor re-judging it against a HEAD that has since moved.
+    if git branch -d "$branch" 2>/dev/null; then
+      branch_disposition="deleted"
+    elif git show-ref --verify --quiet "refs/heads/$branch"; then
+      branch_disposition="kept-unmerged"
+    else
+      branch_disposition="deleted"
+    fi
+    record branch ok
+  else
+    record branch skipped
+  fi
+fi
+
+path_present=true; [ -e "$wt" ] || path_present=false
+registration_present=true
+git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt" || registration_present=false
+branch_present=true
+git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || branch_present=false
+
+if [ "$path_present" = "false" ] && [ "$registration_present" = "false" ]; then
+  rm -f "$receipt"
+fi
+receipt_present=true; [ -e "$receipt" ] || receipt_present=false
+
+mkdir -p "$(dirname "$report")"
+tmp="$report.tmp.$$"
+printf '{"branchDisposition":"%s","completedAt":"%s","expectedDestination":{"branch":"%s","path":"%s"},"observed":{"branchPresent":%s,"pathPresent":%s,"receiptPresent":%s,"registrationPresent":%s},"operationId":"%s","schemaVersion":1,"stages":[%s]}' \\
+  "$branch_disposition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dest" "$repo" \\
+  "$branch_present" "$path_present" "$receipt_present" "$registration_present" \\
+  "$op" "$stages" > "$tmp"
+mv -f "$tmp" "$report"
+
+# Only an operation that proved it owned this target may release the claim.
+# A shell that failed the ownership check would otherwise erase the very
+# evidence that stopped it, and with it the real owner's claim.
+if [ "$abort" != "claim" ]; then
+  rm -rf "$(dirname "$owner")"
+fi
+`;
 }
 
 /** Build the shell script run (from the main repo) after pi exits to tear down
@@ -1032,7 +1171,7 @@ async function buildHandoff(
 	} catch {
 		// best-effort
 	}
-	return encodeHandoff({
+	return encodeLegacyHandoff({
 		parentCwd,
 		parentBranch,
 		uncommitted,
@@ -1048,167 +1187,65 @@ function currentSessionFile(ctx: unknown): string | undefined {
 	)?.sessionManager?.getSessionFile?.();
 }
 
-/** Environment facts for multiplexer detection, injected for testability. */
-export interface MuxEnv {
-	CMUX_SURFACE_ID?: string;
-	HERDR_PANE_ID?: string;
-	HERDR_WORKSPACE_ID?: string;
-	TMUX?: string;
-	TMUX_PANE?: string;
-}
+/**
+ * Transport detection and the detached waiter live in the transport module so
+ * ownership rules and script construction have one implementation. Re-exported
+ * because they are part of this extension's tested public surface.
+ */
+export type { MuxEnv, RecampTarget } from "./worktree-transport.ts";
+export { pickRelaunchMux } from "./worktree-transport.ts";
 
-/** Where a re-camped session should land: a new tab at `targetCwd`, named
- *  after the branch being camped on. */
-export interface RecampTarget {
-	targetCwd: string;
-	tabLabel: string;
-}
-
-/** Pick the terminal multiplexer that owns the current pane, if any.
- *
- *  Precedence: cmux, then herdr, then tmux. cmux and herdr both set a
- *  per-surface/per-pane id on the processes they spawn, so their presence is
- *  definitive for THIS process. TMUX is checked last because it can leak into
- *  herdr panes (e.g. when the herdr server was started from inside a tmux
- *  session); typing into that stale outer pane would land the relaunch
- *  command somewhere unrelated. */
-export function pickRelaunchMux(
-	env: MuxEnv,
-):
-	| { kind: "cmux"; target: string }
-	| { kind: "herdr"; target: string; workspaceId: string }
-	| { kind: "tmux"; target: string }
-	| null {
-	if (env.CMUX_SURFACE_ID) return { kind: "cmux", target: env.CMUX_SURFACE_ID };
-	if (env.HERDR_PANE_ID)
+/** Probe backend for the running process: read-only queries, bounded, no shell. */
+const liveProbeDeps: ProbeDeps = {
+	hasExecutable(name) {
+		// Presence is decided by whether the binary can be executed at all, not by
+		// its exit code: a transport that rejects `--version` is still installed.
+		// Avoids a shell, so nothing here can be word-split or expanded.
+		const r = spawnSync(name, ["--version"], { timeout: 3_000 });
+		return (r.error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT";
+	},
+	run(command, args, timeoutMs) {
+		const r = spawnSync(command, args, {
+			encoding: "utf-8",
+			timeout: timeoutMs,
+		});
 		return {
-			kind: "herdr",
-			target: env.HERDR_PANE_ID,
-			workspaceId: env.HERDR_WORKSPACE_ID ?? "",
+			code: r.status ?? 1,
+			stdout: r.stdout ?? "",
+			stderr: r.stderr ?? "",
 		};
-	if (env.TMUX) return { kind: "tmux", target: env.TMUX_PANE ?? "" };
-	return null;
-}
+	},
+};
 
 /**
- * Schedule a pi relaunch in the current terminal pane by injecting a command
- * via cmux, herdr, or tmux once this pi process has exited.
+ * Schedule a pi relaunch in the current terminal pane, once this pi process has
+ * exited, via the multiplexer that owns the pane.
  *
- * Reliability notes (these were all bugs in the original implementation):
- *  - We wait for THIS pi process to actually exit before sending keys, instead
- *    of a blind `sleep 0.3` that raced pi's TUI teardown. Keys sent while pi
- *    still owns the pane in raw mode are swallowed.
- *  - We target the originating pane explicitly ($TMUX_PANE / $HERDR_PANE_ID /
- *    surface id) so the keys cannot land in some other active pane.
- *  - We send the command text literally (`send-keys -l` / `pane send-text`)
- *    and then a SEPARATE `Enter` key, instead of relying on a trailing "\n"
- *    character.
- *  - Dynamic values are passed as positional args to `bash -c`, never
- *    interpolated into the script body, so paths with spaces/quotes are safe.
- *  - An optional preScript runs (from the detached waiter, after pi exits and
- *    before the keys are sent) to perform teardown such as removing a worktree.
- *
- * Under herdr with a `recamp` target, the session moves to a NEW TAB in the
- * same workspace, labelled with the branch, and the originating pane is closed
- * (herdr collapses the tab when that was its last pane, so a split-out pane the
- * user owns is left alone). The wait-for-exit is still required even though a
- * new tab could be spawned eagerly: `pi --fork` snapshots the session file as
- * of its last flush, so forking before the origin has exited would truncate the
- * carried history.
- *
- * Returns true if a relaunch was scheduled, false if not in a known multiplexer.
+ * Resolves only when the OS confirms the waiter process started. Scheduling is
+ * still weaker than delivery: an acknowledged waiter proves something is there
+ * to run the relaunch, not that the multiplexer accepted the keys.
  */
-function scheduleRelaunch(opts: {
+async function scheduleRelaunch(opts: {
 	typedCmd: string;
 	preScript?: string;
 	recamp?: RecampTarget;
-}): boolean {
-	const parentPid = String(process.pid);
-	const pre = opts.preScript ?? "";
+}): Promise<boolean> {
+	const selection = selectTransport(process.env, liveProbeDeps);
+	if (!selection.available) return false;
 
-	const mux = pickRelaunchMux(process.env);
-	if (!mux) return false;
-
-	let script: string;
-	let dynamic: string[];
-
-	if (mux.kind === "cmux") {
-		// cmux: wait for pi to exit, run teardown, then type the command.
-		script = `
-      parent="$1"; surface="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      cmux send --surface "$surface" -- "$cmd"
-      cmux send --surface "$surface" -- $'\\r'
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	} else if (mux.kind === "herdr" && opts.recamp) {
-		// herdr: re-camp into a new tab in the same workspace, named after the
-		// branch. If tab creation fails we fall back to typing into the
-		// originating pane rather than stranding a session that has already exited.
-		script = `
-      parent="$1"; ws="$2"; target="$3"; label="$4"; origin="$5"; cmd="$6"; pre="$7"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      created=$(herdr tab create --workspace "$ws" --cwd "$target" --label "$label" --focus 2>/dev/null)
-      pane=$(printf '%s' "$created" | sed -n 's/.*"pane_id":"\\([^"]*\\)".*/\\1/p' | head -1)
-      if [ -n "$pane" ]; then
-        herdr pane run "$pane" "$cmd"
-        herdr pane close "$origin" >/dev/null 2>&1
-      else
-        herdr pane send-text "$origin" "$cmd"
-        herdr pane send-keys "$origin" enter
-      fi
-    `;
-		dynamic = [
-			mux.workspaceId,
-			opts.recamp.targetCwd,
-			opts.recamp.tabLabel,
-			mux.target,
-			opts.typedCmd,
-			pre,
-		];
-	} else if (mux.kind === "herdr") {
-		// herdr without a re-camp target: type into the originating pane.
-		script = `
-      parent="$1"; target="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      herdr pane send-text "$target" "$cmd"
-      herdr pane send-keys "$target" enter
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	} else {
-		// tmux: target the originating pane when known; -l types literally; a
-		// separate Enter submits.
-		script = `
-      parent="$1"; target="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      if [ -n "$target" ]; then
-        tmux send-keys -t "$target" -l -- "$cmd"
-        tmux send-keys -t "$target" Enter
-      else
-        tmux send-keys -l -- "$cmd"
-        tmux send-keys Enter
-      fi
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	}
-
-	const args = ["-c", script, "pi-worktree-relaunch", parentPid, ...dynamic];
-
-	// Detached + unref so the waiter outlives pi's shutdown.
-	const child = spawn("bash", args, {
-		detached: true,
-		stdio: "ignore",
-	});
-	child.unref();
-
+	const result = await scheduleWaiter(
+		buildWaiterInvocation({
+			candidate: selection.candidate,
+			parentPid: process.pid,
+			typedCmd: opts.typedCmd,
+			...(opts.preScript ? { preScript: opts.preScript } : {}),
+			...(opts.recamp ? { recamp: opts.recamp } : {}),
+		}),
+	);
+	if (!result.ok) return false;
+	// Nothing else needs to hold this waiter: create/enter has no claim to hand
+	// over, so it is released as soon as the OS confirms it exists.
+	result.handle.commitDetach();
 	return true;
 }
 
@@ -1222,19 +1259,19 @@ function continuationFor(
 	kind: WtHandoff["kind"],
 	targetCwd: string,
 ): string | undefined {
-	return ctx.isIdle() ? undefined : buildContinuationMessage(kind, targetCwd);
+	return ctx.isIdle() ? undefined : buildContinuation(kind, targetCwd);
 }
 
 /** Relaunch pi in a worktree, forking the parent session and passing a handoff.
  *  Under herdr this re-camps into a new tab named after `branch`. */
-function relaunchInPlace(
+async function relaunchInPlace(
 	worktreePath: string,
 	branch: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
 	continuation?: string,
-): boolean {
-	const typedCmd = buildRelaunchCommand(
+): Promise<boolean> {
+	const typedCmd = buildRelaunch(
 		worktreePath,
 		forkSessionFile,
 		handoffB64,
@@ -1254,27 +1291,43 @@ export default function (pi: ExtensionAPI) {
 	let worktreeBranch: string | null = null;
 	let agentWorktree: { repoRoot: string; branch: string; path: string } | null =
 		null;
+	/**
+	 * Set once a hand-off is armed and shutdown has been requested. Every later
+	 * side effect belongs to the replacement session, not this one.
+	 */
+	let pendingTransition: PendingTransition | null = null;
+	/** Result of checking the hand-off this session woke up with, if any. */
+	let lastVerification: SuccessorVerification | null = null;
 
 	// --- Model-callable worktree session helper ---
 	pi.registerTool({
 		name: "worktree_session",
 		label: "Worktree Session",
 		description:
-			"Create, enter, inspect, or dispose git worktrees using this repo's pi-worktree conventions.",
+			"Create, enter, inspect, or dispose git worktrees using this repo's pi-worktree conventions. On a capable interactive runtime, create/enter move this session into the worktree by restarting pi there.",
 		promptSnippet:
 			"Manage git worktree discipline: create/enter a linked worktree, then dispose it after committing.",
 		promptGuidelines: [
 			"Use worktree_session when a repo enforces worktree discipline and you need to write/edit from the main checkout.",
-			"After worktree_session create/enter returns a worktreePath, target write/edit tools at absolute paths inside that worktree and prefix bash commands with `cd <worktreePath> &&`.",
+			"Call worktree_session create or enter as the ONLY tool call in that response: it may end this session and resume it inside the worktree.",
+			"Read the worktree_session outcome field: relaunch-scheduled means this session is ending and a replacement resumes the task; path-target means the process did NOT move, so use absolute paths under worktreePath and prefix bash with `cd <worktreePath> &&`; manual-restart means nothing moved and the user must run the supplied command.",
+			'Pass execution:"paths" to worktree_session when you deliberately want to keep this process where it is and work through absolute paths instead of restarting.',
 			"Call worktree_session dispose after committing when the task asks you to step back out to the main git directory; it refuses to remove a dirty worktree.",
 		],
+		// Sequential execution makes the whole sibling batch ordered, so tool calls
+		// the model issued alongside a transition finish and are recorded before
+		// this session is allowed to shut down.
+		executionMode: "sequential",
 		parameters: Type.Object({
-			action: Type.Union([
-				Type.Literal("status"),
-				Type.Literal("create"),
-				Type.Literal("enter"),
-				Type.Literal("dispose"),
-			]),
+			action: StringEnum(["status", "create", "enter", "dispose"] as const, {
+				description: "Worktree lifecycle action.",
+			}),
+			execution: Type.Optional(
+				StringEnum(["auto", "recamp", "paths"] as const, {
+					description:
+						"auto (default): move this session into the worktree when the runtime supports it, otherwise fall back truthfully. recamp: require a real session move. paths: stay here and use absolute paths.",
+				}),
+			),
 			name: Type.Optional(
 				Type.String({
 					description:
@@ -1291,12 +1344,49 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return handleWorktreeSessionTool(params, ctx);
+			try {
+				return await handleWorktreeSessionTool(params, ctx);
+			} catch (err) {
+				// Git can fail for reasons that are nobody's bug: a repository being
+				// rewritten underneath us, a timeout, a binary swapped mid-session.
+				// The model still needs to know where it is and what to do next,
+				// which a thrown string cannot tell it.
+				return toolResult(
+					buildDetails({
+						action: params.action,
+						outcome: "failed",
+						process: { path: ctx.cwd, branch: null, kind: "main" },
+						code: "git-failed",
+						...(params.execution
+							? { requestedExecution: params.execution }
+							: {}),
+						recovery: {
+							instructions: [
+								"Nothing was changed by this call.",
+								"Check `git worktree list` and `git status`, then retry.",
+							],
+						},
+					}),
+					`Worktree operation failed: ${(err as Error).message}`,
+				);
+			}
 		},
 	});
 
 	// --- Optional worktree-discipline guard ---
 	pi.on("tool_call", async (event, ctx) => {
+		// A pending transition means this process is on its way out. Running any
+		// further tool here would act on the wrong working directory and its
+		// result would never reach the session that continues the task.
+		const pendingDecision = decidePendingToolCall({
+			toolName: event.toolName,
+			action: (event.input as { action?: string } | undefined)?.action,
+			pending: pendingTransition !== null,
+		});
+		if (!pendingDecision.allow) {
+			return { block: true, reason: pendingDecision.reason };
+		}
+
 		if (event.toolName !== "write" && event.toolName !== "edit") return;
 		const target = (event.input as { path?: unknown }).path;
 		if (typeof target !== "string" || target.length === 0) return;
@@ -1462,7 +1552,7 @@ export default function (pi: ExtensionAPI) {
 					// session so history follows the hop, plus a handoff note.
 					const sessionFile = currentSessionFile(ctx);
 					const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
-					const relaunched = relaunchInPlace(
+					const relaunched = await relaunchInPlace(
 						worktreePath,
 						branch,
 						sessionFile,
@@ -1535,10 +1625,35 @@ export default function (pi: ExtensionAPI) {
 		// One-turn orientation when this session was forked across a worktree hop.
 		const handoffEnv = process.env.PI_WT_HANDOFF;
 		if (!handoffShown && handoffEnv) {
-			const h = decodeHandoff(handoffEnv);
-			if (h) {
+			const decoded = decodeTransitionHandoff(handoffEnv);
+			if (decoded?.version === 1) {
 				handoffShown = true;
-				extra += `\n\n${handoffCaveat(h, process.cwd(), worktreeBranch ?? "")}`;
+				lastVerification = legacyVerification(
+					await currentCheckoutState(await getRepoRoot(pi)),
+					new Date().toISOString(),
+					decoded.legacy.kind ?? "enter",
+				);
+				extra += `\n\n${legacyCaveat(decoded.legacy, process.cwd(), worktreeBranch ?? "")}`;
+			} else if (decoded?.version === 2) {
+				handoffShown = true;
+				// The predecessor's claim is only a claim; check it before letting
+				// the agent act as though the move succeeded.
+				lastVerification = await verifyTransition(decoded.handoff);
+				extra += `\n\n${legacyCaveat(
+					{
+						parentCwd: decoded.handoff.source.path,
+						parentBranch: decoded.handoff.source.branch ?? "",
+						uncommitted: decoded.handoff.uncommitted,
+						...(decoded.handoff.ignored === undefined
+							? {}
+							: { ignored: decoded.handoff.ignored }),
+						kind: decoded.handoff.kind,
+					},
+					process.cwd(),
+					worktreeBranch ?? "",
+				)}`;
+				const caveat = transitionCaveat(lastVerification);
+				if (caveat) extra += `\n\n${caveat}`;
 			}
 		}
 		if (!extra) return;
@@ -1561,9 +1676,308 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify(out || "(no output)", res.code === 0 ? "info" : "error");
 	}
 
+	/**
+	 * How this session currently reaches the worktree it is working on.
+	 *
+	 * A pending hand-off outranks a path target: once shutdown is requested the
+	 * replacement session owns the work, whatever this one had selected.
+	 */
+	function currentSessionMode(): SessionMode {
+		if (pendingTransition) return "relaunch-pending";
+		return agentWorktree ? "path-target" : "process";
+	}
+
+	/** Canonical description of the checkout this process is standing in. */
+	async function currentCheckoutState(
+		repoRoot: string,
+	): Promise<CheckoutState> {
+		const detected = await detectWorktree(pi);
+		const path = canonicalPath(detected?.worktreePath ?? repoRoot);
+		let branch = detected?.branch ?? null;
+		if (!branch) {
+			const head = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+				cwd: path,
+				timeout: 5_000,
+			});
+			branch =
+				head.code === 0 && head.stdout.trim() !== "HEAD"
+					? head.stdout.trim()
+					: null;
+		}
+		return { path, branch, kind: detected ? "linked" : "main" };
+	}
+
+	/**
+	 * Build the payload the replacement session will check itself against.
+	 *
+	 * The target's provisioning identity is captured here, at scheduling time,
+	 * so a receipt that is replaced or removed before the successor starts shows
+	 * up as a mismatch rather than passing as a different but plausible state.
+	 */
+	async function buildTransitionHandoff(opts: {
+		operationId: string;
+		kind: "enter" | "dispose";
+		source: CheckoutState;
+		target: CheckoutState;
+		provisioning: ProvisioningState;
+		store: ReceiptStore;
+		sessionFile: string | undefined;
+		dispose?: { removedPath: string; branch: string };
+	}): Promise<string> {
+		let uncommitted = 0;
+		let ignored = 0;
+		const status = await pi.exec(
+			"git",
+			["status", "--porcelain", "--ignored"],
+			{
+				cwd: opts.source.path,
+				timeout: 5_000,
+			},
+		);
+		if (status.code === 0) {
+			for (const line of status.stdout.split("\n")) {
+				if (!line.trim()) continue;
+				if (line.startsWith("!!")) ignored++;
+				else uncommitted++;
+			}
+		}
+
+		const receipt = readReceipt(opts.store, opts.target.path);
+		const ready = opts.provisioning === "ready" && receipt.kind === "present";
+		return encodeTransitionHandoff({
+			schemaVersion: 2,
+			operationId: opts.operationId,
+			kind: opts.kind,
+			source: opts.source,
+			target: opts.target,
+			targetProvisioning: ready ? "ready" : "unmanaged",
+			...(ready ? { expectedReceiptHash: receipt.hash } : {}),
+			sessionCarry: opts.sessionFile ? "fork" : "fresh",
+			uncommitted,
+			...(ignored > 0 ? { ignored } : {}),
+			...(opts.dispose ? { dispose: opts.dispose } : {}),
+		});
+	}
+
+	/**
+	 * Check a v2 hand-off against what this session can actually observe.
+	 *
+	 * Reads git and the receipt store directly rather than trusting any field
+	 * the predecessor wrote, so a transition that went somewhere unexpected is
+	 * reported as a mismatch instead of being narrated as success.
+	 */
+	async function verifyTransition(
+		handoff: TransitionHandoffV2,
+	): Promise<SuccessorVerification> {
+		const now = new Date().toISOString();
+		const repoRoot = await getRepoRoot(pi);
+		const actual = await currentCheckoutState(repoRoot);
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		// A repository that cannot be listed is evidence of nothing, so verification
+		// continues with no registrations rather than failing the whole check.
+		let worktrees: { path: string; branch: string | null }[] = [];
+		try {
+			worktrees = await listWorktrees(repoRoot);
+		} catch {
+			worktrees = [];
+		}
+
+		if (handoff.kind === "enter") {
+			const receipt = readReceipt(store, handoff.target.path);
+			return verifyEnter(
+				handoff,
+				{
+					actual,
+					registrationPresent: worktrees.some(
+						(w) => canonicalPath(w.path) === canonicalPath(handoff.target.path),
+					),
+					provisioning: classifyProvisioning(receipt, {
+						worktreePath: handoff.target.path,
+						...(handoff.target.branch ? { branch: handoff.target.branch } : {}),
+					}),
+					...(receipt.kind === "present" ? { receiptHash: receipt.hash } : {}),
+				},
+				now,
+			);
+		}
+
+		const removed = handoff.dispose?.removedPath ?? "";
+		const branch = handoff.dispose?.branch ?? "";
+		const report = readTeardownReport(store, handoff.operationId);
+		const branchRef = branch
+			? await pi.exec(
+					"git",
+					["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+					{
+						cwd: repoRoot,
+						timeout: 5_000,
+					},
+				)
+			: { code: 1 };
+
+		let branchDisposition: BranchDisposition;
+		const recorded =
+			report.kind === "present" ? report.report.branchDisposition : undefined;
+		if (recorded === "deleted") {
+			branchDisposition = "deleted";
+		} else if (recorded === "kept-unmerged") {
+			// Teardown decided this while it still had the facts. Re-judging it here
+			// against a HEAD that may have moved since would turn a correct retention
+			// into a spurious failure.
+			branchDisposition = "kept-unmerged";
+		} else if (branchRef.code !== 0) {
+			branchDisposition = "deleted";
+		} else {
+			branchDisposition = recorded === "skipped" ? "delete-failed" : "unknown";
+		}
+
+		return verifyDispose(
+			handoff,
+			{
+				actual,
+				pathPresent: removed ? existsSync(removed) : false,
+				registrationPresent: worktrees.some(
+					(w) => canonicalPath(w.path) === canonicalPath(removed),
+				),
+				receiptPresent: removed
+					? readReceipt(store, removed).kind !== "absent"
+					: false,
+				branchDisposition,
+				reportPresent: report.kind === "present",
+			},
+			now,
+		);
+	}
+
+	/**
+	 * The repository's common git directory, where lifecycle evidence lives.
+	 *
+	 * `--path-format` needs git 2.31; older git still answers the plain form,
+	 * which is relative to the repository it was asked from.
+	 */
+	async function resolveGitCommonDir(repoRoot: string): Promise<string> {
+		const absolute = await pi.exec(
+			"git",
+			["rev-parse", "--path-format=absolute", "--git-common-dir"],
+			{ cwd: repoRoot, timeout: 5_000 },
+		);
+		if (absolute.code === 0 && absolute.stdout.trim())
+			return absolute.stdout.trim();
+		const legacy = await pi.exec("git", ["rev-parse", "--git-common-dir"], {
+			cwd: repoRoot,
+			timeout: 5_000,
+		});
+		if (legacy.code === 0 && legacy.stdout.trim()) {
+			return resolve(repoRoot, legacy.stdout.trim());
+		}
+		throw new Error("Could not resolve the repository's common git directory.");
+	}
+
+	function newOperationId(): string {
+		return `wt-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	}
+
+	/** Whether this pi provides the lifecycle guarantees a re-camp depends on. */
+	function piSupportsRecamp(ctx: ExtensionContext): boolean {
+		// Deferred shutdown and sequential/terminating tool results are 0.83
+		// contracts. `mode` is the observable proof they are present, since older
+		// contexts did not expose it at all.
+		return typeof ctx.mode === "string";
+	}
+
+	async function listWorktrees(repoRoot: string) {
+		const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
+			cwd: repoRoot,
+			timeout: 5_000,
+		});
+		if (listed.code !== 0)
+			throw new Error("Could not read the git worktree list.");
+		return parseWorktreeList(listed.stdout);
+	}
+
+	/**
+	 * Start a session hand-off to `target` and report whether a waiter is armed.
+	 *
+	 * Returns only after the OS confirms the waiter exists, so a caller that goes
+	 * on to request shutdown knows something is there to bring the session back.
+	 */
+	async function startRecamp(opts: {
+		targetCwd: string;
+		tabLabel: string;
+		typedCmd: string;
+		preScript?: string;
+		hold?: boolean;
+	}): Promise<
+		| { ok: true; transport: "cmux" | "herdr" | "tmux"; handle?: WaiterHandle }
+		| { ok: false; code: TransitionCode; reason: string }
+	> {
+		const selection = selectTransport(process.env, liveProbeDeps);
+		if (!selection.available) {
+			return {
+				ok: false,
+				code: "transport-preflight-failed",
+				reason: selection.reason,
+			};
+		}
+		const result = await scheduleWaiter(
+			buildWaiterInvocation({
+				candidate: selection.candidate,
+				parentPid: process.pid,
+				typedCmd: opts.typedCmd,
+				...(opts.preScript ? { preScript: opts.preScript } : {}),
+				recamp: { targetCwd: opts.targetCwd, tabLabel: opts.tabLabel },
+			}),
+		);
+		if (!result.ok)
+			return { ok: false, code: "schedule-failed", reason: result.reason };
+		if (opts.hold) {
+			// The caller still has work the waiter depends on, so it decides when
+			// the waiter is released.
+			return {
+				ok: true,
+				transport: selection.candidate.kind,
+				handle: result.handle,
+			};
+		}
+		result.handle.commitDetach();
+		return { ok: true, transport: selection.candidate.kind };
+	}
+
+	/** Provisioning classification for a target, fail-closed on damaged evidence. */
+	function provisioningFor(
+		store: ReceiptStore,
+		targetPath: string,
+		branch: string,
+	) {
+		return classifyProvisioning(readReceipt(store, targetPath), {
+			worktreePath: targetPath,
+			branch,
+		});
+	}
+
+	function toolResult(
+		details: TransitionDetails,
+		message: string,
+		terminate?: boolean,
+	) {
+		return {
+			content: [{ type: "text" as const, text: message }],
+			details: details as unknown as Record<string, unknown>,
+			...(terminate ? { terminate: true } : {}),
+		};
+	}
+
+	/**
+	 * Model-callable worktree lifecycle.
+	 *
+	 * Every outcome states where the process actually is. Refusals are returned
+	 * as structured results rather than thrown, so the model keeps the evidence
+	 * (code, target, recovery) instead of a bare error string.
+	 */
 	async function handleWorktreeSessionTool(
 		params: {
 			action: "status" | "create" | "enter" | "dispose";
+			execution?: ExecutionPreference;
 			name?: string;
 			branch?: string;
 			base?: string;
@@ -1572,177 +1986,795 @@ export default function (pi: ExtensionAPI) {
 	) {
 		const repoRoot = await getRepoRoot(pi);
 		const config = loadConfig(repoRoot);
-		const text = (message: string) => ({
-			content: [{ type: "text" as const, text: message }],
-			details: {},
-		});
-		const resolveRequestedBranches = (): string[] => {
-			if (params.branch) {
-				const branch = params.branch.trim();
-				if (!isValidExplicitBranch(branch)) {
-					throw new Error(
-						`Invalid branch "${branch}". Use a git-ref-safe name (letters, digits, ., _, -, /); no shell metacharacters, "..", "//", or trailing "/"/".lock".`,
-					);
-				}
-				return [branch];
-			}
-			return destroyCandidates(params.name ?? "", config);
-		};
+		const processState = await currentCheckoutState(repoRoot);
 
-		if (params.action === "status") {
+		const validated = validateTransitionRequest({
+			origin: "model",
+			intent: params.action as TransitionIntent,
+			...(params.execution ? { execution: params.execution } : {}),
+			...(params.name ? { name: params.name } : {}),
+			...(params.branch ? { branch: params.branch } : {}),
+			...(params.base ? { base: params.base } : {}),
+		});
+		if (!validated.ok) {
+			return toolResult(
+				refusedDetails(
+					params.action,
+					processState,
+					"invalid-request",
+					params.execution,
+				),
+				`Refused: ${validated.error.reason}`,
+			);
+		}
+		const request = validated.request;
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+
+		if (request.intent === "status") {
 			const marker = readMarker(repoRoot);
-			const detected = await detectWorktree(pi);
-			return text(
+			const details = buildDetails({
+				action: "status",
+				outcome: "status",
+				process: processState,
+				sessionMode: currentSessionMode(),
+				...(agentWorktree
+					? {
+							target: {
+								path: agentWorktree.path,
+								branch: agentWorktree.branch,
+								kind: "linked" as const,
+							},
+						}
+					: {}),
+			});
+			const status = {
+				...details,
+				...(agentWorktree
+					? {
+							pathTarget: {
+								path: agentWorktree.path,
+								branch: agentWorktree.branch,
+								kind: "linked" as const,
+							},
+						}
+					: {}),
+				...(pendingTransition ? { pending: pendingTransition } : {}),
+				discipline: marker?.enforce === true ? "on" : "off",
+				defaultWorktreeBase: getWorktreeDir(repoRoot, config),
+			};
+			return toolResult(
+				status as unknown as TransitionDetails,
 				`repoRoot: ${repoRoot}\n` +
 					`discipline: ${marker?.enforce === true ? "on" : "off"}\n` +
 					`defaultWorktreeBase: ${getWorktreeDir(repoRoot, config)}\n` +
-					`processWorktree: ${detected ? `${detected.branch} at ${detected.worktreePath}` : "main checkout"}\n` +
-					`selectedWorktree: ${agentWorktree ? `${agentWorktree.branch} at ${agentWorktree.path}` : "none"}`,
+					`processCheckout: ${processState.branch ?? "(detached)"} at ${processState.path} (${processState.kind})\n` +
+					`sessionMode: ${status.sessionMode}\n` +
+					`requiresAbsolutePaths: ${status.requiresAbsolutePaths}\n` +
+					`pathTarget: ${agentWorktree ? `${agentWorktree.branch} at ${agentWorktree.path}` : "none"}\n` +
+					`pendingTransition: ${pendingTransition ? `${pendingTransition.action} -> ${pendingTransition.target.path}` : "none"}`,
 			);
 		}
 
-		if (params.action === "create") {
-			const plan = planCreate(repoRoot, config, {
-				name: params.name ?? "",
-				branch: params.branch,
-				base: params.base,
+		if (request.intent === "dispose") {
+			return handleModelDispose(request, processState, repoRoot, config, ctx);
+		}
+
+		// --- create / enter -------------------------------------------------
+		const resolved = await resolveTransitionTarget(
+			request,
+			repoRoot,
+			config,
+			store,
+		);
+		if ("details" in resolved)
+			return toolResult(resolved.details, resolved.message);
+
+		const { target, provisioning } = resolved;
+		const alreadyAtTarget =
+			canonicalPath(processState.path) === canonicalPath(target.path) &&
+			processState.branch === target.branch;
+
+		const sessionFile = currentSessionFile(ctx);
+		const decision = selectExecution({
+			execution: request.execution,
+			mode: ctx.mode,
+			piCompatible: piSupportsRecamp(ctx),
+			transportAvailable: selectTransport(process.env, liveProbeDeps).available,
+			alreadyAtTarget,
+			activeTurn: !ctx.isIdle(),
+			sessionFileReadable: Boolean(sessionFile),
+		});
+
+		const unmanagedNote =
+			provisioning === "unmanaged"
+				? "\nNote: this checkout has no provisioning record, so its project hooks were never observed to run."
+				: "";
+
+		if (decision.kind === "already-active") {
+			if (agentWorktree?.path === target.path) agentWorktree = null;
+			return toolResult(
+				buildDetails({
+					action: request.intent === "enter" ? "enter" : "create",
+					outcome: "already-active",
+					process: processState,
+					target,
+					provisioning,
+					requestedExecution: request.execution,
+				}),
+				`Already working in ${target.branch} at ${target.path}. Repo-relative paths resolve here.${unmanagedNote}`,
+			);
+		}
+
+		const action = request.intent === "enter" ? "enter" : "create";
+		const operationId = newOperationId();
+		const handoffB64 = await buildTransitionHandoff({
+			operationId,
+			kind: "enter",
+			source: processState,
+			target,
+			provisioning,
+			store,
+			sessionFile,
+		});
+		const continuation = continuationFor(ctx, "enter", target.path);
+		const recoveryCommand = buildRelaunch(
+			target.path,
+			sessionFile,
+			handoffB64,
+			continuation,
+		);
+
+		if (decision.kind === "recamp") {
+			const started = await startRecamp({
+				targetCwd: target.path,
+				tabLabel: target.branch ?? basename(target.path),
+				typedCmd: recoveryCommand,
 			});
-			if (existsSync(plan.worktreePath)) {
-				const listed = await pi.exec(
-					"git",
-					["worktree", "list", "--porcelain"],
-					{
-						cwd: repoRoot,
-						timeout: 5_000,
-					},
+			if (!started.ok) {
+				return toolResult(
+					buildDetails({
+						action,
+						outcome: "manual-restart",
+						process: processState,
+						target,
+						provisioning,
+						code: started.code,
+						requestedExecution: request.execution,
+						recovery: {
+							command: recoveryCommand,
+							instructions: [
+								"This session did not move and nothing was lost.",
+								`Run the command above from ${processState.path} to continue in ${target.path}.`,
+							],
+						},
+					}),
+					`Could not hand this session over automatically (${started.reason}). The worktree is ready at ${target.path}; run:\n  ${recoveryCommand}`,
 				);
-				const here =
-					listed.code === 0
-						? parseWorktreeList(listed.stdout).find(
-								(w) =>
-									canonicalPath(w.path) === canonicalPath(plan.worktreePath),
-							)
-						: undefined;
-				if (!here || here.branch !== plan.branch) {
-					throw new Error(
-						`${plan.worktreePath} already exists but is ${here?.branch ? `checked out on branch "${here.branch}"` : "not a registered worktree"}, not "${plan.branch}".`,
-					);
-				}
-			} else {
-				await createWorktree(pi, ctx, repoRoot, config, plan);
 			}
-			agentWorktree = {
-				repoRoot,
-				branch: plan.branch,
-				path: plan.worktreePath,
+
+			pendingTransition = {
+				operationId,
+				action,
+				target,
+				transport: started.transport,
+				scheduledAt: new Date().toISOString(),
+				recoveryCommand,
 			};
-			return text(
-				`Worktree ready.\n` +
-					`branch: ${plan.branch}\n` +
-					`worktreePath: ${plan.worktreePath}\n` +
-					`Next: write/edit absolute paths under worktreePath and run bash commands as: cd ${plan.worktreePath} && <command>. Commit there before dispose.`,
+			ctx.shutdown();
+			return toolResult(
+				buildDetails({
+					action,
+					outcome: "relaunch-scheduled",
+					process: processState,
+					target,
+					provisioning,
+					operationId,
+					transport: started.transport,
+					sessionCarry: sessionCarryFor(decision, {
+						execution: request.execution,
+						mode: ctx.mode,
+						piCompatible: true,
+						transportAvailable: true,
+						alreadyAtTarget: false,
+						activeTurn: !ctx.isIdle(),
+						sessionFileReadable: Boolean(sessionFile),
+					}),
+					requestedExecution: request.execution,
+					recovery: {
+						command: recoveryCommand,
+						instructions: [
+							"If the replacement session does not appear, run the command above manually.",
+						],
+					},
+				}),
+				`This session is moving into ${target.branch} at ${target.path} and will resume there; stop issuing tool calls now.${unmanagedNote}`,
+				true,
 			);
 		}
 
-		if (params.action === "enter") {
-			const branches = resolveRequestedBranches();
-			if (branches.length === 0)
-				throw new Error("enter requires name or branch");
-			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
-				cwd: repoRoot,
-				timeout: 5_000,
+		if (decision.kind === "manual-restart") {
+			return toolResult(
+				buildDetails({
+					action,
+					outcome: "manual-restart",
+					process: processState,
+					target,
+					provisioning,
+					code: decision.code,
+					requestedExecution: request.execution,
+					recovery: {
+						command: recoveryCommand,
+						instructions: [
+							`This session is still in ${processState.path}.`,
+							"Run the command above to continue inside the worktree.",
+						],
+					},
+				}),
+				`The worktree is ready at ${target.path}, but this session cannot move itself here (${decision.code}). Run:\n  ${recoveryCommand}${unmanagedNote}`,
+			);
+		}
+
+		agentWorktree = {
+			repoRoot,
+			branch: target.branch ?? "",
+			path: target.path,
+		};
+		return toolResult(
+			buildDetails({
+				action,
+				outcome: "path-target",
+				process: processState,
+				target,
+				provisioning,
+				requestedExecution: request.execution,
+			}),
+			`Worktree ready, but this process is still in ${processState.path}.\n` +
+				`branch: ${target.branch}\n` +
+				`worktreePath: ${target.path}\n` +
+				`Use absolute paths under worktreePath and run bash commands as: cd ${target.path} && <command>.${unmanagedNote}`,
+		);
+	}
+
+	/**
+	 * Resolve create/enter to an exact target, provisioning it when asked to.
+	 *
+	 * Strict create never adopts an existing checkout: a caller asking to create
+	 * has not agreed to inherit whatever state is already on disk.
+	 */
+	async function resolveTransitionTarget(
+		request: {
+			intent: TransitionIntent;
+			execution: ExecutionPreference;
+			name?: string;
+			branch?: string;
+			base?: string;
+		},
+		repoRoot: string,
+		config: WorktreeConfig,
+		store: ReceiptStore,
+	): Promise<
+		| { target: CheckoutState; provisioning: ProvisioningState }
+		| { details: TransitionDetails; message: string }
+	> {
+		const processState = await currentCheckoutState(repoRoot);
+		const refuse = (code: TransitionCode, message: string) => ({
+			details: refusedDetails(
+				request.intent === "enter" ? "enter" : "create",
+				processState,
+				code,
+				request.execution,
+			),
+			message: `Refused: ${message}`,
+		});
+
+		if (request.intent === "enter") {
+			const candidates = orderedBranchCandidates(request as never, {
+				resolve: (input) => resolveBranch(input, config),
+				isValidExplicit: isValidExplicitBranch,
 			});
-			const entry =
-				listed.code === 0
-					? resolveEnterTarget(
-							parseWorktreeList(listed.stdout),
-							branches,
-							repoRoot,
-						)
-					: { error: "Could not read the git worktree list." };
-			if ("error" in entry) throw new Error(entry.error);
-			agentWorktree = { repoRoot, branch: entry.branch, path: entry.path };
-			return text(
-				`Selected existing worktree.\n` +
-					`branch: ${entry.branch}\n` +
-					`worktreePath: ${entry.path}\n` +
-					`Next: write/edit absolute paths under worktreePath and run bash commands as: cd ${entry.path} && <command>.`,
-			);
-		}
-
-		const target = params.name || params.branch ? null : agentWorktree;
-		let entry: { path: string; branch: string };
-		if (target) {
-			entry = { path: target.path, branch: target.branch };
-		} else {
-			const branches = resolveRequestedBranches();
-			if (branches.length === 0) {
-				throw new Error(
-					"dispose requires an active selected worktree, name, or branch",
+			if (candidates.length === 0) {
+				return refuse(
+					"invalid-request",
+					"no valid branch candidate was supplied.",
 				);
 			}
-			const listed = await pi.exec("git", ["worktree", "list", "--porcelain"], {
-				cwd: repoRoot,
-				timeout: 5_000,
-			});
-			const resolved =
-				listed.code === 0
-					? resolveEnterTarget(
-							parseWorktreeList(listed.stdout),
-							branches,
-							repoRoot,
-						)
-					: { error: "Could not read the git worktree list." };
-			if ("error" in resolved) throw new Error(resolved.error);
-			entry = resolved;
+			const entry = resolveEnterTarget(
+				await listWorktrees(repoRoot),
+				candidates,
+				repoRoot,
+			);
+			if ("error" in entry) return refuse("target-not-found", entry.error);
+
+			const targetPath = canonicalPath(entry.path);
+			const provisioning = provisioningFor(store, targetPath, entry.branch);
+			if (provisioning === "corrupt") {
+				return refuse(
+					"receipt-corrupt",
+					`the provisioning record for ${targetPath} does not describe this checkout. Inspect it before using this worktree.`,
+				);
+			}
+			if (provisioning === "provisioning" || provisioning === "failed") {
+				return refuse(
+					"target-not-ready",
+					`${targetPath} was never fully provisioned (${provisioning}). Dispose it and create it again rather than working in a half-built checkout.`,
+				);
+			}
+			return {
+				target: { path: targetPath, branch: entry.branch, kind: "linked" },
+				provisioning,
+			};
 		}
+
+		// create
+		let plan: CreatePlan;
+		try {
+			plan = planCreate(repoRoot, config, {
+				name: request.name ?? "",
+				...(request.branch ? { branch: request.branch } : {}),
+				...(request.base ? { base: request.base } : {}),
+			});
+		} catch (err) {
+			return refuse("invalid-request", (err as Error).message);
+		}
+
+		const targetPath = canonicalPath(plan.worktreePath);
+		const worktrees = await listWorktrees(repoRoot);
+		const registered = worktrees.find(
+			(w) => canonicalPath(w.path) === targetPath,
+		);
+		if (existsSync(plan.worktreePath) || registered) {
+			if (registered?.branch === plan.branch) {
+				return refuse(
+					"target-exists",
+					`${plan.worktreePath} already exists on branch "${plan.branch}". Use enter to work in it.`,
+				);
+			}
+			const occupant = registered?.branch
+				? `checked out on branch "${registered.branch}"`
+				: "not a registered worktree";
+			return refuse(
+				"target-conflict",
+				`${plan.worktreePath} already exists but is ${occupant}, not "${plan.branch}".`,
+			);
+		}
+
+		const owner: ClaimOwner = {
+			operationId: newOperationId(),
+			pid: process.pid,
+			role: "origin",
+		};
+		const claim = acquireClaim(store, targetPath, owner);
+		if (!claim.ok) return refuse("target-busy", claim.reason);
+
+		try {
+			const provisioned = await provisionWorktree(
+				store,
+				owner,
+				repoRoot,
+				config,
+				{
+					...plan,
+					worktreePath: targetPath,
+				},
+			);
+			if (!provisioned.ok) return refuse(provisioned.code, provisioned.message);
+			return {
+				target: { path: targetPath, branch: plan.branch, kind: "linked" },
+				provisioning: "ready",
+			};
+		} finally {
+			releaseClaim(store, targetPath, owner);
+		}
+	}
+
+	/**
+	 * Create a worktree and record how far provisioning actually got.
+	 *
+	 * The receipt is written before git mutates anything, so a process that dies
+	 * mid-hook leaves durable evidence that the checkout on disk is not ready.
+	 */
+	async function provisionWorktree(
+		store: ReceiptStore,
+		owner: ClaimOwner,
+		repoRoot: string,
+		config: WorktreeConfig,
+		plan: CreatePlan,
+	): Promise<
+		{ ok: true } | { ok: false; code: TransitionCode; message: string }
+	> {
+		let receipt = newReceipt({
+			operationId: owner.operationId,
+			branch: plan.branch,
+			worktreePath: plan.worktreePath,
+			base: plan.base,
+			configDigest: configDigest(config),
+		});
+		const initial = writeReceipt(store, owner, receipt);
+		if (!initial.ok) {
+			return {
+				ok: false,
+				code: "receipt-write-failed",
+				message: `could not record provisioning intent (${initial.reason}); nothing was created.`,
+			};
+		}
+
+		const record = (next: typeof receipt) => {
+			receipt = next;
+			writeReceipt(store, owner, receipt);
+		};
+
+		try {
+			await runProvisioningSteps(pi, repoRoot, config, plan, (stage, index) =>
+				record(advanceReceipt(receipt, stage, index)),
+			);
+		} catch (err) {
+			const failure = err as ProvisioningFailure;
+			record(
+				failedReceipt(receipt, {
+					code: failure.hook ? "hook-failed" : "git-failed",
+					...(failure.exitCode === undefined
+						? {}
+						: { exitCode: failure.exitCode }),
+				}),
+			);
+			return {
+				ok: false,
+				code: failure.hook ? "hook-failed" : "git-failed",
+				message:
+					`${failure.message}\n` +
+					`The checkout at ${plan.worktreePath} exists but is NOT provisioned; it is recorded as failed and cannot be entered. ` +
+					"Inspect it, then dispose it and create it again.",
+			};
+		}
+
+		record(readyReceipt(receipt));
+		return { ok: true };
+	}
+	/**
+	 * Model-triggered disposal.
+	 *
+	 * The model can never authorise data loss, so any dirty state refuses. Live
+	 * disposal is left to the interactive path until the waiter-owned teardown
+	 * lands; the model is told plainly rather than being handed a half-measure.
+	 */
+	async function handleModelDispose(
+		request: {
+			execution: ExecutionPreference;
+			name?: string;
+			branch?: string;
+			selectorless: boolean;
+		},
+		processState: CheckoutState,
+		repoRoot: string,
+		config: WorktreeConfig,
+		ctx: ExtensionContext,
+	) {
+		const refuse = (code: TransitionCode, message: string) =>
+			toolResult(
+				refusedDetails("dispose", processState, code, request.execution),
+				`Refused: ${message}`,
+			);
+
+		let entry: { path: string; branch: string };
+		if (request.selectorless) {
+			if (processState.kind === "linked" && processState.branch) {
+				entry = { path: processState.path, branch: processState.branch };
+			} else if (agentWorktree) {
+				entry = { path: agentWorktree.path, branch: agentWorktree.branch };
+			} else {
+				return refuse(
+					"target-not-found",
+					"dispose needs an active worktree, a path target, or an explicit name/branch.",
+				);
+			}
+		} else {
+			const candidates = orderedBranchCandidates(request as never, {
+				resolve: (input) => resolveBranch(input, config),
+				isValidExplicit: isValidExplicitBranch,
+			});
+			if (candidates.length === 0) {
+				return refuse(
+					"invalid-request",
+					"no valid branch candidate was supplied.",
+				);
+			}
+			const resolved = resolveEnterTarget(
+				await listWorktrees(repoRoot),
+				candidates,
+				repoRoot,
+			);
+			if ("error" in resolved)
+				return refuse("target-not-found", resolved.error);
+			entry = { path: canonicalPath(resolved.path), branch: resolved.branch };
+		}
+
+		const live = canonicalPath(entry.path) === canonicalPath(processState.path);
+		const target: CheckoutState = {
+			path: entry.path,
+			branch: entry.branch,
+			kind: "linked",
+		};
 
 		const dirty = await pi.exec("git", ["status", "--porcelain", "--ignored"], {
 			cwd: entry.path,
 			timeout: 5_000,
 		});
-		if (dirty.code !== 0) throw new Error("Could not read worktree status");
+		if (dirty.code !== 0)
+			return refuse("git-failed", "could not read the worktree status.");
 		const unsafeReason = unsafeDisposeReason({
 			cwd: ctx.cwd,
-			sessionFile: currentSessionFile(ctx),
+			...(currentSessionFile(ctx)
+				? { sessionFile: currentSessionFile(ctx) }
+				: {}),
 			worktreePath: entry.path,
 			porcelainWithIgnored: dirty.stdout,
 		});
-		if (unsafeReason) throw new Error(unsafeReason);
-		const dispose = await pi.exec(
-			"bash",
-			[
-				"-c",
-				buildDisposeScript(
-					repoRoot,
-					entry.path,
-					entry.branch,
-					config.preRemove,
-				),
-			],
-			{ timeout: 130_000 },
+		if (unsafeReason) {
+			return refuse(live ? "live-cwd-unsafe" : "dirty-worktree", unsafeReason);
+		}
+
+		if (live) {
+			return disposeLiveWorktree(
+				request,
+				processState,
+				target,
+				repoRoot,
+				config,
+				ctx,
+			);
+		}
+
+		// Remote teardown mutates the target, so it takes the same exclusive claim
+		// as create and live dispose; two sessions must not tear down one worktree.
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		const owner: ClaimOwner = {
+			operationId: newOperationId(),
+			pid: process.pid,
+			role: "origin",
+		};
+		const claim = acquireClaim(store, canonicalPath(entry.path), owner);
+		if (!claim.ok) return refuse("target-busy", claim.reason);
+
+		let dispose: { code: number; stdout: string; stderr: string };
+		try {
+			dispose = await pi.exec(
+				"bash",
+				[
+					"-c",
+					buildDisposeScript(
+						repoRoot,
+						entry.path,
+						entry.branch,
+						config.preRemove,
+					),
+				],
+				{ timeout: 130_000 },
+			);
+		} finally {
+			releaseClaim(store, canonicalPath(entry.path), owner);
+		}
+		const remaining = await listWorktrees(repoRoot);
+		const registrationGone = !remaining.some(
+			(w) => canonicalPath(w.path) === canonicalPath(entry.path),
 		);
-		if (dispose.code !== 0) {
-			throw new Error(
-				`Failed to dispose worktree ${entry.path}: ${(dispose.stderr || dispose.stdout || "unknown error").trim()}`,
-			);
-		}
-		if (existsSync(entry.path)) {
-			throw new Error(
-				`Failed to dispose worktree ${entry.path}: path still exists after teardown.`,
-			);
-		}
-		if (agentWorktree?.path === entry.path) agentWorktree = null;
+		const pathGone = !existsSync(entry.path);
 		const branchRef = await pi.exec(
 			"git",
 			["show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`],
 			{ cwd: repoRoot, timeout: 5_000 },
 		);
-		return text(
-			`Disposed worktree and returned to main git directory.\n` +
-				`removedPath: ${entry.path}\n` +
-				`branch: ${entry.branch} (${branchRef.code === 0 ? "kept" : "deleted"})\n` +
-				`repoRoot: ${repoRoot}`,
+		const branchKept = branchRef.code === 0;
+
+		if (agentWorktree?.path === entry.path) agentWorktree = null;
+		if (pathGone && registrationGone) {
+			removeReceipt(store, canonicalPath(entry.path));
+		}
+
+		const complete = pathGone && registrationGone && dispose.code === 0;
+
+		if (complete) {
+			const branchNote = branchKept ? "kept: unmerged commits" : "deleted";
+			return toolResult(
+				buildDetails({
+					action: "dispose",
+					outcome: "disposed",
+					process: processState,
+					target,
+					remoteProcessLiveness: "unknown",
+					requestedExecution: request.execution,
+				}),
+				`Disposed ${entry.branch}.\n` +
+					`removedPath: ${entry.path}\n` +
+					`branch: ${entry.branch} (${branchNote})\n` +
+					`This process stayed in ${processState.path}.\n` +
+					"Note: whether another pi session was using that checkout could not be determined.",
+			);
+		}
+
+		const residue: string[] = [];
+		if (!pathGone) residue.push(`${entry.path} still exists`);
+		if (!registrationGone) {
+			residue.push("the worktree is still registered with git");
+		}
+		return toolResult(
+			buildDetails({
+				action: "dispose",
+				outcome: "dispose-partial",
+				process: processState,
+				target,
+				remoteProcessLiveness: "unknown",
+				requestedExecution: request.execution,
+				code: "dispose-partial",
+				partialEffects: residue,
+				recovery: {
+					instructions: [
+						"Check `git worktree list` and the path above, then clean up manually.",
+					],
+				},
+			}),
+			`Teardown of ${entry.path} did not complete. ${(dispose.stderr || dispose.stdout || "").trim()}`.trim(),
+		);
+	}
+
+	/**
+	 * Dispose the worktree this session is standing in.
+	 *
+	 * The directory cannot be removed while pi is using it, so teardown is handed
+	 * to a detached waiter that runs after this process exits. Ownership of the
+	 * target's lifecycle claim is transferred to that exact waiter pid first: if
+	 * the transfer cannot be persisted the waiter is killed, and it would fail
+	 * its own ownership check anyway, so a disposal reported as not scheduled
+	 * cannot quietly destroy the worktree later.
+	 */
+	async function disposeLiveWorktree(
+		request: { execution: ExecutionPreference },
+		processState: CheckoutState,
+		target: CheckoutState,
+		repoRoot: string,
+		config: WorktreeConfig,
+		ctx: ExtensionContext,
+	) {
+		const sessionFile = currentSessionFile(ctx);
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		const operationId = newOperationId();
+		const origin: ClaimOwner = {
+			operationId,
+			pid: process.pid,
+			role: "origin",
+		};
+
+		const refuse = (code: TransitionCode, message: string) =>
+			toolResult(
+				refusedDetails("dispose", processState, code, request.execution),
+				`Refused: ${message}`,
+			);
+
+		const claim = acquireClaim(store, target.path, origin);
+		if (!claim.ok) return refuse("target-busy", claim.reason);
+
+		const destBranch = await pi.exec(
+			"git",
+			["rev-parse", "--abbrev-ref", "HEAD"],
+			{ cwd: repoRoot, timeout: 5_000 },
+		);
+		const destination = destBranch.code === 0 ? destBranch.stdout.trim() : "";
+		if (!destination) {
+			releaseClaim(store, target.path, origin);
+			return refuse(
+				"git-failed",
+				"could not read the destination branch in the main checkout.",
+			);
+		}
+
+		const mainState: CheckoutState = {
+			path: repoRoot,
+			branch: destination,
+			kind: "main",
+		};
+		const handoffB64 = await buildTransitionHandoff({
+			operationId,
+			kind: "dispose",
+			source: processState,
+			target: mainState,
+			provisioning: "unmanaged",
+			store,
+			sessionFile,
+			dispose: { removedPath: target.path, branch: target.branch ?? "" },
+		});
+		const typedCmd = buildRelaunch(
+			repoRoot,
+			sessionFile,
+			handoffB64,
+			continuationFor(ctx, "dispose", repoRoot),
+		);
+
+		const started = await startRecamp({
+			targetCwd: repoRoot,
+			tabLabel: destination,
+			typedCmd,
+			preScript: buildVerifiedTeardownScript({
+				repoRoot,
+				worktreePath: target.path,
+				branch: target.branch ?? "",
+				...(config.preRemove ? { preRemove: config.preRemove } : {}),
+				operationId,
+				waiterOwnerFile: join(claimPath(store, target.path), "owner.json"),
+				receiptFile: receiptPath(store, target.path),
+				reportFile: reportPath(store, operationId),
+				expectedDestinationBranch: destination,
+			}),
+			hold: true,
+		});
+
+		if (!started.ok) {
+			releaseClaim(store, target.path, origin);
+			return toolResult(
+				buildDetails({
+					action: "dispose",
+					outcome: "manual-restart",
+					process: processState,
+					target,
+					code: started.code,
+					requestedExecution: request.execution,
+					recovery: {
+						instructions: [
+							"Nothing was removed and this session is intact.",
+							`Exit pi, then dispose ${target.path} from ${repoRoot}.`,
+						],
+					},
+				}),
+				`Could not arrange teardown after exit (${started.reason}). Nothing was removed.`,
+			);
+		}
+
+		const handle = started.handle;
+		const transferred =
+			handle !== undefined &&
+			transferClaim(store, target.path, origin, {
+				operationId,
+				pid: handle.pid,
+				role: "waiter",
+			});
+		if (!transferred) {
+			// The waiter is armed but cannot prove ownership, so it would refuse to
+			// act. Kill it anyway rather than relying on that single check.
+			await handle?.abortAndWait();
+			releaseClaim(store, target.path, origin);
+			return refuse(
+				"schedule-failed",
+				"could not hand teardown over to the waiter, so nothing was scheduled and nothing was removed.",
+			);
+		}
+		handle?.commitDetach();
+
+		pendingTransition = {
+			operationId,
+			action: "dispose",
+			target: mainState,
+			transport: started.transport,
+			scheduledAt: new Date().toISOString(),
+			recoveryCommand: typedCmd,
+		};
+		ctx.shutdown();
+		return toolResult(
+			buildDetails({
+				action: "dispose",
+				outcome: "relaunch-scheduled",
+				process: processState,
+				target: mainState,
+				operationId,
+				transport: started.transport,
+				sessionCarry: sessionFile ? "fork" : "fresh",
+				requestedExecution: request.execution,
+				recovery: {
+					command: typedCmd,
+					instructions: [
+						`Teardown of ${target.path} runs after this process exits; the replacement session verifies it.`,
+					],
+				},
+			}),
+			`Leaving ${target.path} and removing it after this session exits; the session resumes in ${repoRoot}. Stop issuing tool calls now.`,
+			true,
 		);
 	}
 
@@ -1906,7 +2938,7 @@ export default function (pi: ExtensionAPI) {
 				sessionFile,
 				handoffSource,
 			);
-			const relaunched = relaunchInPlace(
+			const relaunched = await relaunchInPlace(
 				entry.path,
 				entry.branch,
 				sessionFile,
@@ -1963,7 +2995,7 @@ export default function (pi: ExtensionAPI) {
 			// Fork the parent session so history follows the hop, plus a handoff note.
 			const sessionFile = currentSessionFile(ctx);
 			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
-			const relaunched = relaunchInPlace(
+			const relaunched = await relaunchInPlace(
 				worktreePath,
 				branch,
 				sessionFile,
@@ -2049,14 +3081,14 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (!ok) return;
 
-			const handoffB64 = encodeHandoff({
+			const handoffB64 = encodeLegacyHandoff({
 				parentCwd: worktreePath,
 				parentBranch: branch,
 				uncommitted,
 				ignored,
 				kind: "dispose",
 			});
-			const typedCmd = buildRelaunchCommand(
+			const typedCmd = buildRelaunch(
 				repoRoot,
 				sessionFile,
 				handoffB64,
@@ -2075,7 +3107,7 @@ export default function (pi: ExtensionAPI) {
 				["rev-parse", "--abbrev-ref", "HEAD"],
 				{ cwd: repoRoot, timeout: 5_000 },
 			);
-			const scheduled = scheduleRelaunch({
+			const scheduled = await scheduleRelaunch({
 				typedCmd,
 				preScript,
 				recamp: {
@@ -2182,6 +3214,14 @@ export default function (pi: ExtensionAPI) {
 				{ cwd: repoRoot, timeout: 5_000 },
 			);
 			const branchGone = branchRef.code !== 0;
+			// Provisioning evidence outlives the checkout unless it is cleared, and
+			// a stale receipt would make the name unusable later.
+			if (wtGone) {
+				removeReceipt(
+					createStore(await resolveGitCommonDir(repoRoot)),
+					canonicalPath(worktreePath),
+				);
+			}
 			if (wtGone && branchGone) {
 				ctx.ui.notify(
 					`✅ Worktree "${branch}" destroyed\n` +
@@ -2225,29 +3265,54 @@ export default function (pi: ExtensionAPI) {
 // Core: create worktree
 // ---------------------------------------------------------------------------
 
-async function createWorktree(
+/** Raised when a provisioning step fails, carrying enough to record a receipt. */
+interface ProvisioningFailure extends Error {
+	hook?: boolean;
+	exitCode?: number;
+}
+
+function provisioningFailure(
+	message: string,
+	opts: { hook?: boolean; exitCode?: number } = {},
+): ProvisioningFailure {
+	return Object.assign(new Error(message), opts);
+}
+
+/**
+ * Run the provisioning steps for a new worktree, reporting each stage.
+ *
+ * `onStage` fires BEFORE the step it names, so a caller recording durable
+ * evidence knows which step was in flight if this process dies inside it.
+ */
+export async function runProvisioningSteps(
 	pi: ExtensionAPI,
-	ctx: ExtensionContext,
 	repoRoot: string,
 	config: WorktreeConfig,
 	plan: CreatePlan,
-) {
+	onStage: (
+		stage: "git-worktree-add" | "link-env" | "post-create",
+		postCreateIndex?: number,
+	) => void,
+	onProgress?: (message: string) => void,
+): Promise<void> {
 	const { branch, worktreePath, base } = plan;
-
-	const step = (msg: string) => ctx.ui.setStatus("worktree", msg);
 	const run = async (cmd: string, timeout = 30_000) => {
 		const r = await pi.exec("bash", ["-c", cmd], { timeout });
-		if (r.code !== 0) throw new Error(r.stderr || `Command failed: ${cmd}`);
+		if (r.code !== 0) {
+			throw provisioningFailure(r.stderr?.trim() || `Command failed: ${cmd}`, {
+				...(r.code === null ? {} : { exitCode: r.code }),
+			});
+		}
 		return r;
 	};
 
-	// 1. Git worktree
-	step(`⏳ Creating git worktree (${branch})...`);
+	onStage("git-worktree-add");
+	onProgress?.(`⏳ Creating git worktree (${branch})...`);
 	await run(buildCreateScript(repoRoot, worktreePath, branch, base));
 
-	// 2. Link env files
 	if (config.linkEnvFiles !== false) {
-		step("⏳ Linking env files...");
+		onStage("link-env");
+		onProgress?.("⏳ Linking env files...");
 		await run(`
       cd ${shQuote(repoRoot)}
       for f in .env*; do
@@ -2259,27 +3324,42 @@ async function createWorktree(
     `);
 	}
 
-	// 3. Post-create hooks
-	if (config.postCreate?.length) {
-		for (let i = 0; i < config.postCreate.length; i++) {
-			const cmd = config.postCreate[i];
-			step(
-				`⏳ Post-create [${i + 1}/${config.postCreate.length}]: ${cmd.slice(0, 60)}...`,
+	for (let i = 0; i < (config.postCreate?.length ?? 0); i++) {
+		const cmd = (config.postCreate as string[])[i];
+		onStage("post-create", i);
+		onProgress?.(
+			`⏳ Post-create [${i + 1}/${config.postCreate?.length}]: ${cmd.slice(0, 60)}...`,
+		);
+		const r = await pi.exec(
+			"bash",
+			["-c", `cd ${shQuote(worktreePath)} && ${cmd}`],
+			{
+				timeout: 120_000,
+			},
+		);
+		if (r.code !== 0) {
+			throw provisioningFailure(
+				`postCreate step ${i + 1} failed (${cmd}): ${(r.stderr || r.stdout || "").trim()}`,
+				{ hook: true, ...(r.code === null ? {} : { exitCode: r.code }) },
 			);
-			const r = await pi.exec(
-				"bash",
-				["-c", `cd ${shQuote(worktreePath)} && ${cmd}`],
-				{
-					timeout: 120_000,
-				},
-			);
-			if (r.code !== 0) {
-				throw new Error(
-					`postCreate step ${i + 1} failed (${cmd}): ${(r.stderr || r.stdout || "").trim()}`,
-				);
-			}
 		}
 	}
+}
 
-	step("");
+async function createWorktree(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	repoRoot: string,
+	config: WorktreeConfig,
+	plan: CreatePlan,
+) {
+	await runProvisioningSteps(
+		pi,
+		repoRoot,
+		config,
+		plan,
+		() => {},
+		(message) => ctx.ui.setStatus("worktree", message),
+	);
+	ctx.ui.setStatus("worktree", "");
 }
