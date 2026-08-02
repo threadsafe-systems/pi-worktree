@@ -233,6 +233,39 @@ await checkAsync(
 	},
 );
 
+// --- branch disposition is decided while the facts are current --------------------
+
+await checkAsync(
+	"teardown records why the branch survived, not just that it did",
+	async () => {
+		const f = fixture({ commitInWorktree: true });
+		const r = await runTeardown(f, scriptFor(f), (pid) => pid);
+		assert.equal(r.report.kind, "present");
+		if (r.report.kind === "present") {
+			assert.equal(r.report.report.branchDisposition, "kept-unmerged");
+		}
+	},
+);
+
+await checkAsync("a deleted branch is recorded as deleted", async () => {
+	const f = fixture();
+	const r = await runTeardown(f, scriptFor(f), (pid) => pid);
+	assert.equal(r.report.kind, "present");
+	if (r.report.kind === "present") {
+		assert.equal(r.report.report.branchDisposition, "deleted");
+	}
+});
+
+await checkAsync("an aborted teardown records no branch action", async () => {
+	const f = fixture();
+	const r = await runTeardown(f, scriptFor(f), (pid) => pid + 1);
+	assert.equal(r.report.kind, "present");
+	if (r.report.kind === "present") {
+		assert.equal(r.report.report.branchDisposition, "skipped");
+	}
+	assert.equal(r.branchPresent, true);
+});
+
 // --- S-DSP-17: an untransferred waiter must not act -------------------------------
 
 await checkAsync(

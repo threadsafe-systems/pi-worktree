@@ -83,6 +83,8 @@ export interface TeardownReportV1 {
 		branchPresent: boolean;
 		receiptPresent: boolean;
 	};
+	/** What teardown did to the branch, decided while it still had the facts. */
+	branchDisposition?: "deleted" | "kept-unmerged" | "skipped";
 	completedAt: string;
 }
 
@@ -280,12 +282,42 @@ function readClaim(dir: string): StoredClaim | null {
 	return null;
 }
 
-function writeClaimOwner(dir: string, owner: ClaimOwner): void {
-	writeFileAtomic(
-		join(dir, "owner.json"),
-		canonicalJson({ ...owner, createdAt: new Date().toISOString() }),
-		dir,
-	);
+/**
+ * Record who owns a claim.
+ *
+ * `exclusive` refuses to overwrite an existing owner. The fresh-acquire path
+ * uses it because `mkdir` and this write are not one atomic step: an origin
+ * that stalled between them for longer than the orphan grace can find its claim
+ * already reclaimed, and must lose rather than silently take it back.
+ */
+function writeClaimOwner(
+	dir: string,
+	owner: ClaimOwner,
+	opts: { exclusive?: boolean } = {},
+): boolean {
+	const contents = canonicalJson({
+		...owner,
+		createdAt: new Date().toISOString(),
+	});
+	const target = join(dir, "owner.json");
+	if (opts.exclusive) {
+		try {
+			const fd = openSync(target, "wx", 0o600);
+			try {
+				writeSync(fd, contents);
+				fsyncSync(fd);
+			} finally {
+				closeSync(fd);
+			}
+			flushDir(dir);
+			return true;
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+			throw err;
+		}
+	}
+	writeFileAtomic(target, contents, dir);
+	return true;
 }
 
 /**
@@ -303,8 +335,15 @@ export function acquireClaim(
 	ensureDir(provisioningDir(store));
 	try {
 		mkdirSync(dir, { mode: 0o700 });
-		writeClaimOwner(dir, owner);
-		return { ok: true, owner };
+		if (writeClaimOwner(dir, owner, { exclusive: true })) {
+			return { ok: true, owner };
+		}
+		// Another operation reclaimed this claim while we were between steps.
+		return {
+			ok: false,
+			code: "target-busy",
+			reason: "another worktree operation claimed this target first.",
+		};
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
 	}

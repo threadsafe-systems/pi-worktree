@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import {
 	type ClaimOwner,
 	acquireClaim,
+	claimPath,
 	advanceReceipt,
 	canDiscardStaleReceipt,
 	canonicalJson,
@@ -442,6 +443,32 @@ check(
 			holder.kill("SIGKILL");
 		}
 		assert.ok(existsSync(gitDir));
+	},
+);
+
+check(
+	"a stalled origin cannot clobber a challenger that reclaimed its claim",
+	() => {
+		const { store } = freshStore();
+		const dir = claimPath(store, TARGET);
+		// Model the crash window: the directory exists, but its owner was never
+		// written, which is what the orphan-grace reclaim path is for.
+		mkdirSync(dir, { recursive: true });
+		const challenger = owner("op-challenger");
+		writeFileSync(
+			join(dir, "owner.json"),
+			canonicalJson({ createdAt: new Date().toISOString(), ...challenger }),
+		);
+
+		// The original origin resumes and tries to complete its own acquisition.
+		const resumed = acquireClaim(store, TARGET, owner("op-origin"));
+		assert.equal(
+			resumed.ok,
+			false,
+			"a resumed origin took back a reclaimed claim",
+		);
+		if (!resumed.ok) assert.equal(resumed.code, "target-busy");
+		assert.equal(verifyClaim(store, TARGET, challenger), true);
 	},
 );
 

@@ -1042,10 +1042,20 @@ fi
 
 # Only delete the branch once the checkout is really gone, and only if the
 # destination is still the one this teardown checked against.
+branch_disposition="skipped"
 if [ "$abort" = "" ] && [ ! -e "$wt" ]; then
   recheck=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
   if [ "$recheck" = "$dest" ]; then
-    git branch -d "$branch" 2>/dev/null || true
+    # "git branch -d" refuses an unmerged branch, which is the intended
+    # soft-dispose outcome. Deciding that here, while the facts are current,
+    # avoids the successor re-judging it against a HEAD that has since moved.
+    if git branch -d "$branch" 2>/dev/null; then
+      branch_disposition="deleted"
+    elif git show-ref --verify --quiet "refs/heads/$branch"; then
+      branch_disposition="kept-unmerged"
+    else
+      branch_disposition="deleted"
+    fi
     record branch ok
   else
     record branch skipped
@@ -1065,8 +1075,8 @@ receipt_present=true; [ -e "$receipt" ] || receipt_present=false
 
 mkdir -p "$(dirname "$report")"
 tmp="$report.tmp.$$"
-printf '{"branchPresent":%s,"completedAt":"%s","expectedDestination":{"branch":"%s","path":"%s"},"observed":{"branchPresent":%s,"pathPresent":%s,"receiptPresent":%s,"registrationPresent":%s},"operationId":"%s","schemaVersion":1,"stages":[%s]}' \\
-  "$branch_present" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dest" "$repo" \\
+printf '{"branchDisposition":"%s","completedAt":"%s","expectedDestination":{"branch":"%s","path":"%s"},"observed":{"branchPresent":%s,"pathPresent":%s,"receiptPresent":%s,"registrationPresent":%s},"operationId":"%s","schemaVersion":1,"stages":[%s]}' \\
+  "$branch_disposition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dest" "$repo" \\
   "$branch_present" "$path_present" "$receipt_present" "$registration_present" \\
   "$op" "$stages" > "$tmp"
 mv -f "$tmp" "$report"
@@ -1761,6 +1771,7 @@ export default function (pi: ExtensionAPI) {
 
 		const removed = handoff.dispose?.removedPath ?? "";
 		const branch = handoff.dispose?.branch ?? "";
+		const report = readTeardownReport(store, handoff.operationId);
 		const branchRef = branch
 			? await pi.exec(
 					"git",
@@ -1771,25 +1782,21 @@ export default function (pi: ExtensionAPI) {
 					},
 				)
 			: { code: 1 };
-		let branchDisposition: BranchDisposition = "unknown";
-		if (branchRef.code !== 0) {
+
+		let branchDisposition: BranchDisposition;
+		const recorded =
+			report.kind === "present" ? report.report.branchDisposition : undefined;
+		if (recorded === "deleted") {
+			branchDisposition = "deleted";
+		} else if (recorded === "kept-unmerged") {
+			// Teardown decided this while it still had the facts. Re-judging it here
+			// against a HEAD that may have moved since would turn a correct retention
+			// into a spurious failure.
+			branchDisposition = "kept-unmerged";
+		} else if (branchRef.code !== 0) {
 			branchDisposition = "deleted";
 		} else {
-			// A branch git could safely delete but did not means teardown fell short;
-			// a branch it refused to delete is the intended soft-dispose outcome.
-			const merged = await pi.exec(
-				"git",
-				["branch", "--merged", "HEAD", "--format=%(refname:short)"],
-				{
-					cwd: repoRoot,
-					timeout: 5_000,
-				},
-			);
-			branchDisposition =
-				merged.code === 0 &&
-				merged.stdout.split("\n").some((l) => l.trim() === branch)
-					? "delete-failed"
-					: "kept-unmerged";
+			branchDisposition = recorded === "skipped" ? "delete-failed" : "unknown";
 		}
 
 		return verifyDispose(
@@ -1804,8 +1811,7 @@ export default function (pi: ExtensionAPI) {
 					? readReceipt(store, removed).kind !== "absent"
 					: false,
 				branchDisposition,
-				reportPresent:
-					readTeardownReport(store, handoff.operationId).kind === "present",
+				reportPresent: report.kind === "present",
 			},
 			now,
 		);

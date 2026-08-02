@@ -210,6 +210,33 @@ await checkAsync(
 	},
 );
 
+await checkAsync(
+	"S-TRN-03: pi consults the tool_call guard for every call in a batch",
+	async () => {
+		const loop = readFileSync(
+			join(
+				PI_ROOT,
+				"node_modules/@earendil-works/pi-agent-core/dist/agent-loop.js",
+			),
+			"utf-8",
+		);
+		// The pending guard is only worth anything if pi asks per call, inside the
+		// batch, and turns a block into a result instead of running the tool.
+		assert.match(loop, /if \(beforeResult\?\.block\)/);
+		assert.match(
+			loop,
+			/createErrorToolResult\(beforeResult\.reason \|\| "Tool execution was blocked"\)/,
+		);
+
+		// Both batch paths prepare each call individually, so a guard set partway
+		// through a batch still applies to the calls that follow it.
+		const sequential = loop.slice(loop.indexOf("executeToolCallsSequential"));
+		assert.match(sequential.slice(0, 2000), /await prepareToolCall\(/);
+		const parallel = loop.slice(loop.indexOf("executeToolCallsParallel"));
+		assert.match(parallel.slice(0, 2000), /await prepareToolCall\(/);
+	},
+);
+
 if (fail > 0) {
 	console.error(`process lifecycle tests: ${fail} FAILED of ${total}`);
 	process.exit(1);
