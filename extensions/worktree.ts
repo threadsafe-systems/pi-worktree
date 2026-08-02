@@ -40,6 +40,7 @@ import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
 import {
 	acquireClaim,
 	advanceReceipt,
+	claimPath,
 	classifyProvisioning,
 	configDigest,
 	createStore,
@@ -48,8 +49,11 @@ import {
 	readReceipt,
 	readTeardownReport,
 	readyReceipt,
+	receiptPath,
+	reportPath,
 	releaseClaim,
 	removeReceipt,
+	transferClaim,
 	writeReceipt,
 } from "./worktree-receipt.ts";
 import type {
@@ -71,7 +75,11 @@ import {
 	sessionCarryFor,
 	validateTransitionRequest,
 } from "./worktree-transition.ts";
-import type { ProbeDeps, RecampTarget } from "./worktree-transport.ts";
+import type {
+	ProbeDeps,
+	RecampTarget,
+	WaiterHandle,
+} from "./worktree-transport.ts";
 import {
 	buildWaiterInvocation,
 	scheduleWaiter,
@@ -906,6 +914,148 @@ function buildTeardownScript(
 	return lines.join("\n");
 }
 
+/**
+ * Teardown script for a worktree the exiting pi process is standing in.
+ *
+ * Everything destructive here runs after pi is gone, in a detached shell, with
+ * nobody watching. So it re-establishes its right to act rather than assuming
+ * it: it proves it still owns the target's lifecycle claim, that the repository
+ * is on the branch the transition planned for, and that the worktree is still
+ * clean — each immediately before the step that depends on it. A soft branch
+ * delete gets a second destination check, because that is the one step whose
+ * safety is judged relative to whatever HEAD happens to be.
+ *
+ * It always writes a teardown report. The successor reads that instead of
+ * inferring success from the mere fact that it was relaunched.
+ */
+export function buildVerifiedTeardownScript(opts: {
+	repoRoot: string;
+	worktreePath: string;
+	branch: string;
+	preRemove?: string[];
+	operationId: string;
+	waiterOwnerFile: string;
+	receiptFile: string;
+	reportFile: string;
+	expectedDestinationBranch: string;
+}): string {
+	// Each hook runs in a subshell: project hooks are arbitrary trusted commands,
+	// and one containing `exit` would otherwise kill the waiter before it could
+	// record what happened or leave the worktree in a known state.
+	const hooks = (opts.preRemove ?? [])
+		.map(
+			(cmd) => `if [ "$abort" = "" ]; then
+  ( cd ${shQuote(opts.worktreePath)} && ${cmd} ) || abort="pre-remove"
+fi`,
+		)
+		.join("\n");
+
+	return `
+set -u
+repo=${shQuote(opts.repoRoot)}
+wt=${shQuote(opts.worktreePath)}
+branch=${shQuote(opts.branch)}
+op=${shQuote(opts.operationId)}
+owner=${shQuote(opts.waiterOwnerFile)}
+receipt=${shQuote(opts.receiptFile)}
+report=${shQuote(opts.reportFile)}
+dest=${shQuote(opts.expectedDestinationBranch)}
+abort=""
+stages=""
+
+record() { stages="\${stages}\${stages:+,}{\\"name\\":\\"$1\\",\\"status\\":\\"$2\\"}"; }
+
+# This detached shell is the claim owner only if the origin persisted the
+# hand-off to exactly this pid. Without that, it must not touch anything.
+if ! grep -q "\\"operationId\\":\\"$op\\"" "$owner" 2>/dev/null ||
+   ! grep -q "\\"pid\\":$$," "$owner" 2>/dev/null ||
+   ! grep -q "\\"role\\":\\"waiter\\"" "$owner" 2>/dev/null; then
+  abort="claim"
+  record claim failed
+else
+  record claim ok
+fi
+
+# The soft delete below is judged against the destination HEAD, so a repository
+# that moved since scheduling is not the repository this teardown planned for.
+if [ "$abort" = "" ]; then
+  actual_dest=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$actual_dest" != "$dest" ]; then
+    abort="destination"
+    record destination failed
+  else
+    record destination ok
+  fi
+fi
+
+if [ "$abort" = "" ]; then
+  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
+    abort="dirty"
+    record dirty failed
+  else
+    record dirty ok
+  fi
+fi
+
+${hooks}
+if [ "$abort" = "pre-remove" ]; then
+  record pre-remove failed
+elif [ "$abort" = "" ]; then
+  record pre-remove ok
+fi
+
+if [ "$abort" = "" ]; then
+  cd "$repo" || abort="repo-cwd"
+fi
+
+if [ "$abort" = "" ]; then
+  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
+    abort="dirty-after-hooks"
+    record dirty-recheck failed
+  else
+    record dirty-recheck ok
+  fi
+fi
+
+if [ "$abort" = "" ]; then
+  git worktree remove --force "$wt" 2>/dev/null || git worktree prune 2>/dev/null || true
+  if [ -e "$wt" ]; then record remove failed; else record remove ok; fi
+fi
+
+# Only delete the branch once the checkout is really gone, and only if the
+# destination is still the one this teardown checked against.
+if [ "$abort" = "" ] && [ ! -e "$wt" ]; then
+  recheck=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
+  if [ "$recheck" = "$dest" ]; then
+    git branch -d "$branch" 2>/dev/null || true
+    record branch ok
+  else
+    record branch skipped
+  fi
+fi
+
+path_present=true; [ -e "$wt" ] || path_present=false
+registration_present=true
+git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt" || registration_present=false
+branch_present=true
+git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || branch_present=false
+
+if [ "$path_present" = "false" ] && [ "$registration_present" = "false" ]; then
+  rm -f "$receipt"
+fi
+receipt_present=true; [ -e "$receipt" ] || receipt_present=false
+
+mkdir -p "$(dirname "$report")"
+tmp="$report.tmp.$$"
+printf '{"branchPresent":%s,"completedAt":"%s","expectedDestination":{"branch":"%s","path":"%s"},"observed":{"branchPresent":%s,"pathPresent":%s,"receiptPresent":%s,"registrationPresent":%s},"operationId":"%s","schemaVersion":1,"stages":[%s]}' \\
+  "$branch_present" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dest" "$repo" \\
+  "$branch_present" "$path_present" "$receipt_present" "$registration_present" \\
+  "$op" "$stages" > "$tmp"
+mv -f "$tmp" "$report"
+rm -rf "$(dirname "$owner")"
+`;
+}
+
 /** Build the shell script run (from the main repo) after pi exits to tear down
  *  a worktree during dispose: pre-remove hooks, worktree removal, then a SOFT
  *  branch-delete (an unmerged branch is kept). Executed by the detached waiter
@@ -1675,8 +1825,9 @@ export default function (pi: ExtensionAPI) {
 		tabLabel: string;
 		typedCmd: string;
 		preScript?: string;
+		hold?: boolean;
 	}): Promise<
-		| { ok: true; transport: "cmux" | "herdr" | "tmux" }
+		| { ok: true; transport: "cmux" | "herdr" | "tmux"; handle?: WaiterHandle }
 		| { ok: false; code: TransitionCode; reason: string }
 	> {
 		const selection = selectTransport(process.env, liveProbeDeps);
@@ -1698,6 +1849,15 @@ export default function (pi: ExtensionAPI) {
 		);
 		if (!result.ok)
 			return { ok: false, code: "schedule-failed", reason: result.reason };
+		if (opts.hold) {
+			// The caller still has work the waiter depends on, so it decides when
+			// the waiter is released.
+			return {
+				ok: true,
+				transport: selection.candidate.kind,
+				handle: result.handle,
+			};
+		}
 		result.handle.commitDetach();
 		return { ok: true, transport: selection.candidate.kind };
 	}
@@ -2271,24 +2431,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (live) {
-			// Removing the directory this process is standing in has to happen after
-			// it exits, which is the interactive dispose flow.
-			return toolResult(
-				buildDetails({
-					action: "dispose",
-					outcome: "manual-restart",
-					process: processState,
-					target,
-					code: "live-cwd-unsafe",
-					requestedExecution: request.execution,
-					recovery: {
-						instructions: [
-							"This session is inside the worktree being disposed.",
-							"Run /worktree dispose so teardown happens after pi exits, then continue in the main checkout.",
-						],
-					},
-				}),
-				`This session is inside ${entry.path}, so it cannot remove it from under itself. Run /worktree dispose instead.`,
+			return disposeLiveWorktree(
+				request,
+				processState,
+				target,
+				repoRoot,
+				config,
+				ctx,
 			);
 		}
 
@@ -2353,6 +2502,168 @@ export default function (pi: ExtensionAPI) {
 			complete
 				? `Disposed ${entry.branch}.\nremovedPath: ${entry.path}\nbranch: ${entry.branch} (${branchKept ? "kept: unmerged commits" : "deleted"})\nThis process stayed in ${processState.path}.\nNote: whether another pi session was using that checkout could not be determined.`
 				: `Teardown of ${entry.path} did not complete. ${(dispose.stderr || dispose.stdout || "").trim()}`.trim(),
+		);
+	}
+
+	/**
+	 * Dispose the worktree this session is standing in.
+	 *
+	 * The directory cannot be removed while pi is using it, so teardown is handed
+	 * to a detached waiter that runs after this process exits. Ownership of the
+	 * target's lifecycle claim is transferred to that exact waiter pid first: if
+	 * the transfer cannot be persisted the waiter is killed, and it would fail
+	 * its own ownership check anyway, so a disposal reported as not scheduled
+	 * cannot quietly destroy the worktree later.
+	 */
+	async function disposeLiveWorktree(
+		request: { execution: ExecutionPreference },
+		processState: CheckoutState,
+		target: CheckoutState,
+		repoRoot: string,
+		config: WorktreeConfig,
+		ctx: ExtensionContext,
+	) {
+		const sessionFile = currentSessionFile(ctx);
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		const operationId = newOperationId();
+		const origin: ClaimOwner = {
+			operationId,
+			pid: process.pid,
+			role: "origin",
+		};
+
+		const refuse = (code: TransitionCode, message: string) =>
+			toolResult(
+				refusedDetails("dispose", processState, code, request.execution),
+				`Refused: ${message}`,
+			);
+
+		const claim = acquireClaim(store, target.path, origin);
+		if (!claim.ok) return refuse("target-busy", claim.reason);
+
+		const destBranch = await pi.exec(
+			"git",
+			["rev-parse", "--abbrev-ref", "HEAD"],
+			{ cwd: repoRoot, timeout: 5_000 },
+		);
+		const destination = destBranch.code === 0 ? destBranch.stdout.trim() : "";
+		if (!destination) {
+			releaseClaim(store, target.path, origin);
+			return refuse(
+				"git-failed",
+				"could not read the destination branch in the main checkout.",
+			);
+		}
+
+		const mainState: CheckoutState = {
+			path: repoRoot,
+			branch: destination,
+			kind: "main",
+		};
+		const handoffB64 = await buildTransitionHandoff({
+			operationId,
+			kind: "dispose",
+			source: processState,
+			target: mainState,
+			provisioning: "unmanaged",
+			store,
+			sessionFile,
+			dispose: { removedPath: target.path, branch: target.branch ?? "" },
+		});
+		const typedCmd = buildRelaunch(
+			repoRoot,
+			sessionFile,
+			handoffB64,
+			continuationFor(ctx, "dispose", repoRoot),
+		);
+
+		const started = await startRecamp({
+			targetCwd: repoRoot,
+			tabLabel: destination,
+			typedCmd,
+			preScript: buildVerifiedTeardownScript({
+				repoRoot,
+				worktreePath: target.path,
+				branch: target.branch ?? "",
+				...(config.preRemove ? { preRemove: config.preRemove } : {}),
+				operationId,
+				waiterOwnerFile: join(claimPath(store, target.path), "owner.json"),
+				receiptFile: receiptPath(store, target.path),
+				reportFile: reportPath(store, operationId),
+				expectedDestinationBranch: destination,
+			}),
+			hold: true,
+		});
+
+		if (!started.ok) {
+			releaseClaim(store, target.path, origin);
+			return toolResult(
+				buildDetails({
+					action: "dispose",
+					outcome: "manual-restart",
+					process: processState,
+					target,
+					code: started.code,
+					requestedExecution: request.execution,
+					recovery: {
+						instructions: [
+							"Nothing was removed and this session is intact.",
+							`Exit pi, then dispose ${target.path} from ${repoRoot}.`,
+						],
+					},
+				}),
+				`Could not arrange teardown after exit (${started.reason}). Nothing was removed.`,
+			);
+		}
+
+		const handle = started.handle;
+		const transferred =
+			handle !== undefined &&
+			transferClaim(store, target.path, origin, {
+				operationId,
+				pid: handle.pid,
+				role: "waiter",
+			});
+		if (!transferred) {
+			// The waiter is armed but cannot prove ownership, so it would refuse to
+			// act. Kill it anyway rather than relying on that single check.
+			await handle?.abortAndWait();
+			releaseClaim(store, target.path, origin);
+			return refuse(
+				"schedule-failed",
+				"could not hand teardown over to the waiter, so nothing was scheduled and nothing was removed.",
+			);
+		}
+		handle?.commitDetach();
+
+		pendingTransition = {
+			operationId,
+			action: "dispose",
+			target: mainState,
+			transport: started.transport,
+			scheduledAt: new Date().toISOString(),
+			recoveryCommand: typedCmd,
+		};
+		ctx.shutdown();
+		return toolResult(
+			buildDetails({
+				action: "dispose",
+				outcome: "relaunch-scheduled",
+				process: processState,
+				target: mainState,
+				operationId,
+				transport: started.transport,
+				sessionCarry: sessionFile ? "fork" : "fresh",
+				requestedExecution: request.execution,
+				recovery: {
+					command: typedCmd,
+					instructions: [
+						`Teardown of ${target.path} runs after this process exits; the replacement session verifies it.`,
+					],
+				},
+			}),
+			`Leaving ${target.path} and removing it after this session exits; the session resumes in ${repoRoot}. Stop issuing tool calls now.`,
+			true,
 		);
 	}
 
@@ -2792,6 +3103,14 @@ export default function (pi: ExtensionAPI) {
 				{ cwd: repoRoot, timeout: 5_000 },
 			);
 			const branchGone = branchRef.code !== 0;
+			// Provisioning evidence outlives the checkout unless it is cleared, and
+			// a stale receipt would make the name unusable later.
+			if (wtGone) {
+				removeReceipt(
+					createStore(await resolveGitCommonDir(repoRoot)),
+					canonicalPath(worktreePath),
+				);
+			}
 			if (wtGone && branchGone) {
 				ctx.ui.notify(
 					`✅ Worktree "${branch}" destroyed\n` +
