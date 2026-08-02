@@ -867,7 +867,7 @@ check("enter handoff defaults kind to enter on decode", () => {
 	assert.equal(decodeHandoff(legacy)?.kind, "enter");
 });
 
-// --- Ergonomic overrides: --dir / --branch / --base ---
+// --- Ergonomic overrides: --dir / --branch / --base --------------------------
 
 check(
 	"parseCreateArgs: positional name plus --dir/--branch/--base (space + = forms)",

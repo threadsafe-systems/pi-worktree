@@ -35,7 +35,7 @@ const capable: ExecutionFacts = {
 	sessionFileReadable: true,
 };
 
-// --- S-REQ-02: create with both selectors is refused -----------------------
+// --- create with both selectors is refused -----------------------------------
 
 check("S-REQ-02: create with both name and branch is invalid", () => {
 	const r = validateTransitionRequest({
@@ -60,7 +60,7 @@ check("S-REQ-02: create with only one selector is accepted", () => {
 	}
 });
 
-// --- S-REQ-03: enter rejects base ------------------------------------------
+// --- enter rejects base ------------------------------------------------------
 
 check("S-REQ-03: enter with base is invalid", () => {
 	const r = validateTransitionRequest({
@@ -94,7 +94,7 @@ check("S-REQ-03: create keeps base", () => {
 	if (r.ok) assert.equal(r.request.base, "origin/main");
 });
 
-// --- S-REQ-07: enter requires a selector ------------------------------------
+// --- enter requires a selector -----------------------------------------------
 
 check("S-REQ-07: enter with no selector is invalid", () => {
 	const r = validateTransitionRequest({ origin: "model", intent: "enter" });
@@ -111,7 +111,7 @@ check("S-REQ-07: blank selector counts as absent", () => {
 	assert.equal(r.ok, false);
 });
 
-// --- S-REQ-08: dispose rejects both selectors -------------------------------
+// --- dispose rejects both selectors ------------------------------------------
 
 check("S-REQ-08: dispose with both name and branch is invalid", () => {
 	const r = validateTransitionRequest({
@@ -133,7 +133,7 @@ check(
 	},
 );
 
-// --- status is inspection only ----------------------------------------------
+// --- status is inspection only -----------------------------------------------
 
 check("status refuses selectors, base, and execution", () => {
 	for (const extra of [
@@ -183,7 +183,7 @@ check("unknown execution is refused", () => {
 	assert.equal(r.ok, false);
 });
 
-// --- S-REQ-06 support: paths never implies a process move -------------------
+// --- paths never implies a process move --------------------------------------
 
 check("S-REQ-06: paths keeps the process where it is", () => {
 	const decision = selectExecution({ ...capable, execution: "paths" });
@@ -213,7 +213,7 @@ check("paths dispose requires an explicit remote target", () => {
 	assert.equal(r.ok, false);
 });
 
-// --- S-CAP-06 / 07 / 08: fallback selection ---------------------------------
+// --- fallback selection ------------------------------------------------------
 
 check("S-CAP-06: headless auto selects path targeting", () => {
 	for (const mode of ["rpc", "json", "print"] as const) {
@@ -389,7 +389,7 @@ check(
 	},
 );
 
-// --- envelope invariants ------------------------------------------------------
+// --- envelope invariants -----------------------------------------------------
 
 check("scheduled relaunch is reported as pending, not active", () => {
 	const d = buildDetails({

@@ -110,7 +110,7 @@ check("no multiplexer means no transport", () => {
 	assert.equal(selection.available, false);
 });
 
-// --- S-CAP-03: a failed higher probe never falls through ---------------------
+// --- a failed higher probe never falls through -------------------------------
 
 check(
 	"S-CAP-03: a failing cmux probe does not fall back to herdr or tmux",
@@ -145,7 +145,7 @@ check(
 	},
 );
 
-// --- S-CAP-04: herdr workspace metadata ---------------------------------------
+// --- herdr workspace metadata ------------------------------------------------
 
 check("S-CAP-04: a herdr pane without a workspace id fails preflight", () => {
 	const probe = probeTransport(
@@ -173,7 +173,7 @@ check("S-CAP-04: the herdr query is scoped to the claimed workspace", () => {
 	assert.deepEqual(seen[0], ["herdr", "pane", "list", "--workspace", "wG"]);
 });
 
-// --- S-CAP-05: tmux pane targeting --------------------------------------------
+// --- tmux pane targeting -----------------------------------------------------
 
 check("S-CAP-05: TMUX without TMUX_PANE fails preflight", () => {
 	const candidate = pickRelaunchMux({ TMUX: "/tmp/tmux-1/default,1,0" });
@@ -242,7 +242,7 @@ check("probe queries are bounded", () => {
 	assert.ok(timeout > 0 && timeout <= 5_000, `probe timeout was ${timeout}`);
 });
 
-// --- waiter script construction -------------------------------------------------
+// --- waiter script construction ----------------------------------------------
 
 check(
 	"dynamic values are arguments, never interpolated into the script",
@@ -310,7 +310,7 @@ check("a pre-script runs before the relaunch keys are sent", () => {
 	assert.ok(args.includes("git worktree remove --force '/wt'"));
 });
 
-// --- S-CAP-09: OS spawn acknowledgement -----------------------------------------
+// --- OS spawn acknowledgement ------------------------------------------------
 
 class FakeChild extends EventEmitter {
 	pid = 4242;

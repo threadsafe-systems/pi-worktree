@@ -199,7 +199,7 @@ function scriptFor(
 	});
 }
 
-// --- S-DSP-09: the complete path ------------------------------------------------
+// --- the complete path -------------------------------------------------------
 
 await checkAsync(
 	"S-DSP-09: a clean teardown removes path, registration, and receipt",
@@ -221,7 +221,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-07: an unmerged branch is kept, and that is success -------------------
+// --- an unmerged branch is kept, and that is success -------------------------
 
 await checkAsync(
 	"S-DSP-07: an unmerged branch survives a successful teardown",
@@ -239,7 +239,7 @@ await checkAsync(
 	},
 );
 
-// --- branch disposition is decided while the facts are current --------------------
+// --- branch disposition is decided while the facts are current ---------------
 
 await checkAsync(
 	"teardown records why the branch survived, not just that it did",
@@ -272,7 +272,7 @@ await checkAsync("an aborted teardown records no branch action", async () => {
 	assert.equal(r.branchPresent, true);
 });
 
-// --- S-DSP-17: an untransferred waiter must not act -------------------------------
+// --- an untransferred waiter must not act ------------------------------------
 
 await checkAsync(
 	"S-DSP-17: a waiter that does not own the claim removes nothing",
@@ -307,7 +307,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-14: the destination must still be the one that was planned for ---------
+// --- the destination must still be the one that was planned for --------------
 
 await checkAsync(
 	"S-DSP-14: a moved destination branch aborts before any removal",
@@ -332,7 +332,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-15: cleanliness is rechecked at teardown time ---------------------------
+// --- cleanliness is rechecked at teardown time -------------------------------
 
 await checkAsync(
 	"S-DSP-15: a target that became dirty is not force-removed",
@@ -368,7 +368,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-05: a failing preRemove hook blocks removal ------------------------------
+// --- a failing preRemove hook blocks removal ---------------------------------
 
 await checkAsync(
 	"S-DSP-05: a failing pre-remove hook stops the teardown",
@@ -405,7 +405,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-19: evidence is always written ---------------------------------------------
+// --- evidence is always written ----------------------------------------------
 
 await checkAsync(
 	"S-DSP-19: every teardown writes a report, including refusals",
@@ -430,7 +430,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-06: no recursive-delete fallback anywhere in teardown -----------------------
+// --- no recursive-delete fallback anywhere in teardown -----------------------
 
 await checkAsync(
 	"S-DSP-06: teardown never falls back to a recursive delete",
@@ -457,7 +457,7 @@ await checkAsync(
 	},
 );
 
-// --- destroy stays forceful ------------------------------------------------------
+// --- destroy stays forceful --------------------------------------------------
 
 await checkAsync(
 	"destroy still removes a worktree full of ignored files",
@@ -510,7 +510,7 @@ await checkAsync(
 	},
 );
 
-// --- claim cleanup ----------------------------------------------------------------------
+// --- claim cleanup -----------------------------------------------------------
 
 await checkAsync(
 	"a completed teardown releases its lifecycle claim",

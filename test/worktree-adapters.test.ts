@@ -138,7 +138,7 @@ function newRepo(worktreeConfig?: Record<string, unknown>) {
 	return { root, repo };
 }
 
-// --- S-CMP-06 / T5 registration ------------------------------------------------
+// --- tool registration -------------------------------------------------------
 
 await checkAsync(
 	"S-CMP-06: the tool schema uses enum shapes and sequential execution",
@@ -173,7 +173,7 @@ await checkAsync(
 	},
 );
 
-// --- status --------------------------------------------------------------------
+// --- status ------------------------------------------------------------------
 
 await checkAsync(
 	"status reports the process checkout, not a selected target",
@@ -191,7 +191,7 @@ await checkAsync(
 	},
 );
 
-// --- S-REQ-02 refusals are structured, not thrown --------------------------------
+// --- refusals are structured, not thrown -------------------------------------
 
 await checkAsync(
 	"S-REQ-02: a both-selector request is a structured refusal",
@@ -210,7 +210,7 @@ await checkAsync(
 	},
 );
 
-// --- S-PRO-01/02 + S-REQ-06: create provisions and reports truthfully -------------
+// --- create provisions and reports truthfully --------------------------------
 
 await checkAsync(
 	"S-PRO-02 / S-REQ-06: create provisions, then reports path-target",
@@ -245,7 +245,7 @@ await checkAsync(
 	},
 );
 
-// --- S-REQ-04: strict create never adopts an existing checkout ---------------------
+// --- strict create never adopts an existing checkout -------------------------
 
 await checkAsync(
 	"S-REQ-04: create refuses an existing exact checkout",
@@ -260,7 +260,7 @@ await checkAsync(
 	},
 );
 
-// --- enter ------------------------------------------------------------------------
+// --- enter -------------------------------------------------------------------
 
 await checkAsync(
 	"enter selects a provisioned worktree and reports it ready",
@@ -291,7 +291,7 @@ await checkAsync("enter refuses the main checkout", async () => {
 	assert.match(text, /main working tree/);
 });
 
-// --- S-PRO-05: historical checkouts stay usable, without false claims ---------------
+// --- historical checkouts stay usable, without false claims ------------------
 
 await checkAsync(
 	"S-PRO-05: a hand-made worktree enters as unmanaged",
@@ -314,7 +314,7 @@ await checkAsync(
 	},
 );
 
-// --- S-PRO-03 / S-PRO-04: a failed hook is durable and blocks entry -----------------
+// --- a failed hook is durable and blocks entry -------------------------------
 
 await checkAsync(
 	"S-PRO-03/04: a failed post-create hook blocks later entry",
@@ -346,7 +346,7 @@ await checkAsync(
 	},
 );
 
-// --- S-TRN-08: already inside the target -------------------------------------------
+// --- already inside the target -----------------------------------------------
 
 await checkAsync(
 	"S-TRN-08: a session already in the target reports already-active",
@@ -370,7 +370,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-01 / S-DSP-12: remote disposal ---------------------------------------------
+// --- remote disposal ---------------------------------------------------------
 
 await checkAsync("S-DSP-01: model dispose refuses a dirty target", async () => {
 	const { repo } = newRepo();
@@ -433,7 +433,7 @@ await checkAsync(
 	},
 );
 
-// --- adversarial-review regressions --------------------------------------------
+// --- teardown safety under hostile hooks and contention ----------------------
 
 await checkAsync(
 	"S-DSP-05: a remote pre-remove hook containing exit cannot skip teardown",
@@ -531,7 +531,7 @@ await checkAsync(
 	},
 );
 
-// --- pending guard wiring --------------------------------------------------------
+// --- pending guard wiring ----------------------------------------------------
 
 await checkAsync(
 	"the tool_call guard lets unrelated tools through when idle",

@@ -43,7 +43,7 @@ const PI_ROOT = join(
 	"node_modules/@earendil-works/pi-coding-agent",
 );
 
-// --- the waiter must not act before the originating process exits ----------------
+// --- the waiter must not act before the originating process exits ------------
 
 await checkAsync(
 	"the waiter blocks until the originating pi process has exited",
@@ -86,7 +86,7 @@ await checkAsync(
 	},
 );
 
-// --- S-DSP-18: teardown evidence survives a failed transport launch ----------------
+// --- teardown evidence survives a failed transport launch --------------------
 
 await checkAsync(
 	"S-DSP-18: teardown still records itself when the relaunch cannot land",
@@ -123,7 +123,7 @@ await checkAsync(
 	},
 );
 
-// --- an aborted waiter never runs its payload ----------------------------------------
+// --- an aborted waiter never runs its payload --------------------------------
 
 await checkAsync(
 	"S-DSP-17: an aborted waiter never runs its teardown",
@@ -155,7 +155,7 @@ await checkAsync(
 	},
 );
 
-// --- S-CMP-02: the Pi lifecycle contracts this design depends on ----------------------
+// --- the Pi lifecycle contracts this design depends on -----------------------
 
 await checkAsync(
 	"S-CMP-02: the installed agent core only terminates an all-terminating batch",

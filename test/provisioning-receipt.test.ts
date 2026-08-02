@@ -96,7 +96,7 @@ function seedReceipt(o: ClaimOwner) {
 	});
 }
 
-// --- canonical encoding -----------------------------------------------------
+// --- canonical encoding ------------------------------------------------------
 
 check("canonical JSON is key-order independent", () => {
 	assert.equal(
@@ -135,7 +135,7 @@ check("config digest covers hooks and env linking only", () => {
 	assert.equal(a, configDigest({ postCreate: ["npm install"] }));
 });
 
-// --- S-PRO-01 / 02: durable intent before mutation, ready only at the end ----
+// --- durable intent before mutation, ready only at the end -------------------
 
 check(
 	"S-PRO-01: provisioning intent is durable before any git mutation",
@@ -185,7 +185,7 @@ check("S-PRO-02: ready is only reachable after the last stage", () => {
 	);
 });
 
-// --- S-PRO-03: a failed hook is recorded with its index ---------------------
+// --- a failed hook is recorded with its index --------------------------------
 
 check("S-PRO-03: a failed post-create hook records stage and index", () => {
 	const { store } = freshStore();
@@ -207,7 +207,7 @@ check("S-PRO-03: a failed post-create hook records stage and index", () => {
 	assert.equal(classifyProvisioning(read, { worktreePath: TARGET }), "failed");
 });
 
-// --- S-PRO-04: a crash leaves non-ready state -------------------------------
+// --- a crash leaves non-ready state ------------------------------------------
 
 check(
 	"S-PRO-04: an interrupted provisioning stays non-ready for a new process",
@@ -225,7 +225,7 @@ check(
 	},
 );
 
-// --- S-PRO-05: no receipt means unmanaged, not failed -----------------------
+// --- no receipt means unmanaged, not failed ----------------------------------
 
 check("S-PRO-05: a receipt-less checkout classifies as unmanaged", () => {
 	const { store } = freshStore();
@@ -235,7 +235,7 @@ check("S-PRO-05: a receipt-less checkout classifies as unmanaged", () => {
 	);
 });
 
-// --- S-PRO-06: corrupt receipts fail closed ---------------------------------
+// --- corrupt receipts fail closed --------------------------------------------
 
 check(
 	"S-PRO-06: invalid JSON, unknown schema, and mismatches are corrupt",
@@ -275,7 +275,7 @@ check(
 	},
 );
 
-// --- S-PRO-07 / 08: stale discard keys off the recorded branch --------------
+// --- stale discard keys off the recorded branch ------------------------------
 
 check("S-PRO-07: a fully vanished target may be reclaimed", () => {
 	const { store } = freshStore();
@@ -329,7 +329,7 @@ check("S-PRO-08: any surviving trace blocks automatic discard", () => {
 	}
 });
 
-// --- S-PRO-09 / 12: write failures are visible ------------------------------
+// --- write failures are visible ----------------------------------------------
 
 check("S-PRO-09: a receipt write without the claim is refused", () => {
 	const { store } = freshStore();
@@ -360,7 +360,7 @@ check("S-PRO-12: an unwritable store surfaces receipt-write-failed", () => {
 	assert.equal(result.code, "receipt-write-failed");
 });
 
-// --- S-PRO-10: config drift does not invalidate a ready checkout ------------
+// --- config drift does not invalidate a ready checkout -----------------------
 
 check("S-PRO-10: a later config change leaves a ready receipt ready", () => {
 	const { store } = freshStore();
@@ -375,7 +375,7 @@ check("S-PRO-10: a later config change leaves a ready receipt ready", () => {
 		assert.equal(read.receipt.configDigest, receipt.configDigest);
 });
 
-// --- S-PRO-11: concurrent creators ------------------------------------------
+// --- concurrent creators -----------------------------------------------------
 
 check("S-PRO-11: only one of two concurrent claimants wins", () => {
 	const { store } = freshStore();
@@ -472,7 +472,7 @@ check(
 	},
 );
 
-// --- claim ownership --------------------------------------------------------
+// --- claim ownership ---------------------------------------------------------
 
 check("owner tuple verification distinguishes role and pid", () => {
 	const { store } = freshStore();

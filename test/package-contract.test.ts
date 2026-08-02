@@ -36,7 +36,7 @@ function reachableExtensionFiles(): string[] {
 	return [...seen].sort();
 }
 
-// --- S-CMP-03: everything imported at runtime is published --------------------
+// --- everything imported at runtime is published -----------------------------
 
 check(
 	"S-CMP-03: the published package contains every reachable extension file",
@@ -68,7 +68,7 @@ check("the extension entry point really does span several modules", () => {
 	);
 });
 
-// --- S-CMP-02: the declared runtime floor ------------------------------------
+// --- the declared runtime floor ----------------------------------------------
 
 check(
 	"S-CMP-02: the package declares the Pi lifecycle floor it depends on",
@@ -106,7 +106,7 @@ check("S-CMP-02: StringEnum resolves from the declared pi-ai peer", () => {
 	assert.match(helpers, /export declare function StringEnum/);
 });
 
-// --- S-CMP-05: the regression net is discovery-based ---------------------------
+// --- the regression net is discovery-based -----------------------------------
 
 check("S-CMP-05: npm test runs the discovery aggregator", () => {
 	assert.equal(pkg.scripts.test, "tsx test/run-all.ts");
@@ -160,7 +160,7 @@ check("every present test file is discovered", () => {
 	assert.deepEqual(discovered, onDisk.sort());
 });
 
-// --- S-CMP-01: documented behaviour matches the shipped contract ----------------
+// --- documented behaviour matches the shipped contract -----------------------
 
 check(
 	"S-CMP-01: README no longer promises absolute-path targeting as the default",

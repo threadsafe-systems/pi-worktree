@@ -93,7 +93,7 @@ check("an unmanaged handoff must not carry a receipt hash", () => {
 	assert.notEqual(decoded?.version, 2);
 });
 
-// --- S-TRN-06: verified entry -------------------------------------------------
+// --- verified entry ----------------------------------------------------------
 
 check("S-TRN-06: landing exactly where planned verifies", () => {
 	const v = verifyEnter(
@@ -127,7 +127,7 @@ check(
 	},
 );
 
-// --- S-TRN-07: wrong destination ------------------------------------------------
+// --- wrong destination -------------------------------------------------------
 
 check("S-TRN-07: a different path or branch is a mismatch, not success", () => {
 	for (const actual of [
@@ -167,7 +167,7 @@ check("S-TRN-07: an unregistered target is a mismatch", () => {
 	assert.equal(v.registrationDisposition, "removed");
 });
 
-// --- S-TRN-09: provisioning identity ---------------------------------------------
+// --- provisioning identity ---------------------------------------------------
 
 check(
 	"S-TRN-09: a ready target whose receipt vanished is never downgraded",
@@ -212,7 +212,7 @@ check("S-TRN-09: a corrupt receipt is reported as corrupt", () => {
 	assert.ok(v.issues.includes("receipt-corrupt"));
 });
 
-// --- S-TRN-10: legacy payloads ------------------------------------------------------
+// --- legacy payloads ---------------------------------------------------------
 
 check("S-TRN-10: a legacy transition is explicitly unverified", () => {
 	const v = legacyVerification(TARGET, NOW, "enter");
@@ -230,7 +230,7 @@ check("S-TRN-10: a legacy transition is explicitly unverified", () => {
 	);
 });
 
-// --- S-DSP-07 / 08 / 09: disposal outcomes --------------------------------------------
+// --- disposal outcomes -------------------------------------------------------
 
 const disposeHandoff = handoff({
 	kind: "dispose",
@@ -305,7 +305,7 @@ check("a leftover receipt after successful removal is partial", () => {
 	assert.equal(v.receiptDisposition, "present");
 });
 
-// --- S-DSP-18 / 19: missing teardown evidence -----------------------------------------
+// --- missing teardown evidence -----------------------------------------------
 
 check(
 	"S-DSP-19: a missing teardown report is partial, never assumed success",
@@ -320,7 +320,7 @@ check(
 	},
 );
 
-// --- S-DSP-14: destination mismatch -----------------------------------------------------
+// --- destination mismatch ----------------------------------------------------
 
 check("S-DSP-14: landing on an unexpected destination is a mismatch", () => {
 	const v = verifyDispose(
