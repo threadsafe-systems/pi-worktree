@@ -135,6 +135,55 @@ the session across, and grew from there into the feature set below.
     git-list order, so `destroy foo` prefers a literal `foo` worktree over a
     colliding `feat/foo` one. No new defects.
 
+15. **Unified worktree transitions.** The model-callable tool and the slash /
+    startup paths used the same words for different postconditions: the tool
+    recorded an alternate directory and told the agent to rewrite paths, while a
+    slash command restarted pi in the worktree. Both now run through one
+    transition module (`extensions/worktree-transition.ts`), and every result
+    names its actual outcome — `relaunch-scheduled`, `already-active`,
+    `path-target`, `manual-restart`, `disposed`, `dispose-partial`, `refused`,
+    or `failed` — so "selected a directory" can never read as "moved the
+    session". An `execution` preference (`auto` / `recamp` / `paths`) keeps the
+    old absolute-path behaviour available and makes it the automatic choice in
+    headless runs.
+    - On a capable TUI runtime, a model `create`/`enter` now arms the waiter,
+      marks the transition pending, requests shutdown, and returns a terminating
+      result, so the hand-off costs no extra model turn. The tool is registered
+      `executionMode: "sequential"`, so sibling tool calls issued in the same
+      response finish and are recorded before shutdown; every call after the
+      hand-off is armed is refused, including read-only ones, whose results
+      would otherwise be reasoned about in the wrong working directory.
+    - Requires the Pi 0.83 lifecycle contracts (deferred `ctx.shutdown()`,
+      `ctx.mode`, per-tool `executionMode`, terminating tool results), now the
+      declared peer floor. `Type.Union(Type.Literal(...))` was replaced with
+      `StringEnum` from `@earendil-works/pi-ai` for Google-family providers.
+16. **Provisioning is recorded, not inferred** (`extensions/worktree-receipt.ts`).
+    `git worktree add` succeeds long before env linking and `postCreate` hooks
+    do, and git records none of that, so a crashed create left a real checkout
+    that looked identical to a finished one. A receipt in the repository's
+    common git directory is written before git mutates anything and only marked
+    ready after the last hook; a failed or interrupted create is refused by
+    later `enter` calls instead of quietly handing an agent a half-built
+    checkout. Receipt-less checkouts (hand-made, or predating this) stay usable
+    but are reported `unmanaged` rather than claimed to be provisioned.
+    - This package exists to run agents in parallel, so lifecycle operations
+      take an exclusive claim first (`mkdir` as the portable atomic
+      test-and-set). Ownership is the full `operation + pid + role` tuple, not
+      the operation id alone, because a live-dispose waiter inherits its
+      origin's operation id — checking only the id would let an armed waiter act
+      after its hand-off failed.
+17. **Pane ownership is verified before pi agrees to exit**
+    (`extensions/worktree-transport.ts`). Detection previously trusted
+    environment variables, so a stale or leaked pane id could send the relaunch
+    command to an unrelated shell. The transport is now probed (executable
+    present, complete pane/workspace identifiers, plus a read-only vendor query
+    where one exists), and a failed probe on the owning multiplexer never falls
+    through to a lower-precedence one. The waiter spawn is no longer
+    fire-and-forget: scheduling resolves on the OS `spawn` event and keeps the
+    child referenced, so an unacknowledged waiter is killed rather than left to
+    act, and nothing requests shutdown until something is confirmed running.
+    Scheduling still is not delivery, and results say so.
+
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.
 

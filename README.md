@@ -81,7 +81,7 @@ pi --worktree my-feature --worktree-base develop
 **Create overrides** (both `/worktree ...` and the `--worktree-*` CLI flags):
 
 | Override | Flag (CLI) | Effect |
-|---|---|---|
+| --- | --- | --- |
 | `--dir <path>` | `--worktree-dir` | Worktree base directory for this invocation |
 | `--branch <name>` | `--worktree-branch` | Exact branch, bypassing conventional resolution (still validated for ref/shell safety) |
 | `--base <ref>` | `--worktree-base` | Branch the worktree from `<ref>` instead of `HEAD` |
@@ -91,7 +91,7 @@ Worktrees are created in a **sibling** directory next to the repo
 For example `feat/my-feature` lives at `../my-repo.worktrees/feat-my-feature`.
 Because it sits outside the repo tree, there is nothing to add to `.gitignore`.
 
-When cmux, [herdr](https://herdr.dev), or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Without a multiplexer, it prints the path for manual `cd && pi`. If a worktree already exists because it was created manually or by another session, use `/worktree enter <type/name>` to relaunch Pi inside that existing linked checkout.
+When cmux, [herdr](https://herdr.dev), or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Ownership of the pane is verified first, and the relaunch waiter must be confirmed running by the OS before Pi agrees to exit. Without a usable multiplexer, Pi prints the exact command to run instead. If a worktree already exists because it was created manually or by another session, use `/worktree enter <type/name>` to relaunch Pi inside that existing linked checkout.
 
 ## Project configuration
 
@@ -112,7 +112,7 @@ Create `.pi/worktree.json` in your repo root (commit it so all contributors shar
 ```
 
 | Key | Default | Description |
-|-----|---------|-------------|
+| ----- | --------- | ------------- |
 | `dir` | `<repoRoot>.worktrees` | Worktree base dir. Omit for the sibling default; set to resolve relative to the repo root |
 | `defaultType` | `feat` | Conventional-commit type used when the input has no `type/` prefix |
 | `types` | all conventional types | Override the accepted `<type>` set |
@@ -150,10 +150,60 @@ are not blocked. Commit `.pi/worktree-discipline.json` to share the policy; the
 local override `.pi/worktree-discipline.local.json` is gitignored by the helper.
 Manual `git worktree add` creates a checkout but does **not** move the active Pi
 session; use `/worktree enter <type/name>` or restart Pi from the linked worktree
-so relative paths and the worktree status prompt are correct. In autonomous/headless
-agent turns, prefer the `worktree_session` tool; after `create`/`enter`, the agent
-should use absolute paths under the returned `worktreePath` and prefix shell commands
-with `cd <worktreePath> &&` until it calls `worktree_session` `dispose`.
+so relative paths and the worktree status prompt are correct.
+
+### The `worktree_session` tool
+
+Agents get a model-callable `worktree_session` tool with `status`, `create`,
+`enter`, and `dispose`. **Its result says where the session actually is** —
+selecting a directory and moving the process are different things, and the tool
+never reports one as the other:
+
+| `outcome` | What happened | What the agent should do |
+| --- | --- | --- |
+| `relaunch-scheduled` | The session is ending; a replacement resumes in the worktree | Stop issuing tool calls; the task continues there |
+| `already-active` | The process is already in that worktree | Work normally with repo-relative paths |
+| `path-target` | The process did **not** move | Use absolute paths under `worktreePath`, and `cd <worktreePath> && …` for shell |
+| `manual-restart` | Nothing moved; a human must restart | Surface the supplied `recovery.command` |
+| `disposed` / `dispose-partial` | Teardown completed, or left residue | Report residue rather than assuming success |
+| `refused` / `failed` | Nothing unsafe was done | Read `code` and fix the request |
+
+An `execution` preference selects the strategy:
+
+- `auto` (default) — move the session when the runtime supports it, otherwise
+  fall back truthfully;
+- `recamp` — require a real session move, and report `manual-restart` rather
+  than silently degrading;
+- `paths` — deliberately stay put and work through absolute paths. This is the
+  pre-existing autonomous behaviour, and remains the automatic choice in
+  headless (`-p`, JSON, RPC) runs.
+
+A `create`/`enter` call may end the session, so the agent is told to issue it as
+the only tool call in that response. Once a hand-off is armed, every further
+tool call is refused until the replacement session takes over.
+
+Create is strict: it refuses a checkout that already exists rather than adopting
+it. `pi --worktree <existing-name>` keeps its create-or-reuse behaviour.
+
+### Provisioning records
+
+A worktree only becomes usable after `git worktree add`, env linking, and every
+`postCreate` hook. Because git records none of that, pi-worktree keeps a small
+receipt in the repository's common git directory (never inside a checkout, so
+nothing is dirtied). A create that fails or is interrupted leaves the checkout
+recorded as **not ready**, and later `enter` calls refuse it instead of dropping
+an agent into a half-built directory — dispose it and create it again.
+Worktrees made by hand, or before this feature existed, have no receipt: they
+remain usable and are reported as `unmanaged`, which states plainly that their
+project hooks were never observed to run.
+
+Concurrent agents are expected, so every lifecycle operation takes an exclusive
+claim on its target first; a second one gets a `target-busy` refusal rather than
+both mutating the same checkout.
+
+> Disposing a worktree other than the one Pi is running in cannot detect whether
+> a *different* Pi process is using it. That result reports
+> `remoteProcessLiveness: "unknown"` rather than implying it checked.
 
 ## How it works
 
