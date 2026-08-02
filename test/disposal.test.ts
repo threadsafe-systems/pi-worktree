@@ -123,11 +123,18 @@ async function runTeardown(
 ): Promise<RunResult> {
 	const pidFile = join(f.root, "waiter.pid");
 	const goFile = join(f.root, "go");
-	const prelude = `echo $$ > "$1"\nwhile [ ! -e "$2" ]; do sleep 0.02; done\n`;
+	// Invoke the teardown exactly as the real waiter does: as its OWN shell, with
+	// the waiter's pid passed in as $1. Running it in the harness's shell would
+	// make $$ agree by accident and hide a production mismatch.
+	const waiter = [
+		'echo $$ > "$1"',
+		'while [ ! -e "$2" ]; do sleep 0.02; done',
+		'bash -c "$3" pi-worktree-teardown "$$"',
+	].join("\n");
 
 	const child = spawn(
 		"bash",
-		["-c", prelude + script, "teardown", pidFile, goFile],
+		["-c", waiter, "waiter", pidFile, goFile, script],
 		{
 			stdio: "ignore",
 		},

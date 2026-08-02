@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import worktreeExtension from "../extensions/worktree.ts";
+import { acquireClaim, createStore } from "../extensions/worktree-receipt.ts";
 import type { TransitionDetails } from "../extensions/worktree-transition.ts";
 
 let fail = 0;
@@ -429,6 +430,104 @@ await checkAsync(
 		const { details } = await inside.call({ action: "dispose" });
 		assert.equal(details.code, "live-cwd-unsafe");
 		assert.equal(existsSync(targetPath), true);
+	},
+);
+
+// --- adversarial-review regressions --------------------------------------------
+
+await checkAsync(
+	"S-DSP-05: a remote pre-remove hook containing exit cannot skip teardown",
+	async () => {
+		// A hook that ends the shell used to take the whole script with it, silently
+		// skipping removal and every check after it.
+		const { repo } = newRepo({ preRemove: ["exit 7"] });
+		const { call } = harness(repo);
+		const created = await call({ action: "create", name: "feat/hooked" });
+		const targetPath = created.details.target?.path ?? "";
+
+		const { details } = await call({ action: "dispose", name: "feat/hooked" });
+		assert.equal(
+			details.outcome,
+			"dispose-partial",
+			"a failed hook must not report success",
+		);
+		assert.equal(
+			existsSync(targetPath),
+			true,
+			"removal ran despite a failed pre-remove hook",
+		);
+	},
+);
+
+await checkAsync(
+	"S-DSP-15: remote dispose rechecks cleanliness after its hooks",
+	async () => {
+		// The dirty check happens before the script runs, so a hook that writes into
+		// the target would otherwise have its output destroyed by --force.
+		const { repo } = newRepo({ preRemove: ["echo late > hook-artifact.txt"] });
+		const { call } = harness(repo);
+		const created = await call({ action: "create", name: "feat/late-write" });
+		const targetPath = created.details.target?.path ?? "";
+
+		const { details } = await call({
+			action: "dispose",
+			name: "feat/late-write",
+		});
+		assert.equal(details.outcome, "dispose-partial");
+		assert.equal(
+			existsSync(targetPath),
+			true,
+			"--force destroyed post-check hook output",
+		);
+		assert.equal(existsSync(join(targetPath, "hook-artifact.txt")), true);
+	},
+);
+
+await checkAsync(
+	"remote dispose takes an exclusive claim on its target",
+	async () => {
+		const { repo } = newRepo();
+		const { call } = harness(repo);
+		const created = await call({ action: "create", name: "feat/contended" });
+		const targetPath = created.details.target?.path ?? "";
+
+		// Another live operation already owns this target.
+		const store = createStore(join(repo, ".git"));
+		const held = acquireClaim(store, targetPath, {
+			operationId: "other-op",
+			pid: process.pid,
+			role: "origin",
+		});
+		assert.equal(held.ok, true);
+
+		const { details } = await call({
+			action: "dispose",
+			name: "feat/contended",
+		});
+		assert.equal(details.outcome, "refused");
+		assert.equal(details.code, "target-busy");
+		assert.equal(
+			existsSync(targetPath),
+			true,
+			"a contended target must not be torn down",
+		);
+	},
+);
+
+await checkAsync(
+	"an operational git failure is a structured result, not a thrown string",
+	async () => {
+		// Rooted outside any repository, so every git call this tool makes fails.
+		const notARepo = realpathSync(
+			mkdtempSync(join(tmpdir(), "pi-wt-not-a-repo-")),
+		);
+		const { call } = harness(notARepo);
+		const result = await call({ action: "status" });
+		const details = result.details;
+		assert.equal(details.outcome, "failed");
+		assert.equal(details.code, "git-failed");
+		assert.ok(details.recovery?.instructions.length);
+		assert.match(result.text, /failed/i);
 	},
 );
 

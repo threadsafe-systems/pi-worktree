@@ -893,13 +893,26 @@ function buildTeardownScript(
 	const hooks = preRemove ?? [];
 	if (hooks.length) {
 		// Fail-fast: a failing preRemove hook (e.g. a backup) must abort before the
-		// irreversible worktree/branch removal below.
+		// irreversible removal below. Each hook runs in a subshell, because a
+		// project hook containing `exit` would otherwise end this script at the
+		// hook step and skip every check between it and the caller's report.
 		lines.push("set -e");
 		for (const cmd of hooks) {
-			lines.push(`cd ${shQuote(worktreePath)} && ${cmd}`);
+			lines.push(`( cd ${shQuote(worktreePath)} && ${cmd} )`);
 		}
 		lines.push("set +e");
 	}
+	// Hooks are arbitrary project commands and may leave work behind, so what was
+	// clean when the caller checked may not be clean now. `--force` would destroy
+	// it silently.
+	lines.push(
+		`if [ -n "$(git -C ${shQuote(worktreePath)} status --porcelain --ignored 2>/dev/null)" ]; then`,
+	);
+	lines.push(
+		`  echo "refusing to remove ${worktreePath}: it became dirty after the pre-remove hooks" >&2`,
+	);
+	lines.push("  exit 1");
+	lines.push("fi");
 	lines.push(`cd ${shQuote(repoRoot)}`);
 	// NB: no `rm -rf` fallback. If `git worktree remove` refuses (e.g. the path
 	// is stale and has been reused by unrelated content), blindly rm -rf'ing it
@@ -960,6 +973,10 @@ owner=${shQuote(opts.waiterOwnerFile)}
 receipt=${shQuote(opts.receiptFile)}
 report=${shQuote(opts.reportFile)}
 dest=${shQuote(opts.expectedDestinationBranch)}
+# The waiter's pid, passed in by the waiter itself. This teardown runs as its
+# own shell, so $$ here belongs to the child, not to the process the origin
+# handed the claim to.
+waiter_pid="\${1:-}"
 abort=""
 stages=""
 
@@ -967,9 +984,10 @@ record() { stages="\${stages}\${stages:+,}{\\"name\\":\\"$1\\",\\"status\\":\\"$
 
 # This detached shell is the claim owner only if the origin persisted the
 # hand-off to exactly this pid. Without that, it must not touch anything.
-if ! grep -q "\\"operationId\\":\\"$op\\"" "$owner" 2>/dev/null ||
-   ! grep -q "\\"pid\\":$$," "$owner" 2>/dev/null ||
-   ! grep -q "\\"role\\":\\"waiter\\"" "$owner" 2>/dev/null; then
+if [ -z "$waiter_pid" ] ||
+   ! grep -qF "\\"operationId\\":\\"$op\\"" "$owner" 2>/dev/null ||
+   ! grep -qF "\\"pid\\":$waiter_pid," "$owner" 2>/dev/null ||
+   ! grep -qF "\\"role\\":\\"waiter\\"" "$owner" 2>/dev/null; then
   abort="claim"
   record claim failed
 else
@@ -1302,7 +1320,32 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return handleWorktreeSessionTool(params, ctx);
+			try {
+				return await handleWorktreeSessionTool(params, ctx);
+			} catch (err) {
+				// Git can fail for reasons that are nobody's bug: a repository being
+				// rewritten underneath us, a timeout, a binary swapped mid-session.
+				// The model still needs to know where it is and what to do next,
+				// which a thrown string cannot tell it.
+				return toolResult(
+					buildDetails({
+						action: params.action,
+						outcome: "failed",
+						process: { path: ctx.cwd, branch: null, kind: "main" },
+						code: "git-failed",
+						...(params.execution
+							? { requestedExecution: params.execution }
+							: {}),
+						recovery: {
+							instructions: [
+								"Nothing was changed by this call.",
+								"Check `git worktree list` and `git status`, then retry.",
+							],
+						},
+					}),
+					`Worktree operation failed: ${(err as Error).message}`,
+				);
+			}
 		},
 	});
 
@@ -2441,19 +2484,35 @@ export default function (pi: ExtensionAPI) {
 			);
 		}
 
-		const dispose = await pi.exec(
-			"bash",
-			[
-				"-c",
-				buildDisposeScript(
-					repoRoot,
-					entry.path,
-					entry.branch,
-					config.preRemove,
-				),
-			],
-			{ timeout: 130_000 },
-		);
+		// Remote teardown mutates the target, so it takes the same exclusive claim
+		// as create and live dispose; two sessions must not tear down one worktree.
+		const store = createStore(await resolveGitCommonDir(repoRoot));
+		const owner: ClaimOwner = {
+			operationId: newOperationId(),
+			pid: process.pid,
+			role: "origin",
+		};
+		const claim = acquireClaim(store, canonicalPath(entry.path), owner);
+		if (!claim.ok) return refuse("target-busy", claim.reason);
+
+		let dispose: { code: number; stdout: string; stderr: string };
+		try {
+			dispose = await pi.exec(
+				"bash",
+				[
+					"-c",
+					buildDisposeScript(
+						repoRoot,
+						entry.path,
+						entry.branch,
+						config.preRemove,
+					),
+				],
+				{ timeout: 130_000 },
+			);
+		} finally {
+			releaseClaim(store, canonicalPath(entry.path), owner);
+		}
 		const registrationGone = !(await listWorktrees(repoRoot)).some(
 			(w) => canonicalPath(w.path) === canonicalPath(entry.path),
 		);
@@ -2467,10 +2526,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (agentWorktree?.path === entry.path) agentWorktree = null;
 		if (pathGone && registrationGone) {
-			removeReceipt(
-				createStore(await resolveGitCommonDir(repoRoot)),
-				canonicalPath(entry.path),
-			);
+			removeReceipt(store, canonicalPath(entry.path));
 		}
 
 		const complete = pathGone && registrationGone && dispose.code === 0;

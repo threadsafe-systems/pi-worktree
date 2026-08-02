@@ -1,0 +1,286 @@
+{
+  "runId": "78e0e3e0",
+  "agent": "adversary",
+  "task": "Adversarially review a local branch diff. Repo: /Users/neil/code/pi-worktree. Diff: /tmp/wt-review.diff (git diff main...HEAD). Head SHA: 505444e48492acd4c9d8ed0a4662031f062942d1. Branch: feat/unified-worktree-transitions.\n\nRead the FULL files, not just the diff: extensions/worktree.ts, worktree-transition.ts, worktree-receipt.ts, worktree-transport.ts, worktree-handoff.ts, worktree-shell.ts, package.json, and the test/ files. Specs: docs/specs/2026-08-02-unified-worktree-transitions.md.\n\nThis change rewrites a live agent session lifecycle: it can exit the user's pi process, relaunch it elsewhere, and delete git worktrees from a detached shell. Data loss and session loss are the failure modes that matter.\n\nHunt hardest at:\n1. buildVerifiedTeardownScript in extensions/worktree.ts — it is generated bash run detached with no supervision. Check quoting/injection via branch names, paths, and preRemove hooks; the abort-flag control flow; whether grep matching against canonical JSON owner files can false-positive or false-negative (pid substring matches, key ordering, escaping); `$$` semantics inside bash -c; whether any path can remove data it should not; whether the report is always written; `set -u` interactions.\n2. The lifecycle claim protocol in worktree-receipt.ts — mkdir as test-and-set, orphan grace reclaim, dead-PID reclaim vs PID reuse, transferClaim, releaseClaim, and whether a losing process can ever mutate a winner's receipt or worktree.\n3. The pending-transition guard — does returning {block:true} from a tool_call handler actually stop execution in pi 0.83, does it cover worktree_session itself, and can pendingTransition ever be set without shutdown actually happening (stranding the session permanently refusing all tools)?\n4. Error paths that throw instead of returning a structured refusal (e.g. resolveGitCommonDir, listWorktrees, getRepoRoot) and what the model sees when they do.\n5. Dispose target selection: selectorless resolution, live-vs-remote detection, canonicalPath comparisons, symlinks, and whether the main checkout can ever be targeted.\n6. Successor verification in worktree-handoff.ts — can a mismatch be reported as verified, or vice versa? Is any check tautological?\n7. Backward compatibility: removed/renamed exports, re-exports, handoff v1 decode, existing slash-command and startup flows still working.\n8. Test quality: tests that assert something weaker than they claim, or that would pass against a broken implementation.\n\nReport concrete defects with file:line evidence and severity. Say plainly if something is fine.\n\n---\n**Output:**\nWrite your findings to exactly this path: /tmp/wt-adversary-qwen.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 0,
+  "processSignal": "SIGTERM",
+  "usage": {
+    "input": 323180,
+    "output": 20509,
+    "cacheRead": 2751104,
+    "cacheWrite": 0,
+    "cost": 0,
+    "turns": 31
+  },
+  "model": "qwen-token-plan/qwen3.7-max:high",
+  "attemptedModels": ["qwen-token-plan/qwen3.7-max:high"],
+  "modelAttempts": [
+    {
+      "model": "qwen-token-plan/qwen3.7-max:high",
+      "success": true,
+      "exitCode": 0,
+      "usage": {
+        "input": 323180,
+        "output": 20509,
+        "cacheRead": 2751104,
+        "cacheWrite": 0,
+        "cost": 0,
+        "turns": 31
+      }
+    }
+  ],
+  "durationMs": 544089,
+  "toolCount": 34,
+  "launchContractDigest": "1ad8df1a5d7e8f8ee8d80eeea33d433430e9cbaf7318957b3fe393c6ef855678",
+  "launchResolvedExtensions": {
+    "version": 1,
+    "source": "launch-resolved",
+    "disableAmbientExtensions": false,
+    "runtime": ["sha256:3ed3402b6bb426e5"],
+    "configured": [],
+    "effective": ["sha256:3ed3402b6bb426e5"],
+    "omitted": {
+      "runtime": 0,
+      "configured": 0,
+      "effective": 0
+    }
+  },
+  "acceptance": {
+    "status": "review-required",
+    "evidenceStatus": "checked",
+    "explicit": false,
+    "effectiveAcceptance": {
+      "level": "checked",
+      "explicit": false,
+      "inferredReason": ["risky write-capable run"],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Implement the requested change without widening scope",
+          "evidence": [
+            "changed-files",
+            "tests-added",
+            "commands-run",
+            "residual-risks",
+            "no-staged-files"
+          ],
+          "severity": "required"
+        },
+        {
+          "id": "criterion-2",
+          "must": "Return evidence sufficient for an independent acceptance review",
+          "evidence": [
+            "changed-files",
+            "tests-added",
+            "commands-run",
+            "residual-risks",
+            "no-staged-files"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "changed-files",
+        "tests-added",
+        "commands-run",
+        "residual-risks",
+        "no-staged-files"
+      ],
+      "verify": [],
+      "review": {
+        "agent": "reviewer",
+        "required": true
+      },
+      "stopRules": []
+    },
+    "inferredReason": ["risky write-capable run"],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Implement the requested change without widening scope",
+        "evidence": [
+          "changed-files",
+          "tests-added",
+          "commands-run",
+          "residual-risks",
+          "no-staged-files"
+        ],
+        "severity": "required"
+      },
+      {
+        "id": "criterion-2",
+        "must": "Return evidence sufficient for an independent acceptance review",
+        "evidence": [
+          "changed-files",
+          "tests-added",
+          "commands-run",
+          "residual-risks",
+          "no-staged-files"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [
+      {
+        "id": "criterion:criterion-1",
+        "status": "passed",
+        "message": "Required criterion 'criterion-1' satisfied."
+      },
+      {
+        "id": "criterion:criterion-2",
+        "status": "passed",
+        "message": "Required criterion 'criterion-2' satisfied."
+      },
+      {
+        "id": "evidence:changed-files",
+        "status": "passed",
+        "message": "changed-files evidence present."
+      },
+      {
+        "id": "evidence:tests-added",
+        "status": "passed",
+        "message": "tests-added evidence present."
+      },
+      {
+        "id": "evidence:commands-run",
+        "status": "passed",
+        "message": "commands-run evidence present."
+      },
+      {
+        "id": "evidence:residual-risks",
+        "status": "passed",
+        "message": "residual-risks evidence present."
+      },
+      {
+        "id": "evidence:no-staged-files",
+        "status": "passed",
+        "message": "no-staged-files evidence present."
+      },
+      {
+        "id": "no-staged-files",
+        "status": "passed",
+        "message": "No staged files detected."
+      }
+    ],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Review was scoped to the branch diff and full source files. No scope widening — all findings are about code in the diff."
+        },
+        {
+          "id": "criterion-2",
+          "status": "satisfied",
+          "evidence": "7 findings with file:line evidence, severity ratings, and concrete repro descriptions. 8 verified-correct areas traced adversarially. All commands run and reported."
+        }
+      ],
+      "changedFiles": [
+        "PROVENANCE.md",
+        "README.md",
+        "docs/plans/2026-08-02-unified-worktree-transitions-build.md",
+        "docs/plans/2026-08-02-unified-worktree-transitions.md",
+        "docs/specs/2026-08-02-unified-worktree-transitions.md",
+        "extensions/worktree-handoff.ts",
+        "extensions/worktree-receipt.ts",
+        "extensions/worktree-shell.ts",
+        "extensions/worktree-transition.ts",
+        "extensions/worktree-transport.ts",
+        "extensions/worktree.ts",
+        "package-lock.json",
+        "package.json",
+        "test/disposal.test.ts",
+        "test/fixtures-claim-race.ts",
+        "test/package-contract.test.ts",
+        "test/process-lifecycle.test.ts",
+        "test/provisioning-receipt.test.ts",
+        "test/run-all.ts",
+        "test/successor-verification.test.ts",
+        "test/transition-planner.test.ts",
+        "test/transport.test.ts",
+        "test/worktree-adapters.test.ts"
+      ],
+      "testsAddedOrUpdated": [
+        "test/disposal.test.ts",
+        "test/fixtures-claim-race.ts",
+        "test/package-contract.test.ts",
+        "test/process-lifecycle.test.ts",
+        "test/provisioning-receipt.test.ts",
+        "test/run-all.ts",
+        "test/successor-verification.test.ts",
+        "test/transition-planner.test.ts",
+        "test/transport.test.ts",
+        "test/worktree-adapters.test.ts"
+      ],
+      "commandsRun": [
+        {
+          "command": "npm test",
+          "result": "passed",
+          "summary": "10 test files, 231 cases, all OK"
+        },
+        {
+          "command": "npm run typecheck",
+          "result": "passed",
+          "summary": "tsc --noEmit clean"
+        },
+        {
+          "command": "npm run lint",
+          "result": "passed",
+          "summary": "biome check --error-on-warnings: 22 files, no issues"
+        },
+        {
+          "command": "git diff --cached --stat",
+          "result": "passed",
+          "summary": "No staged files"
+        }
+      ],
+      "validationOutput": [
+        "All 231 test cases pass across 10 test files",
+        "TypeScript compilation clean with --noEmit",
+        "Biome lint clean with --error-on-warnings",
+        "No staged files in working tree"
+      ],
+      "residualRisks": [
+        "HIGH: Remote dispose hooks run without subshells — exit in a hook terminates the teardown script, leaving worktree/branch intact without a report",
+        "HIGH: Remote dispose has no post-hook cleanliness recheck — --force can destroy files created after the initial dirty check",
+        "MEDIUM: Remote dispose does not acquire a lifecycle claim, allowing concurrent disposal races",
+        "MEDIUM: listWorktrees and resolveGitCommonDir throw instead of returning structured refusals",
+        "MEDIUM: buildDisposeScript writes no teardown report, making v2 successor verification always report partial",
+        "MEDIUM: Pending-transition guard lacks integration test proving Pi 0.83 actually invokes the handler for queued siblings",
+        "LOW: Teardown script grep uses regex mode for operationId matching instead of fixed-string"
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "23 files changed, +8452 -514. Rewrites the worktree session lifecycle: adds transition planner, provisioning receipts, transport ownership probes, versioned handoff, successor verification, verified teardown scripts, and a pending-transition guard. Extracts 5 new modules under extensions/ and adds 10 test files with 231 cases.",
+      "reviewFindings": [
+        "blocker: extensions/worktree.ts:895-900 — Remote/slash dispose hooks run without subshells; exit in a hook terminates the entire script (same defect fixed in buildVerifiedTeardownScript but not applied to buildTeardownScript)",
+        "blocker: extensions/worktree.ts:880-914,2444-2454 — Remote dispose has no post-hook cleanliness recheck; --force destroys files created after the dirty check",
+        "extensions/worktree.ts:2444-2500 — Remote dispose does not acquire a lifecycle claim on the target",
+        "extensions/worktree.ts:1755,1722 — listWorktrees and resolveGitCommonDir throw instead of returning structured refusals to the model",
+        "extensions/worktree.ts:1063-1073 — buildDisposeScript never writes a teardown report",
+        "test/transition-planner.test.ts:355-390 — Pending-transition guard has no integration test against Pi 0.83 batch loop",
+        "extensions/worktree.ts:970 — grep claim matching uses regex mode for operationId instead of -F"
+      ],
+      "manualNotes": "The live-dispose path (disposeLiveWorktree + buildVerifiedTeardownScript) is well-engineered and was clearly the focus of the safety hardening. The remote-dispose path (handleModelDispose + buildDisposeScript) did not receive the same treatment, creating an asymmetry where the model's remote dispose is materially less safe than its live dispose. The two high-severity findings are instances of the same pattern: fixes applied to one path but not the other. The test suite is strong — 231 cases using real git repositories — but the pending-guard integration gap means the most critical runtime contract (Pi 0.83 actually blocks queued siblings) is only verified by reading the agent-loop source code, not by executing it."
+    },
+    "reviewResult": {
+      "status": "review-required",
+      "findings": [
+        {
+          "severity": "non-blocking",
+          "issue": "Independent review has not been supplied.",
+          "rationale": "The run cannot be marked reviewed from child evidence alone."
+        }
+      ]
+    }
+  },
+  "effects": {
+    "fileMutation": {
+      "status": "not-applicable",
+      "expected": false,
+      "attempted": true
+    }
+  },
+  "transcriptPath": "/Users/neil/code/pi-worktree/.pi-subagents/artifacts/78e0e3e0_adversary_1_transcript.jsonl",
+  "timestamp": 1785688159086
+}

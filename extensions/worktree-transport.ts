@@ -279,7 +279,9 @@ export interface WaiterInvocation {
  *
  * Dynamic values are passed as positional arguments to `bash -c`, never
  * interpolated into the script body, so a path containing spaces or quotes
- * cannot alter the script. The waiter blocks on the originating PID because
+ * cannot alter the script. The pre-script is invoked as its own shell, so the
+ * waiter's pid is passed to it as `$1`: a teardown that must prove it owns the
+ * target cannot read that from its own `$$`, which belongs to the child. The waiter blocks on the originating PID because
  * keys sent while Pi still owns the pane in raw mode are swallowed, and because
  * `pi --fork` snapshots the session file as of its last flush.
  */
@@ -300,7 +302,7 @@ export function buildWaiterInvocation(opts: {
       parent="$1"; surface="$2"; cmd="$3"; pre="$4"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
       sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      if [ -n "$pre" ]; then bash -c "$pre" pi-worktree-teardown "$$"; fi
       cmux send --surface "$surface" -- "$cmd"
       cmux send --surface "$surface" -- $'\\r'
     `;
@@ -313,7 +315,7 @@ export function buildWaiterInvocation(opts: {
       parent="$1"; ws="$2"; target="$3"; label="$4"; origin="$5"; cmd="$6"; pre="$7"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
       sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      if [ -n "$pre" ]; then bash -c "$pre" pi-worktree-teardown "$$"; fi
       created=$(herdr tab create --workspace "$ws" --cwd "$target" --label "$label" --focus 2>/dev/null)
       pane=$(printf '%s' "$created" | sed -n 's/.*"pane_id":"\\([^"]*\\)".*/\\1/p' | head -1)
       if [ -n "$pane" ]; then
@@ -337,7 +339,7 @@ export function buildWaiterInvocation(opts: {
       parent="$1"; target="$2"; cmd="$3"; pre="$4"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
       sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      if [ -n "$pre" ]; then bash -c "$pre" pi-worktree-teardown "$$"; fi
       herdr pane send-text "$target" "$cmd"
       herdr pane send-keys "$target" enter
     `;
@@ -349,7 +351,7 @@ export function buildWaiterInvocation(opts: {
       parent="$1"; target="$2"; cmd="$3"; pre="$4"
       while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
       sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
+      if [ -n "$pre" ]; then bash -c "$pre" pi-worktree-teardown "$$"; fi
       tmux send-keys -t "$target" -l -- "$cmd"
       tmux send-keys -t "$target" Enter
     `;
