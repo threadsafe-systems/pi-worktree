@@ -26,7 +26,7 @@
     "tmux"
   ],
   "files": [
-    "extensions/worktree.ts",
+    "extensions/",
     "skills/",
     "README.md",
     "PROVENANCE.md",
@@ -42,9 +42,9 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/decision.test.ts && tsx test/handoff.test.ts",
+    "test": "tsx test/run-all.ts",
     "check": "npm run typecheck && npm run lint && npm test",
-    "lint": "biome check .",
+    "lint": "biome check . --error-on-warnings",
     "format": "biome check --write ."
   },
   "engines": {
@@ -58,8 +58,8 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": ">=0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
     "typebox": "*"
   }
 }

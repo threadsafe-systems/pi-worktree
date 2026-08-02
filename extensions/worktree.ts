@@ -303,7 +303,7 @@ export function shouldBlock(opts: {
 }): boolean {
 	const { toolName, mainCheckout, marker, relPath } = opts;
 	if (toolName !== "write" && toolName !== "edit") return false;
-	if (!marker || marker.enforce !== true) return false; // default off / not opted in
+	if (marker?.enforce !== true) return false; // default off / not opted in
 	if (!mainCheckout) return false; // worktrees are always allowed
 	// The marker files are NOT exempt. Toggling enforcement goes through the
 	// worktree-enforce script / command (pi.exec, not the gated write/edit tools),
