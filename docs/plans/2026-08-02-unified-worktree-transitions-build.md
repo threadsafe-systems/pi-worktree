@@ -595,4 +595,26 @@ Implementation is ready for PR review only when:
 
 ### Implementation-time assumptions log
 
-_No implementation tasks have started._
+**Status:** T1–T5 and T8 complete on `feat/unified-worktree-transitions`. T6, T7, and T9 outstanding.
+
+| Task | State | Commit |
+| --- | --- | --- |
+| T1 contracts and planner | Complete | `257c585` |
+| T2 receipts, claims, reports | Complete | `915c949` |
+| T3 transport probes and waiter | Complete | `c28051d` |
+| T4 create/ensure/enter convergence | Complete | `de9b59f` |
+| T5 model tool, sequencing, pending guard | Complete | `de9b59f` |
+| T6 versioned handoff and successor verification | Outstanding | — |
+| T7 live disposal and hard-destroy integration | Partial: model remote disposal verified and claim-aware; live teardown still uses the existing interactive flow | `de9b59f` |
+| T8 compatibility, package, documentation | Complete | `f76f9ae` |
+| T9 process-level and live herdr verification | Outstanding | — |
+
+Discretionary calls made during implementation:
+
+1. **`files` widened to `extensions/` in T1, not T8.** The moment T1 split a module out of `extensions/worktree.ts`, the single-file publish allow-list would have shipped a broken package. Deferring that to T8 would have left every intermediate commit unpublishable.
+2. **Branch resolution is injected into the planner rather than imported.** `worktree.ts` imports the planner, so importing its helpers back would create a module cycle. The planner takes a `BranchResolver`, which also lets the candidate-ordering rule be tested without config plumbing.
+3. **Transport ownership probes degrade rather than fail closed on an unknown CLI.** A vendor query that cannot run at all (older CLI, no such subcommand) leaves the identifier evidence standing and records that ownership is unverified. Failing closed there would break herdr and cmux setups that work today, for no safety gain; a query that *does* run and disagrees still fails closed.
+4. **`piSupportsRecamp` uses `ctx.mode` as the observable proof of the 0.83 contracts.** Older contexts did not expose `mode` at all, so its presence is a usable runtime signal without parsing a version string the extension cannot trust.
+5. **Live model disposal returns `manual-restart` pointing at `/worktree dispose`.** Waiter-owned teardown with claim transfer is T7; until it lands, the model is told plainly that it cannot remove the directory it is standing in, rather than being given a partial mechanism.
+6. **The acknowledgement timer is deliberately referenced.** An unreferenced timer cannot fire when nothing else holds the event loop, which would hang the caller instead of failing it — found by the transport tests.
+7. **`runProvisioningSteps` reports each stage before running it**, so a process that dies inside a step leaves a receipt naming the step that was in flight.
