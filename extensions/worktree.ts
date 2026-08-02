@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -17,6 +17,12 @@ import type {
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import type { ProbeDeps, RecampTarget } from "./worktree-transport.ts";
+import {
+	buildWaiterInvocation,
+	scheduleWaiter,
+	selectTransport,
+} from "./worktree-transport.ts";
 
 // ---------------------------------------------------------------------------
 // Name generator (adjective-noun)
@@ -1048,167 +1054,65 @@ function currentSessionFile(ctx: unknown): string | undefined {
 	)?.sessionManager?.getSessionFile?.();
 }
 
-/** Environment facts for multiplexer detection, injected for testability. */
-export interface MuxEnv {
-	CMUX_SURFACE_ID?: string;
-	HERDR_PANE_ID?: string;
-	HERDR_WORKSPACE_ID?: string;
-	TMUX?: string;
-	TMUX_PANE?: string;
-}
+/**
+ * Transport detection and the detached waiter live in the transport module so
+ * ownership rules and script construction have one implementation. Re-exported
+ * because they are part of this extension's tested public surface.
+ */
+export type { MuxEnv, RecampTarget } from "./worktree-transport.ts";
+export { pickRelaunchMux } from "./worktree-transport.ts";
 
-/** Where a re-camped session should land: a new tab at `targetCwd`, named
- *  after the branch being camped on. */
-export interface RecampTarget {
-	targetCwd: string;
-	tabLabel: string;
-}
-
-/** Pick the terminal multiplexer that owns the current pane, if any.
- *
- *  Precedence: cmux, then herdr, then tmux. cmux and herdr both set a
- *  per-surface/per-pane id on the processes they spawn, so their presence is
- *  definitive for THIS process. TMUX is checked last because it can leak into
- *  herdr panes (e.g. when the herdr server was started from inside a tmux
- *  session); typing into that stale outer pane would land the relaunch
- *  command somewhere unrelated. */
-export function pickRelaunchMux(
-	env: MuxEnv,
-):
-	| { kind: "cmux"; target: string }
-	| { kind: "herdr"; target: string; workspaceId: string }
-	| { kind: "tmux"; target: string }
-	| null {
-	if (env.CMUX_SURFACE_ID) return { kind: "cmux", target: env.CMUX_SURFACE_ID };
-	if (env.HERDR_PANE_ID)
+/** Probe backend for the running process: read-only queries, bounded, no shell. */
+const liveProbeDeps: ProbeDeps = {
+	hasExecutable(name) {
+		// Presence is decided by whether the binary can be executed at all, not by
+		// its exit code: a transport that rejects `--version` is still installed.
+		// Avoids a shell, so nothing here can be word-split or expanded.
+		const r = spawnSync(name, ["--version"], { timeout: 3_000 });
+		return (r.error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT";
+	},
+	run(command, args, timeoutMs) {
+		const r = spawnSync(command, args, {
+			encoding: "utf-8",
+			timeout: timeoutMs,
+		});
 		return {
-			kind: "herdr",
-			target: env.HERDR_PANE_ID,
-			workspaceId: env.HERDR_WORKSPACE_ID ?? "",
+			code: r.status ?? 1,
+			stdout: r.stdout ?? "",
+			stderr: r.stderr ?? "",
 		};
-	if (env.TMUX) return { kind: "tmux", target: env.TMUX_PANE ?? "" };
-	return null;
-}
+	},
+};
 
 /**
- * Schedule a pi relaunch in the current terminal pane by injecting a command
- * via cmux, herdr, or tmux once this pi process has exited.
+ * Schedule a pi relaunch in the current terminal pane, once this pi process has
+ * exited, via the multiplexer that owns the pane.
  *
- * Reliability notes (these were all bugs in the original implementation):
- *  - We wait for THIS pi process to actually exit before sending keys, instead
- *    of a blind `sleep 0.3` that raced pi's TUI teardown. Keys sent while pi
- *    still owns the pane in raw mode are swallowed.
- *  - We target the originating pane explicitly ($TMUX_PANE / $HERDR_PANE_ID /
- *    surface id) so the keys cannot land in some other active pane.
- *  - We send the command text literally (`send-keys -l` / `pane send-text`)
- *    and then a SEPARATE `Enter` key, instead of relying on a trailing "\n"
- *    character.
- *  - Dynamic values are passed as positional args to `bash -c`, never
- *    interpolated into the script body, so paths with spaces/quotes are safe.
- *  - An optional preScript runs (from the detached waiter, after pi exits and
- *    before the keys are sent) to perform teardown such as removing a worktree.
- *
- * Under herdr with a `recamp` target, the session moves to a NEW TAB in the
- * same workspace, labelled with the branch, and the originating pane is closed
- * (herdr collapses the tab when that was its last pane, so a split-out pane the
- * user owns is left alone). The wait-for-exit is still required even though a
- * new tab could be spawned eagerly: `pi --fork` snapshots the session file as
- * of its last flush, so forking before the origin has exited would truncate the
- * carried history.
- *
- * Returns true if a relaunch was scheduled, false if not in a known multiplexer.
+ * Resolves only when the OS confirms the waiter process started. Scheduling is
+ * still weaker than delivery: an acknowledged waiter proves something is there
+ * to run the relaunch, not that the multiplexer accepted the keys.
  */
-function scheduleRelaunch(opts: {
+async function scheduleRelaunch(opts: {
 	typedCmd: string;
 	preScript?: string;
 	recamp?: RecampTarget;
-}): boolean {
-	const parentPid = String(process.pid);
-	const pre = opts.preScript ?? "";
+}): Promise<boolean> {
+	const selection = selectTransport(process.env, liveProbeDeps);
+	if (!selection.available) return false;
 
-	const mux = pickRelaunchMux(process.env);
-	if (!mux) return false;
-
-	let script: string;
-	let dynamic: string[];
-
-	if (mux.kind === "cmux") {
-		// cmux: wait for pi to exit, run teardown, then type the command.
-		script = `
-      parent="$1"; surface="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      cmux send --surface "$surface" -- "$cmd"
-      cmux send --surface "$surface" -- $'\\r'
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	} else if (mux.kind === "herdr" && opts.recamp) {
-		// herdr: re-camp into a new tab in the same workspace, named after the
-		// branch. If tab creation fails we fall back to typing into the
-		// originating pane rather than stranding a session that has already exited.
-		script = `
-      parent="$1"; ws="$2"; target="$3"; label="$4"; origin="$5"; cmd="$6"; pre="$7"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      created=$(herdr tab create --workspace "$ws" --cwd "$target" --label "$label" --focus 2>/dev/null)
-      pane=$(printf '%s' "$created" | sed -n 's/.*"pane_id":"\\([^"]*\\)".*/\\1/p' | head -1)
-      if [ -n "$pane" ]; then
-        herdr pane run "$pane" "$cmd"
-        herdr pane close "$origin" >/dev/null 2>&1
-      else
-        herdr pane send-text "$origin" "$cmd"
-        herdr pane send-keys "$origin" enter
-      fi
-    `;
-		dynamic = [
-			mux.workspaceId,
-			opts.recamp.targetCwd,
-			opts.recamp.tabLabel,
-			mux.target,
-			opts.typedCmd,
-			pre,
-		];
-	} else if (mux.kind === "herdr") {
-		// herdr without a re-camp target: type into the originating pane.
-		script = `
-      parent="$1"; target="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      herdr pane send-text "$target" "$cmd"
-      herdr pane send-keys "$target" enter
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	} else {
-		// tmux: target the originating pane when known; -l types literally; a
-		// separate Enter submits.
-		script = `
-      parent="$1"; target="$2"; cmd="$3"; pre="$4"
-      while kill -0 "$parent" 2>/dev/null; do sleep 0.05; done
-      sleep 0.15
-      if [ -n "$pre" ]; then bash -c "$pre"; fi
-      if [ -n "$target" ]; then
-        tmux send-keys -t "$target" -l -- "$cmd"
-        tmux send-keys -t "$target" Enter
-      else
-        tmux send-keys -l -- "$cmd"
-        tmux send-keys Enter
-      fi
-    `;
-		dynamic = [mux.target, opts.typedCmd, pre];
-	}
-
-	const args = ["-c", script, "pi-worktree-relaunch", parentPid, ...dynamic];
-
-	// Detached + unref so the waiter outlives pi's shutdown.
-	const child = spawn("bash", args, {
-		detached: true,
-		stdio: "ignore",
-	});
-	child.unref();
-
+	const result = await scheduleWaiter(
+		buildWaiterInvocation({
+			candidate: selection.candidate,
+			parentPid: process.pid,
+			typedCmd: opts.typedCmd,
+			...(opts.preScript ? { preScript: opts.preScript } : {}),
+			...(opts.recamp ? { recamp: opts.recamp } : {}),
+		}),
+	);
+	if (!result.ok) return false;
+	// Nothing else needs to hold this waiter: create/enter has no claim to hand
+	// over, so it is released as soon as the OS confirms it exists.
+	result.handle.commitDetach();
 	return true;
 }
 
@@ -1227,13 +1131,13 @@ function continuationFor(
 
 /** Relaunch pi in a worktree, forking the parent session and passing a handoff.
  *  Under herdr this re-camps into a new tab named after `branch`. */
-function relaunchInPlace(
+async function relaunchInPlace(
 	worktreePath: string,
 	branch: string,
 	forkSessionFile?: string,
 	handoffB64?: string,
 	continuation?: string,
-): boolean {
+): Promise<boolean> {
 	const typedCmd = buildRelaunchCommand(
 		worktreePath,
 		forkSessionFile,
@@ -1462,7 +1366,7 @@ export default function (pi: ExtensionAPI) {
 					// session so history follows the hop, plus a handoff note.
 					const sessionFile = currentSessionFile(ctx);
 					const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
-					const relaunched = relaunchInPlace(
+					const relaunched = await relaunchInPlace(
 						worktreePath,
 						branch,
 						sessionFile,
@@ -1906,7 +1810,7 @@ export default function (pi: ExtensionAPI) {
 				sessionFile,
 				handoffSource,
 			);
-			const relaunched = relaunchInPlace(
+			const relaunched = await relaunchInPlace(
 				entry.path,
 				entry.branch,
 				sessionFile,
@@ -1963,7 +1867,7 @@ export default function (pi: ExtensionAPI) {
 			// Fork the parent session so history follows the hop, plus a handoff note.
 			const sessionFile = currentSessionFile(ctx);
 			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
-			const relaunched = relaunchInPlace(
+			const relaunched = await relaunchInPlace(
 				worktreePath,
 				branch,
 				sessionFile,
@@ -2075,7 +1979,7 @@ export default function (pi: ExtensionAPI) {
 				["rev-parse", "--abbrev-ref", "HEAD"],
 				{ cwd: repoRoot, timeout: 5_000 },
 			);
-			const scheduled = scheduleRelaunch({
+			const scheduled = await scheduleRelaunch({
 				typedCmd,
 				preScript,
 				recamp: {
