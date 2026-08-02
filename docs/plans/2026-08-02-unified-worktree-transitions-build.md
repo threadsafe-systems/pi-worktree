@@ -595,7 +595,7 @@ Implementation is ready for PR review only when:
 
 ### Implementation-time assumptions log
 
-**Status:** T1–T5 and T8 complete on `feat/unified-worktree-transitions`. T6, T7, and T9 outstanding.
+**Status:** T1–T9 implemented on `feat/unified-worktree-transitions`. The only outstanding item is the manual live-herdr matrix in T9, which needs an interactive herdr session.
 
 | Task | State | Commit |
 | --- | --- | --- |
@@ -604,10 +604,17 @@ Implementation is ready for PR review only when:
 | T3 transport probes and waiter | Complete | `c28051d` |
 | T4 create/ensure/enter convergence | Complete | `de9b59f` |
 | T5 model tool, sequencing, pending guard | Complete | `de9b59f` |
-| T6 versioned handoff and successor verification | Outstanding | — |
-| T7 live disposal and hard-destroy integration | Partial: model remote disposal verified and claim-aware; live teardown still uses the existing interactive flow | `de9b59f` |
+| T6 versioned handoff and successor verification | Complete | `a2c3c1a` |
+| T7 live disposal and hard-destroy integration | Complete | `d749f7c` |
 | T8 compatibility, package, documentation | Complete | `f76f9ae` |
-| T9 process-level and live herdr verification | Outstanding | — |
+| T9 process-level tests | Complete | `edfe77b` |
+| T9 live herdr matrix | Outstanding — requires an interactive herdr session | — |
+
+Defects found by the tests rather than by review:
+
+1. An unreferenced acknowledgement timer could never fire, so a waiter that never reported back would hang the caller instead of failing it (T3).
+2. A `preRemove` hook containing `exit` terminated the waiter itself, losing the teardown report and every remaining safety check. Hooks now run in a subshell (T7).
+3. The first process-lifecycle test deadlocked because a killed child stays a reapable zombie, and a zombie still answers `kill -0`; blocking the event loop kept the "dead" process visible to the waiter (T9).
 
 Discretionary calls made during implementation:
 
@@ -618,3 +625,7 @@ Discretionary calls made during implementation:
 5. **Live model disposal returns `manual-restart` pointing at `/worktree dispose`.** Waiter-owned teardown with claim transfer is T7; until it lands, the model is told plainly that it cannot remove the directory it is standing in, rather than being given a partial mechanism.
 6. **The acknowledgement timer is deliberately referenced.** An unreferenced timer cannot fire when nothing else holds the event loop, which would hang the caller instead of failing it — found by the transport tests.
 7. **`runProvisioningSteps` reports each stage before running it**, so a process that dies inside a step leaves a receipt naming the step that was in flight.
+8. **Shell quoting moved to `extensions/worktree-shell.ts`.** Handoff command construction and teardown scripts both need it, and duplicating a shell-safety primitive is how quoting rules drift apart.
+9. **The teardown script performs its safety checks in bash, not Node.** A detached waiter cannot rely on `tsx` being present in a consumer install, and git plus `grep` can verify claim ownership, destination branch, and cleanliness without it.
+10. **The waiter identifies itself with `$$`.** The claim is transferred to the pid the OS reported at spawn, and the script compares that against its own pid, so an armed-but-untransferred waiter fails its own check.
+11. **`buildVerifiedTeardownScript` is exported** so the disposal tests can execute the real script under bash against real repositories rather than asserting on its text.
