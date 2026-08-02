@@ -889,6 +889,11 @@ function buildTeardownScript(
 	preRemove: string[] | undefined,
 	hardDelete: boolean,
 ): string {
+	// Dispose promises never to destroy work, so it re-checks cleanliness before
+	// --force. Destroy makes the opposite promise: the caller has already
+	// confirmed they want the checkout and its ignored files gone, so rechecking
+	// would strand every worktree that has a node_modules in it.
+	const recheckClean = !hardDelete;
 	const lines: string[] = [];
 	const hooks = preRemove ?? [];
 	if (hooks.length) {
@@ -902,17 +907,19 @@ function buildTeardownScript(
 		}
 		lines.push("set +e");
 	}
-	// Hooks are arbitrary project commands and may leave work behind, so what was
-	// clean when the caller checked may not be clean now. `--force` would destroy
-	// it silently.
-	lines.push(
-		`if [ -n "$(git -C ${shQuote(worktreePath)} status --porcelain --ignored 2>/dev/null)" ]; then`,
-	);
-	lines.push(
-		`  echo "refusing to remove ${worktreePath}: it became dirty after the pre-remove hooks" >&2`,
-	);
-	lines.push("  exit 1");
-	lines.push("fi");
+	if (recheckClean) {
+		// Hooks are arbitrary project commands and may leave work behind, and the
+		// caller's dirty check happened before this script started, so what was
+		// clean then may not be clean now. `--force` would destroy it silently.
+		lines.push(
+			`if [ -n "$(git -C ${shQuote(worktreePath)} status --porcelain --ignored 2>/dev/null)" ]; then`,
+		);
+		lines.push(
+			`  echo "refusing to remove ${worktreePath}: it is no longer clean" >&2`,
+		);
+		lines.push("  exit 1");
+		lines.push("fi");
+	}
 	lines.push(`cd ${shQuote(repoRoot)}`);
 	// NB: no `rm -rf` fallback. If `git worktree remove` refuses (e.g. the path
 	// is stale and has been reused by unrelated content), blindly rm -rf'ing it
@@ -1080,7 +1087,13 @@ printf '{"branchDisposition":"%s","completedAt":"%s","expectedDestination":{"bra
   "$branch_present" "$path_present" "$receipt_present" "$registration_present" \\
   "$op" "$stages" > "$tmp"
 mv -f "$tmp" "$report"
-rm -rf "$(dirname "$owner")"
+
+# Only an operation that proved it owned this target may release the claim.
+# A shell that failed the ownership check would otherwise erase the very
+# evidence that stopped it, and with it the real owner's claim.
+if [ "$abort" != "claim" ]; then
+  rm -rf "$(dirname "$owner")"
+fi
 `;
 }
 

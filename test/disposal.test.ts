@@ -10,7 +10,11 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { buildVerifiedTeardownScript } from "../extensions/worktree.ts";
+import {
+	buildDestroyScript,
+	buildDisposeScript,
+	buildVerifiedTeardownScript,
+} from "../extensions/worktree.ts";
 import {
 	acquireClaim,
 	canonicalJson,
@@ -52,7 +56,9 @@ function waitForFile(path: string, timeoutMs = 15_000): boolean {
 
 function git(cwd: string, ...args: string[]) {
 	const r = spawnSync("git", args, { cwd, encoding: "utf-8" });
-	if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr}`);
+	if (r.status !== 0) {
+		throw new Error(`git ${args.join(" ")}: ${r.stderr}${r.stdout}`);
+	}
 	return r.stdout;
 }
 
@@ -283,6 +289,11 @@ await checkAsync(
 		assert.equal(r.branchPresent, true);
 		assert.equal(r.receiptPresent, true);
 		assert.equal(r.stageStatus("claim"), "failed");
+		assert.equal(
+			existsSync(claimPath(f.store, f.wt)),
+			true,
+			"an unowned waiter released another process's claim",
+		);
 	},
 );
 
@@ -442,6 +453,59 @@ await checkAsync(
 			script,
 			/git worktree prune/,
 			"stale metadata should be pruned, not deleted",
+		);
+	},
+);
+
+// --- destroy stays forceful ------------------------------------------------------
+
+await checkAsync(
+	"destroy still removes a worktree full of ignored files",
+	async () => {
+		const f = fixture();
+		// The normal state of a real worktree: installed dependencies and local
+		// env sitting in the checkout, which destroy is expected to take with it.
+		mkdirSync(join(f.wt, "node_modules"), { recursive: true });
+		writeFileSync(
+			join(f.wt, "node_modules", "dep.js"),
+			"module.exports = 1;\n",
+		);
+		writeFileSync(join(f.wt, ".env.local"), "SECRET=local\n");
+		assert.notEqual(
+			git(f.wt, "status", "--porcelain", "--ignored").trim(),
+			"",
+			"the fixture must not be clean, or this proves nothing",
+		);
+
+		const script = buildDestroyScript(f.repo, f.wt, BRANCH, undefined);
+		const r = spawnSync("bash", ["-c", script], { encoding: "utf-8" });
+		assert.equal(
+			existsSync(f.wt),
+			false,
+			`destroy left the worktree: ${r.stderr}`,
+		);
+		assert.equal(
+			git(f.repo, "branch", "--format=%(refname:short)")
+				.split("\n")
+				.some((b) => b.trim() === BRANCH),
+			false,
+			"destroy should hard-delete the branch",
+		);
+	},
+);
+
+await checkAsync(
+	"dispose refuses the same worktree, because it promises not to lose work",
+	async () => {
+		const f = fixture();
+		writeFileSync(join(f.wt, "uncommitted.txt"), "work\n");
+
+		const script = buildDisposeScript(f.repo, f.wt, BRANCH, undefined);
+		spawnSync("bash", ["-c", script], { encoding: "utf-8" });
+		assert.equal(
+			existsSync(f.wt),
+			true,
+			"dispose force-removed a dirty worktree",
 		);
 	},
 );
