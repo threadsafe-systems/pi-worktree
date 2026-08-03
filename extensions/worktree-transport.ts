@@ -13,6 +13,16 @@
  */
 
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
+import {
+	mkdirSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { shQuote } from "./worktree-shell.ts";
 import type { TransportKind } from "./worktree-transition.ts";
 
 /** Environment facts for multiplexer detection, injected for testability. */
@@ -368,6 +378,65 @@ export function buildWaiterInvocation(opts: {
 			...dynamic,
 		],
 	};
+}
+
+/**
+ * Hand the relaunch to the pane as a script path rather than a command line.
+ *
+ * A terminal in canonical mode caps a single input line — 1024 bytes on macOS.
+ * The relaunch carries a base64 handoff, two absolute paths, and sometimes a
+ * continuation message, which together get close to that on ordinary
+ * repositories and exceed it on nested ones. Past the cap the line is silently
+ * truncated: the shell receives an unterminated quote, waits forever, and the
+ * session is simply never restarted.
+ *
+ * Writing the command to a file keeps the typed line short no matter what the
+ * command contains. The script is removed once it has run.
+ */
+export function writeRelaunchLauncher(command: string): {
+	typedCommand: string;
+	scriptPath: string;
+} {
+	const dir = join(tmpdir(), "pi-worktree-relaunch");
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	pruneStaleLaunchers(dir);
+
+	const scriptPath = join(
+		dir,
+		`relaunch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}.sh`,
+	);
+	writeFileSync(scriptPath, `${command}\n`, { mode: 0o600 });
+	return {
+		typedCommand: `sh ${shQuote(scriptPath)}; rm -f ${shQuote(scriptPath)}`,
+		scriptPath,
+	};
+}
+
+/** How long a launcher may survive a pane that was killed before it ran. */
+const LAUNCHER_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Drop launchers left by panes that never ran them.
+ *
+ * The script removes itself once the session it starts exits, so a pane killed
+ * before then leaves one behind. Sharing one directory and pruning on write
+ * bounds that to a day's worth instead of letting it grow for the life of the
+ * machine.
+ */
+function pruneStaleLaunchers(dir: string): void {
+	const cutoff = Date.now() - LAUNCHER_TTL_MS;
+	try {
+		for (const entry of readdirSync(dir)) {
+			const path = join(dir, entry);
+			try {
+				if (statSync(path).mtimeMs < cutoff) rmSync(path, { force: true });
+			} catch {
+				// raced with another session's cleanup
+			}
+		}
+	} catch {
+		// best-effort
+	}
 }
 
 /**

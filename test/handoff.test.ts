@@ -48,10 +48,11 @@ const check = (name: string, fn: () => void) => {
 
 check("relaunch command: fork + handoff env, safely quoted", () => {
 	const cmd = buildRelaunchCommand("/wt path/x", "/s s.jsonl", "YWJjPT0=");
-	assert.equal(
-		cmd,
-		"cd '/wt path/x' && PI_WT_HANDOFF='YWJjPT0=' pi --fork '/s s.jsonl'",
-	);
+	assert.match(cmd, /^cd '\/wt path\/x' && PI_WT_HANDOFF='YWJjPT0=' /);
+	// Paths travel as arguments, so a space or quote in them cannot alter the
+	// command that decides whether the session can be forked.
+	assert.match(cmd, /'\/s s\.jsonl'/);
+	assert.match(cmd, /--fork "\$fork"/);
 });
 
 check("relaunch command: no session -> plain pi (back-compat)", () => {
@@ -60,18 +61,17 @@ check("relaunch command: no session -> plain pi (back-compat)", () => {
 
 check("continuation: appended as pi's positional initial message", () => {
 	const cmd = buildRelaunchCommand("/wt", "/s.jsonl", undefined, "carry on");
-	assert.equal(cmd, "cd '/wt' && pi --fork '/s.jsonl' 'carry on'");
+	assert.match(cmd, /'carry on'$/);
+	assert.match(cmd, /exec pi --fork "\$fork" "\$2"/);
 });
 
 check("continuation: omitted when absent or blank (no spurious turn)", () => {
-	assert.equal(
-		buildRelaunchCommand("/wt", "/s.jsonl"),
-		"cd '/wt' && pi --fork '/s.jsonl'",
-	);
-	assert.equal(
-		buildRelaunchCommand("/wt", "/s.jsonl", undefined, "   "),
-		"cd '/wt' && pi --fork '/s.jsonl'",
-	);
+	// An empty message argument makes the relaunch take a branch that starts pi
+	// with no initial message, so no turn is burned asking what to resume.
+	for (const blank of [undefined, "   "]) {
+		const cmd = buildRelaunchCommand("/wt", "/s.jsonl", undefined, blank);
+		assert.match(cmd, /pi-worktree-relaunch '\/s\.jsonl' ''$/, String(blank));
+	}
 });
 
 check("continuation: real message survives shell quoting intact", () => {
@@ -81,7 +81,7 @@ check("continuation: real message survives shell quoting intact", () => {
 	const msg = buildContinuationMessage("enter", "/wt path/x");
 	const cmd = buildRelaunchCommand("/wt path/x", "/s.jsonl", undefined, msg);
 	assert.match(msg, /\n/);
-	const quoted = cmd.slice(cmd.indexOf("--fork '/s.jsonl' ") + 18);
+	const quoted = cmd.slice(cmd.indexOf("'/s.jsonl' ") + "'/s.jsonl' ".length);
 	assert.ok(quoted.startsWith("'") && quoted.endsWith("'"));
 	// every embedded ' must be escaped as the '\'' idiom
 	assert.equal(
@@ -171,10 +171,9 @@ check("relaunch mux: no multiplexer -> null", () => {
 });
 
 check("relaunch command: fork without handoff", () => {
-	assert.equal(
-		buildRelaunchCommand("/wt", "/s.jsonl"),
-		"cd '/wt' && pi --fork '/s.jsonl'",
-	);
+	const cmd = buildRelaunchCommand("/wt", "/s.jsonl");
+	assert.match(cmd, /^cd '\/wt' && sh -c /);
+	assert.equal(cmd.includes("PI_WT_HANDOFF"), false);
 });
 
 check("handoff encode/decode round-trips", () => {
@@ -438,10 +437,8 @@ check(
 );
 
 check("dispose relaunch command targets the repo root", () => {
-	assert.equal(
-		buildRelaunchCommand("/repo", "/s.jsonl", "YWJjPT0="),
-		"cd '/repo' && PI_WT_HANDOFF='YWJjPT0=' pi --fork '/s.jsonl'",
-	);
+	const cmd = buildRelaunchCommand("/repo", "/s.jsonl", "YWJjPT0=");
+	assert.match(cmd, /^cd '\/repo' && PI_WT_HANDOFF='YWJjPT0=' /);
 });
 
 check("dispose handoff round-trips with kind", () => {
