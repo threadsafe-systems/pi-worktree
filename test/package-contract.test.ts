@@ -160,6 +160,55 @@ check("every present test file is discovered", () => {
 	assert.deepEqual(discovered, onDisk.sort());
 });
 
+// --- every relaunch carries a checkable handoff -----------------------------
+
+check("no relaunch path can construct a v1 handoff", () => {
+	// v1 records where a session came from but not where it was going, so a
+	// successor carrying one cannot check anything. The guarantee here is
+	// structural: the only v1 encoder left is the decode-compatibility export,
+	// and nothing in the extension calls it.
+	const source = readFileSync(join(ROOT, "extensions/worktree.ts"), "utf-8");
+	const withoutReExports = source
+		.split("\n")
+		.filter((line) => !line.trim().startsWith("export"))
+		.join("\n");
+
+	assert.equal(
+		/encodeHandoff\s*\(/.test(withoutReExports),
+		false,
+		"the extension builds a v1 handoff somewhere",
+	);
+	assert.match(
+		source,
+		/buildTransitionHandoff\(/,
+		"the extension should build v2 handoffs",
+	);
+});
+
+check("both teardown paths write a report the successor can read", () => {
+	// Dispose verification treats a missing report as partial, so a caller that
+	// emits a v2 dispose handoff must also produce a report, or a complete
+	// teardown reports itself as incomplete.
+	const source = readFileSync(join(ROOT, "extensions/worktree.ts"), "utf-8");
+	const scheduleLive = source.slice(
+		source.indexOf("async function scheduleLiveDisposal"),
+	);
+	assert.match(
+		scheduleLive.slice(0, 4000),
+		/buildVerifiedTeardownScript\(/,
+		"live disposal must use the reporting teardown",
+	);
+
+	const slashDispose = source.slice(
+		source.indexOf("async function handleDispose"),
+	);
+	assert.match(
+		slashDispose.slice(0, 4000),
+		/scheduleLiveDisposal\(/,
+		"the slash command must share the live disposal machinery, not duplicate it",
+	);
+});
+
 // --- documented behaviour matches the shipped contract -----------------------
 
 check(
