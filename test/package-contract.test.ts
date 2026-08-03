@@ -207,6 +207,11 @@ check("both teardown paths write a report the successor can read", () => {
 		/scheduleLiveDisposal\(/,
 		"the slash command must share the live disposal machinery, not duplicate it",
 	);
+	assert.doesNotMatch(
+		slashDispose.slice(0, 4000),
+		/ctx\.ui\.confirm\(/,
+		"clean disposal must not wait for an interactive confirmation",
+	);
 });
 
 // --- documented behaviour matches the shipped contract -----------------------
