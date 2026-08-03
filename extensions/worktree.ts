@@ -3074,36 +3074,28 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Count both tracked-uncommitted and gitignored files: the worktree is
-			// rm -rf'd, so per-worktree .env.local / local DBs are destroyed too.
-			let uncommitted = 0;
-			let ignored = 0;
 			const st = await pi.exec("git", ["status", "--porcelain", "--ignored"], {
 				cwd: worktreePath,
 				timeout: 5_000,
 			});
-			if (st.code === 0) {
-				for (const line of st.stdout.split("\n")) {
-					if (!line.trim()) continue;
-					if (line.startsWith("!!")) ignored++;
-					else uncommitted++;
-				}
-			}
-
-			const lost: string[] = [];
-			if (uncommitted > 0) lost.push(`${uncommitted} uncommitted file(s)`);
-			if (ignored > 0)
-				lost.push(
-					`${ignored} gitignored file(s) (incl. .env.local / local DBs)`,
+			if (st.code !== 0) {
+				ctx.ui.notify(
+					"Could not read the worktree status; nothing was removed.",
+					"error",
 				);
-			const warn = lost.length
-				? `\n\n⚠️  ${lost.join(" and ")} will be permanently lost.`
-				: "";
-			const ok = await ctx.ui.confirm(
-				"Dispose this worktree?",
-				`This exits pi, removes ${worktreePath}, soft-deletes branch ${branch} (kept if it has unmerged commits), and reopens pi in ${repoRoot} carrying this session.${warn}`,
-			);
-			if (!ok) return;
+				return;
+			}
+			const unsafeReason = unsafeDisposeReason({
+				cwd: ctx.cwd,
+				...(sessionFile ? { sessionFile } : {}),
+				worktreePath,
+				porcelainWithIgnored: st.stdout,
+				allowLiveCwd: true,
+			});
+			if (unsafeReason) {
+				ctx.ui.notify(unsafeReason, "error");
+				return;
+			}
 
 			// Same machinery the model tool uses: the teardown must prove it owns
 			// the target, check the destination it was planned against, and leave a
