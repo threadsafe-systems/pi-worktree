@@ -25,7 +25,6 @@ import type {
 import {
 	buildContinuationMessage as buildContinuation,
 	buildRelaunchCommand as buildRelaunch,
-	encodeHandoff as encodeLegacyHandoff,
 	decodeTransitionHandoff,
 	encodeTransitionHandoff,
 	handoffCaveat as legacyCaveat,
@@ -1138,47 +1137,6 @@ export function buildCreateScript(
 	].join("\n");
 }
 
-/** Gather the handoff payload (parent branch + uncommitted count) for a
- *  relaunch. Returns undefined when there is no session to fork. */
-async function buildHandoff(
-	pi: ExtensionAPI,
-	sourceCwd: string,
-	sessionFile: string | undefined,
-	parentCwd = sourceCwd,
-): Promise<string | undefined> {
-	if (!sessionFile) return undefined;
-	let parentBranch = "";
-	try {
-		const b = await pi.exec("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
-			cwd: sourceCwd,
-			timeout: 5_000,
-		});
-		if (b.code === 0) parentBranch = b.stdout.trim();
-	} catch {
-		// best-effort
-	}
-	let uncommitted = 0;
-	try {
-		const st = await pi.exec("git", ["status", "--porcelain"], {
-			cwd: sourceCwd,
-			timeout: 5_000,
-		});
-		if (st.code === 0) {
-			uncommitted = st.stdout
-				.split("\n")
-				.filter((l) => l.trim().length > 0).length;
-		}
-	} catch {
-		// best-effort
-	}
-	return encodeLegacyHandoff({
-		parentCwd,
-		parentBranch,
-		uncommitted,
-		kind: "enter",
-	});
-}
-
 /** Read the current session file path from a context, tolerating context
  *  variants that may not type it. */
 function currentSessionFile(ctx: unknown): string | undefined {
@@ -1551,7 +1509,17 @@ export default function (pi: ExtensionAPI) {
 					// directory so all tools resolve paths correctly. Fork the parent
 					// session so history follows the hop, plus a handoff note.
 					const sessionFile = currentSessionFile(ctx);
-					const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
+					const store = createStore(await resolveGitCommonDir(repoRoot));
+					const targetPath = canonicalPath(worktreePath);
+					const handoffB64 = await buildTransitionHandoff({
+						operationId: newOperationId(),
+						kind: "enter",
+						source: await currentCheckoutState(repoRoot),
+						target: { path: targetPath, branch, kind: "linked" },
+						provisioning: provisioningFor(store, targetPath, branch),
+						store,
+						sessionFile,
+					});
 					const relaunched = await relaunchInPlace(
 						worktreePath,
 						branch,
@@ -1719,7 +1687,8 @@ export default function (pi: ExtensionAPI) {
 		kind: "enter" | "dispose";
 		source: CheckoutState;
 		target: CheckoutState;
-		provisioning: ProvisioningState;
+		/** Damaged evidence travels as unmanaged; the successor re-reads it anyway. */
+		provisioning: ProvisioningState | "corrupt";
 		store: ReceiptStore;
 		sessionFile: string | undefined;
 		dispose?: { removedPath: string; branch: string };
@@ -2626,14 +2595,22 @@ export default function (pi: ExtensionAPI) {
 	 * its own ownership check anyway, so a disposal reported as not scheduled
 	 * cannot quietly destroy the worktree later.
 	 */
-	async function disposeLiveWorktree(
-		request: { execution: ExecutionPreference },
+	async function scheduleLiveDisposal(
 		processState: CheckoutState,
 		target: CheckoutState,
 		repoRoot: string,
 		config: WorktreeConfig,
 		ctx: ExtensionContext,
-	) {
+	): Promise<
+		| {
+				ok: true;
+				transport: "cmux" | "herdr" | "tmux";
+				operationId: string;
+				recoveryCommand: string;
+				destination: CheckoutState;
+		  }
+		| { ok: false; code: TransitionCode; reason: string }
+	> {
 		const sessionFile = currentSessionFile(ctx);
 		const store = createStore(await resolveGitCommonDir(repoRoot));
 		const operationId = newOperationId();
@@ -2643,14 +2620,10 @@ export default function (pi: ExtensionAPI) {
 			role: "origin",
 		};
 
-		const refuse = (code: TransitionCode, message: string) =>
-			toolResult(
-				refusedDetails("dispose", processState, code, request.execution),
-				`Refused: ${message}`,
-			);
-
 		const claim = acquireClaim(store, target.path, origin);
-		if (!claim.ok) return refuse("target-busy", claim.reason);
+		if (!claim.ok) {
+			return { ok: false, code: "target-busy", reason: claim.reason };
+		}
 
 		const destBranch = await pi.exec(
 			"git",
@@ -2660,10 +2633,11 @@ export default function (pi: ExtensionAPI) {
 		const destination = destBranch.code === 0 ? destBranch.stdout.trim() : "";
 		if (!destination) {
 			releaseClaim(store, target.path, origin);
-			return refuse(
-				"git-failed",
-				"could not read the destination branch in the main checkout.",
-			);
+			return {
+				ok: false,
+				code: "git-failed",
+				reason: "could not read the destination branch in the main checkout.",
+			};
 		}
 
 		const mainState: CheckoutState = {
@@ -2708,23 +2682,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (!started.ok) {
 			releaseClaim(store, target.path, origin);
-			return toolResult(
-				buildDetails({
-					action: "dispose",
-					outcome: "manual-restart",
-					process: processState,
-					target,
-					code: started.code,
-					requestedExecution: request.execution,
-					recovery: {
-						instructions: [
-							"Nothing was removed and this session is intact.",
-							`Exit pi, then dispose ${target.path} from ${repoRoot}.`,
-						],
-					},
-				}),
-				`Could not arrange teardown after exit (${started.reason}). Nothing was removed.`,
-			);
+			return { ok: false, code: started.code, reason: started.reason };
 		}
 
 		const handle = started.handle;
@@ -2740,10 +2698,12 @@ export default function (pi: ExtensionAPI) {
 			// act. Kill it anyway rather than relying on that single check.
 			await handle?.abortAndWait();
 			releaseClaim(store, target.path, origin);
-			return refuse(
-				"schedule-failed",
-				"could not hand teardown over to the waiter, so nothing was scheduled and nothing was removed.",
-			);
+			return {
+				ok: false,
+				code: "schedule-failed",
+				reason:
+					"could not hand teardown over to the waiter, so nothing was scheduled and nothing was removed.",
+			};
 		}
 		handle?.commitDetach();
 
@@ -2755,19 +2715,66 @@ export default function (pi: ExtensionAPI) {
 			scheduledAt: new Date().toISOString(),
 			recoveryCommand: typedCmd,
 		};
+		return {
+			ok: true,
+			transport: started.transport,
+			operationId,
+			recoveryCommand: typedCmd,
+			destination: mainState,
+		};
+	}
+
+	/** Model-facing wrapper: render a live disposal as a structured outcome. */
+	async function disposeLiveWorktree(
+		request: { execution: ExecutionPreference },
+		processState: CheckoutState,
+		target: CheckoutState,
+		repoRoot: string,
+		config: WorktreeConfig,
+		ctx: ExtensionContext,
+	) {
+		const scheduled = await scheduleLiveDisposal(
+			processState,
+			target,
+			repoRoot,
+			config,
+			ctx,
+		);
+		if (!scheduled.ok) {
+			const outcome =
+				scheduled.code === "target-busy" ? "refused" : "manual-restart";
+			return toolResult(
+				buildDetails({
+					action: "dispose",
+					outcome,
+					process: processState,
+					target,
+					code: scheduled.code,
+					requestedExecution: request.execution,
+					recovery: {
+						instructions: [
+							"Nothing was removed and this session is intact.",
+							`Exit pi, then dispose ${target.path} from ${repoRoot}.`,
+						],
+					},
+				}),
+				`Could not arrange teardown after exit (${scheduled.reason}). Nothing was removed.`,
+			);
+		}
+
 		ctx.shutdown();
 		return toolResult(
 			buildDetails({
 				action: "dispose",
 				outcome: "relaunch-scheduled",
 				process: processState,
-				target: mainState,
-				operationId,
-				transport: started.transport,
-				sessionCarry: sessionFile ? "fork" : "fresh",
+				target: scheduled.destination,
+				operationId: scheduled.operationId,
+				transport: scheduled.transport,
+				sessionCarry: currentSessionFile(ctx) ? "fork" : "fresh",
 				requestedExecution: request.execution,
 				recovery: {
-					command: typedCmd,
+					command: scheduled.recoveryCommand,
 					instructions: [
 						`Teardown of ${target.path} runs after this process exits; the replacement session verifies it.`,
 					],
@@ -2930,14 +2937,17 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const sessionFile = currentSessionFile(ctx);
-			const current = await detectWorktree(pi);
-			const handoffSource = current?.worktreePath ?? ctx.cwd;
-			const handoffB64 = await buildHandoff(
-				pi,
-				handoffSource,
+			const store = createStore(await resolveGitCommonDir(repoRoot));
+			const targetPath = canonicalPath(entry.path);
+			const handoffB64 = await buildTransitionHandoff({
+				operationId: newOperationId(),
+				kind: "enter",
+				source: await currentCheckoutState(repoRoot),
+				target: { path: targetPath, branch: entry.branch, kind: "linked" },
+				provisioning: provisioningFor(store, targetPath, entry.branch),
+				store,
 				sessionFile,
-				handoffSource,
-			);
+			});
 			const relaunched = await relaunchInPlace(
 				entry.path,
 				entry.branch,
@@ -2994,7 +3004,17 @@ export default function (pi: ExtensionAPI) {
 
 			// Fork the parent session so history follows the hop, plus a handoff note.
 			const sessionFile = currentSessionFile(ctx);
-			const handoffB64 = await buildHandoff(pi, repoRoot, sessionFile);
+			const store = createStore(await resolveGitCommonDir(repoRoot));
+			const targetPath = canonicalPath(worktreePath);
+			const handoffB64 = await buildTransitionHandoff({
+				operationId: newOperationId(),
+				kind: "enter",
+				source: await currentCheckoutState(repoRoot),
+				target: { path: targetPath, branch, kind: "linked" },
+				provisioning: provisioningFor(store, targetPath, branch),
+				store,
+				sessionFile,
+			});
 			const relaunched = await relaunchInPlace(
 				worktreePath,
 				branch,
@@ -3081,47 +3101,24 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (!ok) return;
 
-			const handoffB64 = encodeLegacyHandoff({
-				parentCwd: worktreePath,
-				parentBranch: branch,
-				uncommitted,
-				ignored,
-				kind: "dispose",
-			});
-			const typedCmd = buildRelaunch(
-				repoRoot,
-				sessionFile,
-				handoffB64,
-				continuationFor(ctx, "dispose", repoRoot),
-			);
-			const preScript = buildDisposeScript(
-				repoRoot,
-				worktreePath,
-				branch,
-				config.preRemove,
-			);
-			// Dispose lands back in the main checkout, so the new tab is named
-			// after the branch checked out THERE, not the worktree being removed.
-			const destBranch = await pi.exec(
-				"git",
-				["rev-parse", "--abbrev-ref", "HEAD"],
-				{ cwd: repoRoot, timeout: 5_000 },
-			);
-			const scheduled = await scheduleRelaunch({
-				typedCmd,
-				preScript,
-				recamp: {
-					targetCwd: repoRoot,
-					tabLabel:
-						destBranch.code === 0 && destBranch.stdout.trim()
-							? destBranch.stdout.trim()
-							: basename(repoRoot),
+			// Same machinery the model tool uses: the teardown must prove it owns
+			// the target, check the destination it was planned against, and leave a
+			// report, whoever asked for it.
+			const scheduled = await scheduleLiveDisposal(
+				await currentCheckoutState(repoRoot),
+				{
+					path: canonicalPath(worktreePath),
+					branch,
+					kind: "linked",
 				},
-			});
-			if (!scheduled) {
+				repoRoot,
+				config,
+				ctx,
+			);
+			if (!scheduled.ok) {
 				ctx.ui.notify(
-					`No cmux/herdr/tmux detected — cannot carry the session automatically.\n` +
-						`Do it manually:\n` +
+					`Could not arrange teardown after exit (${scheduled.reason}).\n` +
+						`Nothing was removed. Do it manually:\n` +
 						`  cd ${repoRoot} && pi${sessionFile ? ` --fork ${sessionFile}` : ""}\n` +
 						`  /worktree destroy ${branch}`,
 					"info",
