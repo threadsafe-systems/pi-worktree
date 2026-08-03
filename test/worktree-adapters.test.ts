@@ -419,17 +419,38 @@ await checkAsync(
 );
 
 await checkAsync(
-	"S-DSP-03: dispose refuses to remove the checkout it is standing in",
+	"live disposal reaches recamp scheduling instead of refusing its own cwd",
 	async () => {
 		const { repo } = newRepo();
 		const { call } = harness(repo);
 		const created = await call({ action: "create", name: "feat/live" });
 		const targetPath = created.details.target?.path ?? "";
+		const savedMux = {
+			CMUX_SURFACE_ID: process.env.CMUX_SURFACE_ID,
+			HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+			HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID,
+			TMUX: process.env.TMUX,
+			TMUX_PANE: process.env.TMUX_PANE,
+		};
 
-		const inside = harness(targetPath);
-		const { details } = await inside.call({ action: "dispose" });
-		assert.equal(details.code, "live-cwd-unsafe");
-		assert.equal(existsSync(targetPath), true);
+		try {
+			delete process.env.CMUX_SURFACE_ID;
+			delete process.env.HERDR_PANE_ID;
+			delete process.env.HERDR_WORKSPACE_ID;
+			delete process.env.TMUX;
+			delete process.env.TMUX_PANE;
+
+			const inside = harness(targetPath);
+			const { details } = await inside.call({ action: "dispose" });
+			assert.equal(details.outcome, "manual-restart");
+			assert.notEqual(details.code, "live-cwd-unsafe");
+			assert.equal(existsSync(targetPath), true);
+		} finally {
+			for (const [key, value] of Object.entries(savedMux)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
 	},
 );
 
