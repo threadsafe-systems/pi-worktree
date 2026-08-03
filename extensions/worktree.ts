@@ -84,6 +84,7 @@ import {
 	buildWaiterInvocation,
 	scheduleWaiter,
 	selectTransport,
+	writeRelaunchLauncher,
 } from "./worktree-transport.ts";
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1196,7 @@ async function scheduleRelaunch(opts: {
 		buildWaiterInvocation({
 			candidate: selection.candidate,
 			parentPid: process.pid,
-			typedCmd: opts.typedCmd,
+			typedCmd: writeRelaunchLauncher(opts.typedCmd).typedCommand,
 			...(opts.preScript ? { preScript: opts.preScript } : {}),
 			...(opts.recamp ? { recamp: opts.recamp } : {}),
 		}),
@@ -1892,7 +1893,7 @@ export default function (pi: ExtensionAPI) {
 			buildWaiterInvocation({
 				candidate: selection.candidate,
 				parentPid: process.pid,
-				typedCmd: opts.typedCmd,
+				typedCmd: writeRelaunchLauncher(opts.typedCmd).typedCommand,
 				...(opts.preScript ? { preScript: opts.preScript } : {}),
 				recamp: { targetCwd: opts.targetCwd, tabLabel: opts.tabLabel },
 			}),

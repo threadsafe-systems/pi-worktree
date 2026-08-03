@@ -100,13 +100,37 @@ export function handoffCaveat(
 	);
 }
 
+/**
+ * Decide at launch time whether the parent session can actually be forked.
+ *
+ * pi writes its session file lazily, so a session that has not had a turn yet
+ * owns a path to an empty file. `pi --fork` refuses an empty source, and the
+ * relaunch would exit immediately, leaving a bare shell where the session
+ * should be. Whether there is anything to fork is only knowable once the
+ * previous process has flushed and exited, which is after this command was
+ * built — so the check has to travel with the command and run there.
+ *
+ * The session path and the initial message are positional arguments, never
+ * interpolated into the script body, so neither can alter it.
+ */
+const FORK_IF_USABLE = [
+	'fork=""; [ -s "$1" ] && fork="$1"',
+	'if [ -n "$fork" ] && [ -n "$2" ]; then exec pi --fork "$fork" "$2"',
+	'elif [ -n "$fork" ]; then exec pi --fork "$fork"',
+	'elif [ -n "$2" ]; then exec pi "$2"',
+	"else exec pi; fi",
+].join("; ");
+
 /** Build the shell command typed into the pane to relaunch pi in a directory.
  *  Optionally forks the parent session (to carry history) and passes a base64
  *  handoff payload via PI_WT_HANDOFF for the new session to decode.
  *
  *  `continuation` is passed as pi's positional initial message. A forked
  *  session otherwise loads history and waits at the editor, so this is the
- *  only thing that makes an interrupted task resume without a human nudge. */
+ *  only thing that makes an interrupted task resume without a human nudge.
+ *
+ *  A hop always ends with pi running: when there is no session worth forking,
+ *  the replacement starts fresh rather than failing. */
 export function buildRelaunchCommand(
 	targetDir: string,
 	forkSessionFile?: string,
@@ -114,9 +138,17 @@ export function buildRelaunchCommand(
 	continuation?: string,
 ): string {
 	const envPrefix = handoffB64 ? `PI_WT_HANDOFF=${shQuote(handoffB64)} ` : "";
-	const forkArg = forkSessionFile ? ` --fork ${shQuote(forkSessionFile)}` : "";
-	const msgArg = continuation?.trim() ? ` ${shQuote(continuation.trim())}` : "";
-	return `cd ${shQuote(targetDir)} && ${envPrefix}pi${forkArg}${msgArg}`;
+	const message = continuation?.trim() ?? "";
+
+	if (!forkSessionFile) {
+		const msgArg = message ? ` ${shQuote(message)}` : "";
+		return `cd ${shQuote(targetDir)} && ${envPrefix}pi${msgArg}`;
+	}
+
+	return (
+		`cd ${shQuote(targetDir)} && ${envPrefix}sh -c ${shQuote(FORK_IF_USABLE)} ` +
+		`pi-worktree-relaunch ${shQuote(forkSessionFile)} ${shQuote(message)}`
+	);
 }
 
 /** Initial message for a session that hopped while the agent was mid-task.

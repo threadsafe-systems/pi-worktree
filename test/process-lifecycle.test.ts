@@ -1,12 +1,23 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	buildContinuationMessage,
+	buildRelaunchCommand,
+} from "../extensions/worktree-handoff.ts";
+import {
 	buildWaiterInvocation,
 	scheduleWaiter,
+	writeRelaunchLauncher,
 } from "../extensions/worktree-transport.ts";
 
 let fail = 0;
@@ -151,6 +162,171 @@ await checkAsync(
 			existsSync(marker),
 			false,
 			"a killed waiter still tore down the target",
+		);
+	},
+);
+
+// --- a hop always ends with pi running ------------------------------------------
+
+/**
+ * Run a relaunch command against a stub `pi` that records its argv.
+ *
+ * The command is what gets typed into a real pane, so running it is the only
+ * way to know which branch it actually takes.
+ */
+function runRelaunch(command: string, sessionBody: string | null) {
+	const dir = mkdtempSync(join(tmpdir(), "pi-wt-relaunch-"));
+	const bin = join(dir, "bin");
+	mkdirSync(bin);
+	const argvLog = join(dir, "argv");
+	writeFileSync(
+		join(bin, "pi"),
+		`#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argvLog)}\nexit 0\n`,
+		{ mode: 0o755 },
+	);
+	const session = join(dir, "parent.jsonl");
+	if (sessionBody !== null) writeFileSync(session, sessionBody);
+
+	const result = spawnSync(
+		"sh",
+		["-c", command.replace("__SESSION__", session).replace("__DIR__", dir)],
+		{
+			env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+			encoding: "utf-8",
+		},
+	);
+	const argv = existsSync(argvLog)
+		? readFileSync(argvLog, "utf-8").split("\n").filter(Boolean)
+		: null;
+	return { argv, status: result.status, session };
+}
+
+await checkAsync("a hop from a session with content forks it", async () => {
+	const cmd = buildRelaunchCommand(
+		"__DIR__",
+		"__SESSION__",
+		undefined,
+		"carry on",
+	);
+	const { argv } = runRelaunch(cmd, '{"type":"user","content":"hello"}\n');
+	assert.notEqual(argv, null, "pi never started");
+	assert.equal(argv?.[0], "--fork");
+	assert.equal(argv?.[2], "carry on");
+});
+
+await checkAsync(
+	"a hop from a session with no turns yet still starts pi",
+	async () => {
+		// pi writes its session file lazily, so hopping before the first turn used
+		// to fork an empty file, fail, and leave a bare shell.
+		const cmd = buildRelaunchCommand(
+			"__DIR__",
+			"__SESSION__",
+			undefined,
+			"carry on",
+		);
+		const { argv } = runRelaunch(cmd, "");
+		assert.notEqual(argv, null, "the hop left no pi running");
+		assert.equal(
+			argv?.includes("--fork"),
+			false,
+			"an empty session must not be forked",
+		);
+		assert.deepEqual(argv, ["carry on"]);
+	},
+);
+
+await checkAsync(
+	"a hop from a missing session file still starts pi",
+	async () => {
+		const cmd = buildRelaunchCommand("__DIR__", "__SESSION__");
+		const { argv } = runRelaunch(cmd, null);
+		assert.notEqual(argv, null, "the hop left no pi running");
+		assert.deepEqual(argv, [], "no fork and no spurious initial message");
+	},
+);
+
+await checkAsync("an idle hop carries no initial message", async () => {
+	const cmd = buildRelaunchCommand("__DIR__", "__SESSION__");
+	const { argv } = runRelaunch(cmd, '{"type":"user"}\n');
+	assert.deepEqual(argv?.[0], "--fork");
+	assert.equal(argv?.length, 2, "an idle hop must not submit a message");
+});
+
+await checkAsync("the relaunch lands in the target directory", async () => {
+	const cmd = buildRelaunchCommand("__DIR__", "__SESSION__");
+	const { status } = runRelaunch(cmd, '{"type":"user"}\n');
+	assert.equal(status, 0, "the relaunch command failed");
+});
+
+// --- the delivered line stays inside the terminal input cap ---------------------
+
+/** macOS drops canonical-mode input past this; a truncated line never runs. */
+const TTY_LINE_CAP = 1024;
+
+await checkAsync(
+	"a long relaunch is delivered as a short typed line",
+	async () => {
+		const handoff = Buffer.from(
+			JSON.stringify({
+				schemaVersion: 2,
+				operationId: "wt-longish-operation",
+				kind: "enter",
+				source: {
+					path: `/Users/someone/code/${"nested/".repeat(8)}project`,
+					branch: "main",
+					kind: "main",
+				},
+				target: {
+					path: `/Users/someone/code/${"nested/".repeat(8)}project.worktrees/feat-a-long-branch-name`,
+					branch: "feat/a-long-branch-name",
+					kind: "linked",
+				},
+				targetProvisioning: "ready",
+				expectedReceiptHash: "a".repeat(64),
+				sessionCarry: "fork",
+				uncommitted: 3,
+			}),
+		).toString("base64");
+		const command = buildRelaunchCommand(
+			`/Users/someone/code/${"nested/".repeat(8)}project.worktrees/feat-a-long-branch-name`,
+			`/Users/someone/.pi/agent/sessions/${"x".repeat(60)}/session.jsonl`,
+			handoff,
+			buildContinuationMessage(
+				"enter",
+				"/Users/someone/code/project.worktrees/feat-a-long-branch-name",
+			),
+		);
+		assert.ok(
+			command.length > TTY_LINE_CAP,
+			`this case is only meaningful if the command exceeds the cap (was ${command.length})`,
+		);
+
+		const { typedCommand, scriptPath } = writeRelaunchLauncher(command);
+		assert.ok(
+			typedCommand.length < 300,
+			`typed line was ${typedCommand.length} bytes: ${typedCommand}`,
+		);
+		assert.ok(typedCommand.length < TTY_LINE_CAP);
+		assert.equal(readFileSync(scriptPath, "utf-8").trim(), command.trim());
+	},
+);
+
+await checkAsync(
+	"the launcher runs the command and cleans itself up",
+	async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-wt-launcher-"));
+		const marker = join(dir, "ran");
+		const { typedCommand, scriptPath } = writeRelaunchLauncher(
+			`touch ${JSON.stringify(marker)}`,
+		);
+		const result = spawnSync("sh", ["-c", typedCommand], { encoding: "utf-8" });
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(existsSync(marker), true, "the relaunch command did not run");
+		assert.equal(
+			existsSync(scriptPath),
+			false,
+			"the launcher script was left behind",
 		);
 	},
 );
