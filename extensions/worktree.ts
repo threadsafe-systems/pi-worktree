@@ -594,8 +594,10 @@ export function unsafeDisposeReason(opts: {
 	sessionFile?: string;
 	worktreePath: string;
 	porcelainWithIgnored: string;
+	/** A waiter can safely remove the live checkout only after Pi exits. */
+	allowLiveCwd?: boolean;
 }): string | null {
-	if (isPathInside(opts.cwd, opts.worktreePath)) {
+	if (!opts.allowLiveCwd && isPathInside(opts.cwd, opts.worktreePath)) {
 		return `Refusing to dispose ${opts.worktreePath} because the current pi session is running inside that worktree.`;
 	}
 	if (opts.sessionFile && isPathInside(opts.sessionFile, opts.worktreePath)) {
@@ -2403,9 +2405,9 @@ export default function (pi: ExtensionAPI) {
 	/**
 	 * Model-triggered disposal.
 	 *
-	 * The model can never authorise data loss, so any dirty state refuses. Live
-	 * disposal is left to the interactive path until the waiter-owned teardown
-	 * lands; the model is told plainly rather than being handed a half-measure.
+	 * The model can never authorise data loss, so any dirty state refuses. A clean
+	 * live checkout is removed only by a waiter after Pi exits and hands off to
+	 * the main checkout.
 	 */
 	async function handleModelDispose(
 		request: {
@@ -2478,6 +2480,7 @@ export default function (pi: ExtensionAPI) {
 				: {}),
 			worktreePath: entry.path,
 			porcelainWithIgnored: dirty.stdout,
+			allowLiveCwd: live,
 		});
 		if (unsafeReason) {
 			return refuse(live ? "live-cwd-unsafe" : "dirty-worktree", unsafeReason);
