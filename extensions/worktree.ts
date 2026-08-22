@@ -1934,6 +1934,9 @@ export default function (pi: ExtensionAPI) {
 	) {
 		return {
 			content: [{ type: "text" as const, text: message }],
+			// SAFETY: TransitionDetails is a closed set of JSON-serialisable
+			// fields, so it satisfies the index signature a tool result requires.
+			// An interface has no index signature, so inference cannot see that.
 			details: details as unknown as Record<string, unknown>,
 			...(terminate ? { terminate: true } : {}),
 		};
@@ -2015,6 +2018,9 @@ export default function (pi: ExtensionAPI) {
 				defaultWorktreeBase: getWorktreeDir(repoRoot, config),
 			};
 			return toolResult(
+				// SAFETY: built field by field above to match the status arm of
+				// TransitionDetails; a union cannot be narrowed to one arm by the
+				// shape of an object literal alone.
 				status as unknown as TransitionDetails,
 				`repoRoot: ${repoRoot}\n` +
 					`discipline: ${marker?.enforce === true ? "on" : "off"}\n` +
