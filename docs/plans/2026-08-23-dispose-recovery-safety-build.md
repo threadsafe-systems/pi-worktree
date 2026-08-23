@@ -192,6 +192,7 @@ D13, D14, D15, D16, D17.
 
 ### Checks
 
+- `npx tsx test/detached-teardown.test.ts` — tests, scope: task.
 - `npx tsx test/process-lifecycle.test.ts` — tests, scope: task.
 - `npx tsx test/disposal.test.ts` — tests, scope: task.
 - `npm pack --dry-run` — packaging.
@@ -275,3 +276,5 @@ Every DoD item has one owning implementation task and at least one downstream in
 - T4 retains `unsafeDisposeReason`'s legacy porcelain input for compatibility with existing pure callers, while every shipping removal adapter now supplies the structured safety snapshot.
 - T5 deletes either kind of branch only after both the selected path and its Git worktree registration are gone; a failed worktree removal leaves the branch untouched even for explicit destroy.
 - T5 does not run the repository-wide `git worktree prune` fallback after a target removal failure because pruning unrelated stale registrations exceeds the approved target's mutation boundary.
+- T6 executes the package-shipped `.ts` worker directly with Node; the declared Node `>=22.19.0` floor supports built-in type stripping, and a task-scoped test runs that exact entrypoint without `tsx`.
+- T6 keeps schema version 1 for teardown reports by adding optional outcome fields; legacy reports remain readable, while new refused or partial reports cannot satisfy successor verification.

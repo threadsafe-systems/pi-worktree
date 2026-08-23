@@ -869,6 +869,8 @@ export type TeardownBranchDisposition =
 export interface WorktreeTeardownResult {
 	status: "refused" | "partial" | "complete";
 	reason:
+		| "claim-failed"
+		| "destination-changed"
 		| "hook-failed"
 		| "inspection-failed"
 		| "snapshot-changed"
@@ -966,6 +968,7 @@ export interface WorktreeTeardownOptions {
 	branch: string;
 	mode: WorktreeTeardownMode;
 	approvedSnapshot: WorktreeSafetySnapshot;
+	expectedDestination?: { path: string; branch: string };
 	preRemove?: readonly string[];
 	runner?: GitRunner;
 	hookRunner?: HookRunner;
@@ -1100,10 +1103,38 @@ async function removeTeardownWorktree(
 	};
 }
 
+async function destinationMatches(
+	options: WorktreeTeardownOptions,
+	runner: GitRunner,
+): Promise<boolean> {
+	if (!options.expectedDestination) return true;
+	if (resolve(options.repoRoot) !== resolve(options.expectedDestination.path)) {
+		return false;
+	}
+	try {
+		const result = await runner(["symbolic-ref", "--short", "-q", "HEAD"], {
+			cwd: options.repoRoot,
+		});
+		return (
+			!result.killed &&
+			result.code === 0 &&
+			result.stdout.trim() === options.expectedDestination.branch
+		);
+	} catch {
+		return false;
+	}
+}
+
 export async function executeWorktreeTeardown(
 	options: WorktreeTeardownOptions,
 ): Promise<WorktreeTeardownResult> {
 	const runner = options.runner ?? nodeGitRunner;
+	if (!(await destinationMatches(options, runner))) {
+		return refusedTeardown(
+			"destination-changed",
+			"The destination checkout changed after scheduling; nothing was removed.",
+		);
+	}
 	const hooks = await runTeardownHooks(
 		options,
 		options.hookRunner ?? nodeHookRunner,
@@ -1114,6 +1145,19 @@ export async function executeWorktreeTeardown(
 	const removal = await removeTeardownWorktree(options, runner);
 	if (!removal.ok) return removal.result;
 	const details = removal.value.details;
+	if (!(await destinationMatches(options, runner))) {
+		return {
+			status: "partial",
+			reason: "destination-changed",
+			message:
+				"The worktree was removed, but the destination checkout changed before branch deletion.",
+			changes: [],
+			pathGone: true,
+			registrationGone: true,
+			branchDisposition: "not-attempted",
+			details,
+		};
+	}
 	const branchDisposition = await deleteTeardownBranch(
 		runner,
 		options.repoRoot,

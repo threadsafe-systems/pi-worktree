@@ -5,8 +5,6 @@ import { join as pjoin } from "node:path";
 import {
 	branchToDirName,
 	buildCreateScript,
-	buildDestroyScript,
-	buildDisposeScript,
 	buildContinuationMessage,
 	buildRelaunchCommand,
 	decodeHandoff,
@@ -442,30 +440,6 @@ check("branchToDirName: slashes collapse to hyphens", () => {
 	);
 });
 
-check(
-	"buildDisposeScript: preRemove, cd repo, remove, branch -d (soft) in order",
-	() => {
-		const s = buildDisposeScript("/repo", "/repo.worktrees/feat-x", "feat/x", [
-			"dropdb foo",
-		]);
-		const iHook = s.indexOf("dropdb foo");
-		const iCd = s.indexOf("cd '/repo'");
-		const iRemove = s.indexOf(
-			"git worktree remove --force '/repo.worktrees/feat-x'",
-		);
-		const iPathGone = s.indexOf("if [ ! -e '/repo.worktrees/feat-x' ]; then");
-		const iBranch = s.indexOf("git branch -d 'feat/x'");
-		assert.ok(
-			iHook >= 0 &&
-				iCd > iHook &&
-				iRemove > iCd &&
-				iPathGone > iRemove &&
-				iBranch > iPathGone,
-			s,
-		);
-	},
-);
-
 check("dispose relaunch command targets the repo root", () => {
 	const cmd = buildRelaunchCommand("/repo", "/s.jsonl", "YWJjPT0=");
 	assert.match(cmd, /^cd '\/repo' && PI_WT_HANDOFF='YWJjPT0=' /);
@@ -609,51 +583,6 @@ check(
 				before >= 0 && s.slice(before, m.index).indexOf("'", 1) === -1;
 			assert.ok(quotedOpen, `unquoted injection at ${m.index}: ${s}`);
 		}
-	},
-);
-
-check("buildDestroyScript: shQuotes and hard-deletes the branch", () => {
-	const s = buildDestroyScript("/repo", "/repo.worktrees/feat-x", "feat/x", [
-		"dropdb foo",
-	]);
-	assert.match(s, /git worktree remove --force '\/repo.worktrees\/feat-x'/);
-	assert.match(s, /git branch -D 'feat\/x'/);
-	assert.doesNotMatch(s, /if \[ ! -e '\/repo\.worktrees\/feat-x' \]; then/);
-	assert.match(s, /dropdb foo/);
-});
-
-check(
-	"teardown never rm -rf's on failure (prunes instead) — no blunt delete",
-	() => {
-		// A stale worktree path can be reused by unrelated content; git refuses to
-		// remove it, so an rm -rf fallback would destroy that unrelated data.
-		for (const s of [
-			buildDisposeScript("/repo", "/repo.worktrees/feat-x", "feat/x"),
-			buildDestroyScript("/repo", "/repo.worktrees/feat-x", "feat/x"),
-		]) {
-			assert.doesNotMatch(s, /rm -rf/);
-			assert.match(s, /git worktree prune/);
-		}
-	},
-);
-
-check(
-	"teardown: preRemove hooks are fail-fast (set -e brackets), none without hooks",
-	() => {
-		const withHooks = buildDestroyScript(
-			"/repo",
-			"/repo.worktrees/feat-x",
-			"feat/x",
-			["backup.sh"],
-		);
-		assert.match(withHooks, /set -e/);
-		assert.match(withHooks, /set \+e/);
-		const noHooks = buildDestroyScript(
-			"/repo",
-			"/repo.worktrees/feat-x",
-			"feat/x",
-		);
-		assert.doesNotMatch(noHooks, /set -e/);
 	},
 );
 

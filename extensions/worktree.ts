@@ -1,5 +1,11 @@
 import { execFile, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+	existsSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import {
 	basename,
@@ -44,6 +50,7 @@ import {
 	type WorktreeTeardownResult,
 } from "./worktree-safety.ts";
 import { shQuote } from "./worktree-shell.ts";
+import { writeDetachedTeardownRequest } from "./worktree-teardown.ts";
 import {
 	type ReplacementSessionContext,
 	switchIntoCheckout,
@@ -59,6 +66,7 @@ import {
 	configDigest,
 	createStore,
 	failedReceipt,
+	isSuccessfulTeardownReport,
 	newReceipt,
 	readReceipt,
 	readTeardownReport,
@@ -902,238 +910,15 @@ export {
 	handoffCaveat,
 } from "./worktree-handoff.ts";
 
-/** Shared worktree-teardown script builder (used by dispose and destroy). All
- *  paths and the branch name are shQuote'd. `hardDelete` selects `git branch -D`
- *  (destroy) vs `-d` (dispose, which keeps an unmerged branch). */
-function buildTeardownScript(
-	repoRoot: string,
-	worktreePath: string,
-	branch: string,
-	preRemove: string[] | undefined,
-	hardDelete: boolean,
-): string {
-	// Dispose promises never to destroy work, so it re-checks cleanliness before
-	// --force. Destroy makes the opposite promise: the caller has already
-	// confirmed they want the checkout and its ignored files gone, so rechecking
-	// would strand every worktree that has a node_modules in it.
-	const recheckClean = !hardDelete;
-	const lines: string[] = [];
-	const hooks = preRemove ?? [];
-	if (hooks.length) {
-		// Fail-fast: a failing preRemove hook (e.g. a backup) must abort before the
-		// irreversible removal below. Each hook runs in a subshell, because a
-		// project hook containing `exit` would otherwise end this script at the
-		// hook step and skip every check between it and the caller's report.
-		lines.push("set -e");
-		for (const cmd of hooks) {
-			lines.push(`( cd ${shQuote(worktreePath)} && ${cmd} )`);
-		}
-		lines.push("set +e");
-	}
-	if (recheckClean) {
-		// Hooks are arbitrary project commands and may leave work behind, and the
-		// caller's dirty check happened before this script started, so what was
-		// clean then may not be clean now. `--force` would destroy it silently.
-		lines.push(
-			`if [ -n "$(git -C ${shQuote(worktreePath)} status --porcelain --ignored 2>/dev/null)" ]; then`,
-		);
-		lines.push(
-			`  echo "refusing to remove ${worktreePath}: it is no longer clean" >&2`,
-		);
-		lines.push("  exit 1");
-		lines.push("fi");
-	}
-	lines.push(`cd ${shQuote(repoRoot)}`);
-	// NB: no `rm -rf` fallback. If `git worktree remove` refuses (e.g. the path
-	// is stale and has been reused by unrelated content), blindly rm -rf'ing it
-	// would destroy that data; prune the metadata instead and let the caller
-	// report any directory that lingers.
-	lines.push(
-		`git worktree remove --force ${shQuote(worktreePath)} 2>/dev/null || git worktree prune 2>/dev/null || true`,
-	);
-	if (hardDelete) {
-		lines.push(`git branch -D ${shQuote(branch)} 2>/dev/null || true`);
-	} else {
-		lines.push(`if [ ! -e ${shQuote(worktreePath)} ]; then`);
-		lines.push(`  git branch -d ${shQuote(branch)} 2>/dev/null || true`);
-		lines.push("fi");
-	}
-	return lines.join("\n");
-}
-
-/**
- * Teardown script for a worktree the exiting pi process is standing in.
- *
- * Everything destructive here runs after pi is gone, in a detached shell, with
- * nobody watching. So it re-establishes its right to act rather than assuming
- * it: it proves it still owns the target's lifecycle claim, that the repository
- * is on the branch the transition planned for, and that the worktree is still
- * clean — each immediately before the step that depends on it. A soft branch
- * delete gets a second destination check, because that is the one step whose
- * safety is judged relative to whatever HEAD happens to be.
- *
- * It always writes a teardown report. The successor reads that instead of
- * inferring success from the mere fact that it was relaunched.
- */
+/** Run the package-shipped teardown worker after the owning Pi process exits. */
 export function buildVerifiedTeardownScript(opts: {
-	repoRoot: string;
-	worktreePath: string;
-	branch: string;
-	preRemove?: string[];
-	operationId: string;
-	waiterOwnerFile: string;
-	receiptFile: string;
-	reportFile: string;
-	expectedDestinationBranch: string;
+	requestFile: string;
+	entrypoint?: string;
 }): string {
-	// Each hook runs in a subshell: project hooks are arbitrary trusted commands,
-	// and one containing `exit` would otherwise kill the waiter before it could
-	// record what happened or leave the worktree in a known state.
-	const hooks = (opts.preRemove ?? [])
-		.map(
-			(cmd) => `if [ "$abort" = "" ]; then
-  ( cd ${shQuote(opts.worktreePath)} && ${cmd} ) || abort="pre-remove"
-fi`,
-		)
-		.join("\n");
-
-	return `
-set -u
-repo=${shQuote(opts.repoRoot)}
-wt=${shQuote(opts.worktreePath)}
-branch=${shQuote(opts.branch)}
-op=${shQuote(opts.operationId)}
-owner=${shQuote(opts.waiterOwnerFile)}
-receipt=${shQuote(opts.receiptFile)}
-report=${shQuote(opts.reportFile)}
-dest=${shQuote(opts.expectedDestinationBranch)}
-# The waiter's pid, passed in by the waiter itself. This teardown runs as its
-# own shell, so $$ here belongs to the child, not to the process the origin
-# handed the claim to.
-waiter_pid="\${1:-}"
-abort=""
-stages=""
-
-record() { stages="\${stages}\${stages:+,}{\\"name\\":\\"$1\\",\\"status\\":\\"$2\\"}"; }
-
-# This detached shell is the claim owner only if the origin persisted the
-# hand-off to exactly this pid. Without that, it must not touch anything.
-if [ -z "$waiter_pid" ] ||
-   ! grep -qF "\\"operationId\\":\\"$op\\"" "$owner" 2>/dev/null ||
-   ! grep -qF "\\"pid\\":$waiter_pid," "$owner" 2>/dev/null ||
-   ! grep -qF "\\"role\\":\\"waiter\\"" "$owner" 2>/dev/null; then
-  abort="claim"
-  record claim failed
-else
-  record claim ok
-fi
-
-# The soft delete below is judged against the destination HEAD, so a repository
-# that moved since scheduling is not the repository this teardown planned for.
-if [ "$abort" = "" ]; then
-  actual_dest=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  if [ "$actual_dest" != "$dest" ]; then
-    abort="destination"
-    record destination failed
-  else
-    record destination ok
-  fi
-fi
-
-if [ "$abort" = "" ]; then
-  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
-    abort="dirty"
-    record dirty failed
-  else
-    record dirty ok
-  fi
-fi
-
-${hooks}
-if [ "$abort" = "pre-remove" ]; then
-  record pre-remove failed
-elif [ "$abort" = "" ]; then
-  record pre-remove ok
-fi
-
-if [ "$abort" = "" ]; then
-  cd "$repo" || abort="repo-cwd"
-fi
-
-if [ "$abort" = "" ]; then
-  if [ -n "$(git -C "$wt" status --porcelain --ignored 2>/dev/null)" ]; then
-    abort="dirty-after-hooks"
-    record dirty-recheck failed
-  else
-    record dirty-recheck ok
-  fi
-fi
-
-if [ "$abort" = "" ]; then
-  git worktree remove --force "$wt" 2>/dev/null || git worktree prune 2>/dev/null || true
-  if [ -e "$wt" ]; then record remove failed; else record remove ok; fi
-fi
-
-# Only delete the branch once the checkout is really gone, and only if the
-# destination is still the one this teardown checked against.
-branch_disposition="skipped"
-if [ "$abort" = "" ] && [ ! -e "$wt" ]; then
-  recheck=$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  if [ "$recheck" = "$dest" ]; then
-    # "git branch -d" refuses an unmerged branch, which is the intended
-    # soft-dispose outcome. Deciding that here, while the facts are current,
-    # avoids the successor re-judging it against a HEAD that has since moved.
-    if git branch -d "$branch" 2>/dev/null; then
-      branch_disposition="deleted"
-    elif git show-ref --verify --quiet "refs/heads/$branch"; then
-      branch_disposition="kept-unmerged"
-    else
-      branch_disposition="deleted"
-    fi
-    record branch ok
-  else
-    record branch skipped
-  fi
-fi
-
-path_present=true; [ -e "$wt" ] || path_present=false
-registration_present=true
-git -C "$repo" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $wt" || registration_present=false
-branch_present=true
-git -C "$repo" show-ref --verify --quiet "refs/heads/$branch" || branch_present=false
-
-if [ "$path_present" = "false" ] && [ "$registration_present" = "false" ]; then
-  rm -f "$receipt"
-fi
-receipt_present=true; [ -e "$receipt" ] || receipt_present=false
-
-mkdir -p "$(dirname "$report")"
-tmp="$report.tmp.$$"
-printf '{"branchDisposition":"%s","completedAt":"%s","expectedDestination":{"branch":"%s","path":"%s"},"observed":{"branchPresent":%s,"pathPresent":%s,"receiptPresent":%s,"registrationPresent":%s},"operationId":"%s","schemaVersion":1,"stages":[%s]}' \\
-  "$branch_disposition" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$dest" "$repo" \\
-  "$branch_present" "$path_present" "$receipt_present" "$registration_present" \\
-  "$op" "$stages" > "$tmp"
-mv -f "$tmp" "$report"
-
-# Only an operation that proved it owned this target may release the claim.
-# A shell that failed the ownership check would otherwise erase the very
-# evidence that stopped it, and with it the real owner's claim.
-if [ "$abort" != "claim" ]; then
-  rm -rf "$(dirname "$owner")"
-fi
-`;
-}
-
-/** Build the shell script run from the main repo to tear down a worktree:
- *  pre-remove hooks, worktree removal, then a SOFT branch-delete (an unmerged
- *  branch is kept). */
-export function buildDisposeScript(
-	repoRoot: string,
-	worktreePath: string,
-	branch: string,
-	preRemove?: string[],
-): string {
-	return buildTeardownScript(repoRoot, worktreePath, branch, preRemove, false);
+	const entrypoint =
+		opts.entrypoint ??
+		join(dirname(fileURLToPath(import.meta.url)), "worktree-teardown.ts");
+	return `node ${shQuote(entrypoint)} ${shQuote(opts.requestFile)} "$1"`;
 }
 
 type InProcessDisposeResult = WorktreeTeardownResult;
@@ -1363,17 +1148,6 @@ async function finishInProcessDisposal(opts: {
 		{ triggerTurn: false, deliverAs: "followUp" },
 	);
 	opts.ctx.ui.notify(summary.notice, summary.level);
-}
-
-/** Build the teardown script for `/worktree destroy`: pre-remove hooks, worktree
- *  removal, then a HARD branch-delete. All values are shQuote'd. */
-export function buildDestroyScript(
-	repoRoot: string,
-	worktreePath: string,
-	branch: string,
-	preRemove?: string[],
-): string {
-	return buildTeardownScript(repoRoot, worktreePath, branch, preRemove, true);
 }
 
 /** Build the worktree-creation script. All values are shQuote'd. It does NOT
@@ -2142,8 +1916,8 @@ export default function (pi: ExtensionAPI) {
 			: { code: 1 };
 
 		let branchDisposition: BranchDisposition;
-		const recorded =
-			report.kind === "present" ? report.report.branchDisposition : undefined;
+		const reportUsable = isSuccessfulTeardownReport(report);
+		const recorded = reportUsable ? report.report.branchDisposition : undefined;
 		if (recorded === "deleted") {
 			branchDisposition = "deleted";
 		} else if (recorded === "kept-unmerged") {
@@ -2169,7 +1943,7 @@ export default function (pi: ExtensionAPI) {
 					? readReceipt(store, removed).kind !== "absent"
 					: false,
 				branchDisposition,
-				reportPresent: report.kind === "present",
+				reportPresent: reportUsable,
 			},
 			now,
 		);
@@ -2856,6 +2630,7 @@ export default function (pi: ExtensionAPI) {
 				target,
 				repoRoot,
 				config,
+				safety,
 				ctx,
 			);
 		}
@@ -2965,6 +2740,7 @@ export default function (pi: ExtensionAPI) {
 		target: CheckoutState,
 		repoRoot: string,
 		config: WorktreeConfig,
+		approvedSnapshot: WorktreeSafetySnapshot,
 		ctx: ExtensionContext,
 	): Promise<
 		| {
@@ -3027,25 +2803,40 @@ export default function (pi: ExtensionAPI) {
 			continuationFor(ctx, "dispose", repoRoot),
 		);
 
+		const teardownReport = reportPath(store, operationId);
+		const requestFile = `${teardownReport}.request.json`;
+		try {
+			writeDetachedTeardownRequest(requestFile, {
+				schemaVersion: 1,
+				operationId,
+				repoRoot,
+				worktreePath: target.path,
+				branch: target.branch ?? "",
+				expectedDestination: { path: repoRoot, branch: destination },
+				approvedSnapshot,
+				preRemove: config.preRemove ?? [],
+				ownerFile: join(claimPath(store, target.path), "owner.json"),
+				receiptFile: receiptPath(store, target.path),
+				reportFile: teardownReport,
+			});
+		} catch (error) {
+			releaseClaim(store, target.path, origin);
+			return {
+				ok: false,
+				code: "schedule-failed",
+				reason: `could not record the detached teardown request: ${error instanceof Error ? error.message : String(error)}`,
+			};
+		}
 		const started = await startRecamp({
 			targetCwd: repoRoot,
 			tabLabel: destination,
 			typedCmd,
-			preScript: buildVerifiedTeardownScript({
-				repoRoot,
-				worktreePath: target.path,
-				branch: target.branch ?? "",
-				...(config.preRemove ? { preRemove: config.preRemove } : {}),
-				operationId,
-				waiterOwnerFile: join(claimPath(store, target.path), "owner.json"),
-				receiptFile: receiptPath(store, target.path),
-				reportFile: reportPath(store, operationId),
-				expectedDestinationBranch: destination,
-			}),
+			preScript: buildVerifiedTeardownScript({ requestFile }),
 			hold: true,
 		});
 
 		if (!started.ok) {
+			rmSync(requestFile, { force: true });
 			releaseClaim(store, target.path, origin);
 			return { ok: false, code: started.code, reason: started.reason };
 		}
@@ -3062,6 +2853,7 @@ export default function (pi: ExtensionAPI) {
 			// The waiter is armed but cannot prove ownership, so it would refuse to
 			// act. Kill it anyway rather than relying on that single check.
 			await handle?.abortAndWait();
+			rmSync(requestFile, { force: true });
 			releaseClaim(store, target.path, origin);
 			return {
 				ok: false,
@@ -3096,6 +2888,7 @@ export default function (pi: ExtensionAPI) {
 		target: CheckoutState,
 		repoRoot: string,
 		config: WorktreeConfig,
+		approvedSnapshot: WorktreeSafetySnapshot,
 		ctx: ExtensionContext,
 	) {
 		const scheduled = await scheduleLiveDisposal(
@@ -3103,6 +2896,7 @@ export default function (pi: ExtensionAPI) {
 			target,
 			repoRoot,
 			config,
+			approvedSnapshot,
 			ctx,
 		);
 		if (!scheduled.ok) {

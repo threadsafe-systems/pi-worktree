@@ -21,12 +21,14 @@ import {
 	configDigest,
 	createStore,
 	failedReceipt,
+	isSuccessfulTeardownReport,
 	newReceipt,
 	readReceipt,
 	readTeardownReport,
 	readyReceipt,
 	receiptHash,
 	receiptPath,
+	reportPath,
 	releaseClaim,
 	removeReceipt,
 	transferClaim,
@@ -570,10 +572,41 @@ check("a teardown report round-trips and a missing one is absent", () => {
 	);
 	const read = readTeardownReport(store, "op-1");
 	assert.equal(read.kind, "present");
+	assert.equal(isSuccessfulTeardownReport(read), true);
 	if (read.kind === "present") {
 		assert.equal(read.report.stages[0].status, "failed");
 		assert.equal(read.report.observed.pathPresent, true);
 	}
+});
+
+check("a malformed teardown outcome is corrupt rather than success", () => {
+	const { store } = freshStore();
+	const file = reportPath(store, "op-bad");
+	mkdirSync(dirname(file), { recursive: true });
+	writeFileSync(
+		file,
+		JSON.stringify({
+			schemaVersion: 1,
+			operationId: "op-bad",
+			expectedDestination: { path: "/repo", branch: "main" },
+			outcome: "success",
+			reason: null,
+			message: "invalid",
+			changes: [],
+			details: [],
+			stages: [],
+			observed: {
+				pathPresent: false,
+				registrationPresent: false,
+				branchPresent: false,
+				receiptPresent: false,
+			},
+			completedAt: new Date().toISOString(),
+		}),
+	);
+	const read = readTeardownReport(store, "op-bad");
+	assert.equal(read.kind, "corrupt");
+	assert.equal(isSuccessfulTeardownReport(read), false);
 });
 
 check("receipts and reports never capture hook text or output", () => {
