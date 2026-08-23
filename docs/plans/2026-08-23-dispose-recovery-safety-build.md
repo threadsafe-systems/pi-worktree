@@ -273,3 +273,5 @@ Every DoD item has one owning implementation task and at least one downstream in
 - T2 enumerates initialized submodule paths with Git's recursive `submodule foreach`, then inspects each checkout independently; this avoids parsing human-oriented submodule descriptions while keeping every Git call argv-based.
 - T3 always includes the selected worktree's current `HEAD` as a recovery candidate, so an unreferenced detached commit remains protected even when reflogs are disabled or absent.
 - T4 retains `unsafeDisposeReason`'s legacy porcelain input for compatibility with existing pure callers, while every shipping removal adapter now supplies the structured safety snapshot.
+- T5 deletes either kind of branch only after both the selected path and its Git worktree registration are gone; a failed worktree removal leaves the branch untouched even for explicit destroy.
+- T5 does not run the repository-wide `git worktree prune` fallback after a target removal failure because pruning unrelated stale registrations exceeds the approved target's mutation boundary.

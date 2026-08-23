@@ -68,9 +68,15 @@ export type GitRunner = (
 const GIT_TIMEOUT_MS = 10_000;
 const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
 
-const nodeGitRunner: GitRunner = (args, options) =>
-	new Promise((resolveGit, rejectGit) => {
-		const child = spawn("git", [...args], {
+export type HookRunner = (hook: string, cwd: string) => Promise<GitResult>;
+
+function nodeCommandRunner(
+	command: string,
+	args: readonly string[],
+	options: GitRunOptions,
+): Promise<GitResult> {
+	return new Promise((resolveCommand, rejectCommand) => {
+		const child = spawn(command, [...args], {
 			cwd: options.cwd,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -103,18 +109,24 @@ const nodeGitRunner: GitRunner = (args, options) =>
 		child.stderr.on("data", collect(stderr));
 		child.on("error", (error) =>
 			finish(() =>
-				rejectGit(
-					new WorktreeSafetyError(`Could not start Git: ${error.message}`),
+				rejectCommand(
+					new WorktreeSafetyError(
+						`Could not start ${escapeForDisplay(command)}: ${error.message}`,
+					),
 				),
 			),
 		);
 		child.on("close", (code, signal) =>
 			finish(() => {
 				if (overflow) {
-					rejectGit(new WorktreeSafetyError("Git output exceeded 16 MiB."));
+					rejectCommand(
+						new WorktreeSafetyError(
+							`${escapeForDisplay(command)} output exceeded 16 MiB.`,
+						),
+					);
 					return;
 				}
-				resolveGit({
+				resolveCommand({
 					code: code ?? 1,
 					stdout: Buffer.concat(stdout).toString("utf8"),
 					stderr: Buffer.concat(stderr).toString("utf8"),
@@ -125,15 +137,23 @@ const nodeGitRunner: GitRunner = (args, options) =>
 		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
 			if (error.code === "EPIPE") return;
 			finish(() =>
-				rejectGit(
+				rejectCommand(
 					new WorktreeSafetyError(
-						`Could not write Git input: ${error.message}`,
+						`Could not write ${escapeForDisplay(command)} input: ${error.message}`,
 					),
 				),
 			);
 		});
 		child.stdin.end(options.input ?? "");
 	});
+}
+
+const nodeGitRunner: GitRunner = (args, options) =>
+	nodeCommandRunner("git", args, options);
+
+// Hooks are configured as shell snippets; Git mutations never use this runner.
+const nodeHookRunner: HookRunner = (hook, cwd) =>
+	nodeCommandRunner("bash", ["-c", hook], { cwd });
 
 function splitTerminated(
 	value: string,
@@ -835,6 +855,297 @@ export function describeSafetySnapshotChanges(
 		changes.push("recovery history");
 	}
 	return changes;
+}
+
+export type WorktreeTeardownMode = "dispose" | "destroy";
+
+export type TeardownBranchDisposition =
+	| "not-attempted"
+	| "absent"
+	| "deleted"
+	| "kept-unmerged"
+	| "delete-failed";
+
+export interface WorktreeTeardownResult {
+	status: "refused" | "partial" | "complete";
+	reason:
+		| "hook-failed"
+		| "inspection-failed"
+		| "snapshot-changed"
+		| "removal-incomplete"
+		| "branch-delete-failed"
+		| null;
+	message: string;
+	changes: string[];
+	pathGone: boolean;
+	registrationGone: boolean;
+	branchDisposition: TeardownBranchDisposition;
+	details: string[];
+}
+
+function refusedTeardown(
+	reason: Exclude<WorktreeTeardownResult["reason"], null>,
+	message: string,
+	changes: string[] = [],
+): WorktreeTeardownResult {
+	return {
+		status: "refused",
+		reason,
+		message,
+		changes,
+		pathGone: false,
+		registrationGone: false,
+		branchDisposition: "not-attempted",
+		details: [],
+	};
+}
+
+function commandDetail(label: string, result: GitResult): string | null {
+	const output = (result.stderr || result.stdout).trim();
+	if (!output) return null;
+	return `${label}: ${escapeForDisplay(output)}`;
+}
+
+async function registrationContains(
+	runner: GitRunner,
+	repoRoot: string,
+	worktreePath: string,
+): Promise<boolean> {
+	const output = await runGit(
+		runner,
+		["worktree", "list", "--porcelain", "-z"],
+		repoRoot,
+	);
+	for (const field of splitTerminated(output, "\0", "git worktree list")) {
+		if (!field.startsWith("worktree ")) continue;
+		if (resolve(field.slice("worktree ".length)) === resolve(worktreePath)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+async function deleteTeardownBranch(
+	runner: GitRunner,
+	repoRoot: string,
+	branch: string,
+	mode: WorktreeTeardownMode,
+	details: string[],
+): Promise<TeardownBranchDisposition> {
+	const ref = `refs/heads/${branch}`;
+	const exists = await runner(["show-ref", "--verify", "--quiet", ref], {
+		cwd: repoRoot,
+	});
+	if (exists.killed) return "delete-failed";
+	if (exists.code === 1) return "absent";
+	if (exists.code !== 0) {
+		const detail = commandDetail("git show-ref", exists);
+		if (detail) details.push(detail);
+		return "delete-failed";
+	}
+	const remove = await runner(
+		["branch", mode === "destroy" ? "-D" : "-d", "--", branch],
+		{ cwd: repoRoot },
+	);
+	const removeDetail = commandDetail("git branch", remove);
+	if (removeDetail) details.push(removeDetail);
+	if (!remove.killed && remove.code === 0) return "deleted";
+	if (mode === "destroy") return "delete-failed";
+	const ancestor = await runner(["merge-base", "--is-ancestor", ref, "HEAD"], {
+		cwd: repoRoot,
+	});
+	if (!ancestor.killed && ancestor.code === 1) return "kept-unmerged";
+	const ancestorDetail = commandDetail("git merge-base", ancestor);
+	if (ancestorDetail) details.push(ancestorDetail);
+	return "delete-failed";
+}
+
+export interface WorktreeTeardownOptions {
+	repoRoot: string;
+	worktreePath: string;
+	branch: string;
+	mode: WorktreeTeardownMode;
+	approvedSnapshot: WorktreeSafetySnapshot;
+	preRemove?: readonly string[];
+	runner?: GitRunner;
+	hookRunner?: HookRunner;
+}
+
+type TeardownGate<T> =
+	| { ok: true; value: T }
+	| { ok: false; result: WorktreeTeardownResult };
+
+async function runTeardownHooks(
+	options: WorktreeTeardownOptions,
+	hookRunner: HookRunner,
+): Promise<TeardownGate<null>> {
+	for (const hook of options.preRemove ?? []) {
+		let result: GitResult;
+		try {
+			result = await hookRunner(hook, options.worktreePath);
+		} catch (error) {
+			return {
+				ok: false,
+				result: refusedTeardown(
+					"hook-failed",
+					`preRemove hook could not start: ${error instanceof Error ? error.message : String(error)}`,
+				),
+			};
+		}
+		if (result.killed || result.code !== 0) {
+			const detail = commandDetail("preRemove hook", result);
+			return {
+				ok: false,
+				result: {
+					...refusedTeardown(
+						"hook-failed",
+						"A preRemove hook failed; nothing was removed.",
+					),
+					details: detail ? [detail] : [],
+				},
+			};
+		}
+	}
+	return { ok: true, value: null };
+}
+
+async function revalidateTeardown(
+	options: WorktreeTeardownOptions,
+	runner: GitRunner,
+): Promise<TeardownGate<null>> {
+	let current: WorktreeSafetySnapshot;
+	try {
+		current = await inspectWorktreeSafety(options.worktreePath, { runner });
+	} catch (error) {
+		return {
+			ok: false,
+			result: refusedTeardown(
+				"inspection-failed",
+				`Removal safety could not be revalidated; nothing was removed: ${error instanceof Error ? error.message : String(error)}`,
+			),
+		};
+	}
+	const changes = describeSafetySnapshotChanges(
+		options.approvedSnapshot,
+		current,
+	);
+	if (changes.length === 0) return { ok: true, value: null };
+	return {
+		ok: false,
+		result: refusedTeardown(
+			"snapshot-changed",
+			`Removal safety changed after approval (${changes.join(", ")}); inspect and retry.`,
+			changes,
+		),
+	};
+}
+
+async function removeTeardownWorktree(
+	options: WorktreeTeardownOptions,
+	runner: GitRunner,
+): Promise<TeardownGate<{ details: string[] }>> {
+	const details: string[] = [];
+	let removal: GitResult;
+	try {
+		removal = await runner(
+			["worktree", "remove", "--force", "--", options.worktreePath],
+			{ cwd: options.repoRoot },
+		);
+	} catch (error) {
+		return {
+			ok: false,
+			result: {
+				status: "partial",
+				reason: "removal-incomplete",
+				message: `Git worktree removal could not start: ${error instanceof Error ? error.message : String(error)}`,
+				changes: [],
+				pathGone: !existsSync(options.worktreePath),
+				registrationGone: false,
+				branchDisposition: "not-attempted",
+				details,
+			},
+		};
+	}
+	const removalDetail = commandDetail("git worktree remove", removal);
+	if (removalDetail) details.push(removalDetail);
+	const pathGone = !existsSync(options.worktreePath);
+	let registrationGone = false;
+	try {
+		registrationGone = !(await registrationContains(
+			runner,
+			options.repoRoot,
+			options.worktreePath,
+		));
+	} catch (error) {
+		details.push(
+			`worktree registration check: ${escapeForDisplay(error instanceof Error ? error.message : String(error))}`,
+		);
+	}
+	if (!removal.killed && removal.code === 0 && pathGone && registrationGone) {
+		return { ok: true, value: { details } };
+	}
+	return {
+		ok: false,
+		result: {
+			status: "partial",
+			reason: "removal-incomplete",
+			message:
+				"Worktree removal did not complete; the branch was left untouched.",
+			changes: [],
+			pathGone,
+			registrationGone,
+			branchDisposition: "not-attempted",
+			details,
+		},
+	};
+}
+
+export async function executeWorktreeTeardown(
+	options: WorktreeTeardownOptions,
+): Promise<WorktreeTeardownResult> {
+	const runner = options.runner ?? nodeGitRunner;
+	const hooks = await runTeardownHooks(
+		options,
+		options.hookRunner ?? nodeHookRunner,
+	);
+	if (!hooks.ok) return hooks.result;
+	const revalidated = await revalidateTeardown(options, runner);
+	if (!revalidated.ok) return revalidated.result;
+	const removal = await removeTeardownWorktree(options, runner);
+	if (!removal.ok) return removal.result;
+	const details = removal.value.details;
+	const branchDisposition = await deleteTeardownBranch(
+		runner,
+		options.repoRoot,
+		options.branch,
+		options.mode,
+		details,
+	);
+	if (branchDisposition === "delete-failed") {
+		return {
+			status: "partial",
+			reason: "branch-delete-failed",
+			message: "The worktree was removed, but branch deletion failed.",
+			changes: [],
+			pathGone: true,
+			registrationGone: true,
+			branchDisposition,
+			details,
+		};
+	}
+	return {
+		status: "complete",
+		reason: null,
+		message:
+			branchDisposition === "kept-unmerged"
+				? "The worktree was removed and its unmerged branch was kept."
+				: "The worktree and eligible branch were removed.",
+		changes: [],
+		pathGone: true,
+		registrationGone: true,
+		branchDisposition,
+		details,
+	};
 }
 
 export function parseReflogOids(value: string, source: string): string[] {

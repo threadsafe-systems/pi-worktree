@@ -37,9 +37,11 @@ import {
 import { Type } from "typebox";
 import {
 	disposeSafetyReason,
+	executeWorktreeTeardown,
 	formatDestroyConfirmation,
 	inspectWorktreeSafety,
 	type WorktreeSafetySnapshot,
+	type WorktreeTeardownResult,
 } from "./worktree-safety.ts";
 import { shQuote } from "./worktree-shell.ts";
 import {
@@ -1134,14 +1136,7 @@ export function buildDisposeScript(
 	return buildTeardownScript(repoRoot, worktreePath, branch, preRemove, false);
 }
 
-interface InProcessDisposeResult {
-	exitCode: number;
-	stdout: string;
-	stderr: string;
-	pathGone: boolean;
-	registrationGone: boolean;
-	branchDisposition: BranchDisposition;
-}
+type InProcessDisposeResult = WorktreeTeardownResult;
 
 interface AsyncProcessResult {
 	exitCode: number;
@@ -1203,41 +1198,25 @@ async function runInProcessDisposal(
 	repoRoot: string,
 	worktreePath: string,
 	branch: string,
+	approvedSnapshot: WorktreeSafetySnapshot,
 	preRemove?: string[],
 ): Promise<InProcessDisposeResult> {
-	const teardown = await runAsyncProcess(
-		"bash",
-		["-c", buildDisposeScript(repoRoot, worktreePath, branch, preRemove)],
-		{ cwd: repoRoot, timeout: 130_000 },
-	);
-	const [listed, branchRef] = await Promise.all([
-		runAsyncProcess("git", ["worktree", "list", "--porcelain"], {
-			cwd: repoRoot,
-			timeout: 5_000,
-		}),
-		runAsyncProcess(
-			"git",
-			["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-			{ cwd: repoRoot, timeout: 5_000 },
-		),
-	]);
-	const pathGone = !existsSync(worktreePath);
-	let branchDisposition: BranchDisposition = "delete-failed";
-	if (teardown.exitCode === 0 && pathGone) {
-		branchDisposition = branchRef.exitCode === 0 ? "kept-unmerged" : "deleted";
-	}
-	return {
-		exitCode: teardown.exitCode,
-		stdout: teardown.stdout,
-		stderr: teardown.stderr,
-		pathGone,
-		registrationGone:
-			listed.exitCode === 0 &&
-			!parseWorktreeList(listed.stdout).some(
-				(entry) => canonicalPath(entry.path) === canonicalPath(worktreePath),
-			),
-		branchDisposition,
-	};
+	return executeWorktreeTeardown({
+		repoRoot,
+		worktreePath,
+		branch,
+		mode: "dispose",
+		approvedSnapshot,
+		...(preRemove ? { preRemove } : {}),
+	});
+}
+
+function verificationBranchDisposition(
+	disposition: WorktreeTeardownResult["branchDisposition"],
+): BranchDisposition {
+	if (disposition === "absent") return "deleted";
+	if (disposition === "not-attempted") return "delete-failed";
+	return disposition;
 }
 
 function summarizeInProcessDisposal(opts: {
@@ -1255,7 +1234,7 @@ function summarizeInProcessDisposal(opts: {
 	level: "info" | "warning";
 } {
 	const complete =
-		opts.disposed.exitCode === 0 &&
+		opts.disposed.status === "complete" &&
 		opts.disposed.pathGone &&
 		opts.disposed.registrationGone;
 	const verification: SuccessorVerification = {
@@ -1265,7 +1244,9 @@ function summarizeInProcessDisposal(opts: {
 		checkedAt: new Date().toISOString(),
 		expected: opts.expected,
 		actual: opts.actual,
-		branchDisposition: opts.disposed.branchDisposition,
+		branchDisposition: verificationBranchDisposition(
+			opts.disposed.branchDisposition,
+		),
 		pathDisposition: opts.disposed.pathGone ? "removed" : "present",
 		registrationDisposition: opts.disposed.registrationGone
 			? "removed"
@@ -1289,11 +1270,16 @@ function summarizeInProcessDisposal(opts: {
 			level: "info",
 		};
 	}
+	const detail = [opts.disposed.message, ...opts.disposed.details]
+		.filter(Boolean)
+		.join("\n");
 	return {
 		verification,
-		content:
-			`${transitionCaveat(verification)}\n${(opts.disposed.stderr || opts.disposed.stdout).trim()}`.trim(),
-		notice: `Teardown of ${opts.targetPath} did not complete. Check git worktree list and the path before continuing.`,
+		content: `${transitionCaveat(verification)}\n${detail}`.trim(),
+		notice:
+			opts.disposed.status === "refused"
+				? `The session moved to ${opts.expected.path}, but removal was refused: ${opts.disposed.message}`
+				: `Teardown of ${opts.targetPath} did not complete. Check git worktree list and the path before continuing.`,
 		level: "warning",
 	};
 }
@@ -1303,6 +1289,7 @@ async function finishInProcessDisposal(opts: {
 	destination: CheckoutState;
 	targetPath: string;
 	branch: string;
+	approvedSnapshot: WorktreeSafetySnapshot;
 	preRemove?: string[];
 	store: ReceiptStore;
 	operationId: string;
@@ -1348,6 +1335,7 @@ async function finishInProcessDisposal(opts: {
 		opts.destination.path,
 		opts.targetPath,
 		opts.branch,
+		opts.approvedSnapshot,
 		opts.preRemove,
 	);
 	if (disposed.pathGone && disposed.registrationGone) {
@@ -2883,45 +2871,40 @@ export default function (pi: ExtensionAPI) {
 		const claim = acquireClaim(store, canonicalPath(entry.path), owner);
 		if (!claim.ok) return refuse("target-busy", claim.reason);
 
-		let dispose: { code: number; stdout: string; stderr: string };
+		let disposed: WorktreeTeardownResult;
 		try {
-			dispose = await pi.exec(
-				"bash",
-				[
-					"-c",
-					buildDisposeScript(
-						repoRoot,
-						entry.path,
-						entry.branch,
-						config.preRemove,
-					),
-				],
-				{ timeout: 130_000 },
-			);
+			disposed = await executeWorktreeTeardown({
+				repoRoot,
+				worktreePath: entry.path,
+				branch: entry.branch,
+				mode: "dispose",
+				approvedSnapshot: safety,
+				preRemove: config.preRemove,
+			});
 		} finally {
 			releaseClaim(store, canonicalPath(entry.path), owner);
 		}
-		const remaining = await listWorktrees(repoRoot);
-		const registrationGone = !remaining.some(
-			(w) => canonicalPath(w.path) === canonicalPath(entry.path),
-		);
-		const pathGone = !existsSync(entry.path);
-		const branchRef = await pi.exec(
-			"git",
-			["show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`],
-			{ cwd: repoRoot, timeout: 5_000 },
-		);
-		const branchKept = branchRef.code === 0;
-
-		if (agentWorktree?.path === entry.path) agentWorktree = null;
-		if (pathGone && registrationGone) {
+		const detail = [disposed.message, ...disposed.details]
+			.filter(Boolean)
+			.join("\n");
+		if (disposed.status === "refused") {
+			const code: TransitionCode =
+				disposed.reason === "hook-failed"
+					? "hook-failed"
+					: disposed.reason === "inspection-failed"
+						? "git-failed"
+						: "dirty-worktree";
+			return refuse(code, detail);
+		}
+		if (disposed.pathGone && disposed.registrationGone) {
+			if (agentWorktree?.path === entry.path) agentWorktree = null;
 			removeReceipt(store, canonicalPath(entry.path));
 		}
-
-		const complete = pathGone && registrationGone && dispose.code === 0;
-
-		if (complete) {
-			const branchNote = branchKept ? "kept: unmerged commits" : "deleted";
+		if (disposed.status === "complete") {
+			const branchNote =
+				disposed.branchDisposition === "kept-unmerged"
+					? "kept: unmerged commits"
+					: "deleted";
 			return toolResult(
 				buildDetails({
 					action: "dispose",
@@ -2940,9 +2923,12 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const residue: string[] = [];
-		if (!pathGone) residue.push(`${entry.path} still exists`);
-		if (!registrationGone) {
+		if (!disposed.pathGone) residue.push(`${entry.path} still exists`);
+		if (!disposed.registrationGone) {
 			residue.push("the worktree is still registered with git");
+		}
+		if (disposed.branchDisposition === "delete-failed") {
+			residue.push(`branch ${entry.branch} was not deleted`);
 		}
 		return toolResult(
 			buildDetails({
@@ -2960,7 +2946,7 @@ export default function (pi: ExtensionAPI) {
 					],
 				},
 			}),
-			`Teardown of ${entry.path} did not complete. ${(dispose.stderr || dispose.stdout || "").trim()}`.trim(),
+			`Teardown of ${entry.path} did not complete. ${detail}`.trim(),
 		);
 	}
 
@@ -3447,6 +3433,7 @@ export default function (pi: ExtensionAPI) {
 		config: WorktreeConfig;
 		branch: string;
 		worktreePath: string;
+		approvedSnapshot: WorktreeSafetySnapshot;
 	}): Promise<void> {
 		const destinationBranch = await pi.exec(
 			"git",
@@ -3514,6 +3501,7 @@ export default function (pi: ExtensionAPI) {
 							destination,
 							targetPath,
 							branch: opts.branch,
+							approvedSnapshot: opts.approvedSnapshot,
 							preRemove: opts.config.preRemove,
 							store,
 							operationId,
@@ -3589,6 +3577,7 @@ export default function (pi: ExtensionAPI) {
 				config,
 				branch,
 				worktreePath,
+				approvedSnapshot: safety,
 			});
 		} catch (err) {
 			const message = `Failed to dispose worktree: ${(err as Error).message}`;
@@ -3647,60 +3636,59 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const safety = await inspectWorktreeSafety(worktreePath);
-			const confirmation = formatDestroyConfirmation(safety, branch);
-			const ok = await ctx.ui.confirm(confirmation.title, confirmation.body);
-			if (!ok) return;
-
-			const step = (msg: string) => ctx.ui.setStatus("worktree", msg);
-
-			// Teardown: preRemove hooks, worktree removal, hard branch-delete.
-			// All paths/branch are shQuote'd inside buildDestroyScript.
-			step("⏳ Tearing down worktree...");
-			await pi.exec(
-				"bash",
-				[
-					"-c",
-					buildDestroyScript(repoRoot, worktreePath, branch, config.preRemove),
-				],
-				{ timeout: 130_000 },
-			);
-
-			step("");
-			// Verify rather than trust: report the ACTUAL post-teardown state of both
-			// the worktree directory and the branch.
-			const wtGone = !existsSync(worktreePath);
-			const branchRef = await pi.exec(
-				"git",
-				["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-				{ cwd: repoRoot, timeout: 5_000 },
-			);
-			const branchGone = branchRef.code !== 0;
-			// Provisioning evidence outlives the checkout unless it is cleared, and
-			// a stale receipt would make the name unusable later.
-			if (wtGone) {
-				removeReceipt(
-					createStore(await resolveGitCommonDir(repoRoot)),
-					canonicalPath(worktreePath),
-				);
+			const store = createStore(await resolveGitCommonDir(repoRoot));
+			const targetPath = canonicalPath(worktreePath);
+			const owner: ClaimOwner = {
+				operationId: newOperationId(),
+				pid: process.pid,
+				role: "origin",
+			};
+			const claim = acquireClaim(store, targetPath, owner);
+			if (!claim.ok) {
+				ctx.ui.notify(claim.reason, "error");
+				return;
 			}
-			if (wtGone && branchGone) {
+			let destroyed: WorktreeTeardownResult | null = null;
+			try {
+				const safety = await inspectWorktreeSafety(worktreePath);
+				const confirmation = formatDestroyConfirmation(safety, branch);
+				const ok = await ctx.ui.confirm(confirmation.title, confirmation.body);
+				if (!ok) return;
+				ctx.ui.setStatus("worktree", "⏳ Tearing down worktree...");
+				destroyed = await executeWorktreeTeardown({
+					repoRoot,
+					worktreePath,
+					branch,
+					mode: "destroy",
+					approvedSnapshot: safety,
+					preRemove: config.preRemove,
+				});
+			} finally {
+				releaseClaim(store, targetPath, owner);
+				ctx.ui.setStatus("worktree", undefined);
+			}
+			if (!destroyed) return;
+			if (destroyed.pathGone && destroyed.registrationGone) {
+				removeReceipt(store, targetPath);
+			}
+			if (destroyed.status === "complete") {
 				ctx.ui.notify(
 					`✅ Worktree "${branch}" destroyed\n` +
 						`   Path:   ${worktreePath} (removed)\n` +
 						`   Branch: ${branch} (hard-deleted)`,
 					"info",
 				);
-			} else {
-				const bits: string[] = [];
-				if (!wtGone) bits.push(`${worktreePath} still exists`);
-				if (!branchGone) bits.push(`branch ${branch} was not deleted`);
-				ctx.ui.notify(
-					`⚠️  Worktree "${branch}" not fully destroyed: ${bits.join("; ")}.\n` +
-						`   Check \`git worktree list\` / \`git branch\` and clean up manually.`,
-					"error",
-				);
+				return;
 			}
+			const detail = [destroyed.message, ...destroyed.details]
+				.filter(Boolean)
+				.join("\n");
+			ctx.ui.notify(
+				destroyed.status === "refused"
+					? `Destroy refused before removal. ${detail}`
+					: `⚠️ Worktree "${branch}" not fully destroyed. ${detail}`,
+				"error",
+			);
 		} catch (err) {
 			ctx.ui.setStatus("worktree", undefined);
 			ctx.ui.notify(
