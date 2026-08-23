@@ -15,16 +15,16 @@
  * built from the in-memory entries instead.
  *
  * The persisted leaf can also be ahead of the active one, because navigating
- * the session tree moves the active branch without rewriting the file. Forking
- * the file in that state would carry the session to a leaf the user has
- * already moved away from, so the active branch is written explicitly.
+ * the session tree moves the active branch without rewriting the file. The
+ * target must preserve the complete tree while attaching its orientation to
+ * the active leaf, including the root state where that leaf is null.
  *
  * Note that the OS working directory of the process is untouched: pi never
  * calls `process.chdir`. `ctx.cwd` moves, `process.cwd()` does not, so anything
  * downstream that wants to know where the session is must read the context.
  */
 
-import { existsSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
 	type ExtensionCommandContext,
@@ -36,7 +36,7 @@ import {
 export type TargetSessionPlan =
 	/** Copy the source file's tree wholesale; the file is authoritative. */
 	| { kind: "fork"; source: string }
-	/** Write the active branch out; the file is absent, empty, or stale. */
+	/** Write the in-memory tree out; the file is absent, empty, or stale. */
 	| { kind: "entries"; reason: "unflushed" | "stale-leaf" }
 	/** Nothing to carry. */
 	| { kind: "empty" };
@@ -51,8 +51,8 @@ export interface SourceSessionState {
 	persistedLeafId: string | null;
 	/** Leaf the session is actually on. */
 	activeLeafId: string | null;
-	/** Entries on the active branch. */
-	entryCount: number;
+	/** All entries held by the live session manager. */
+	totalEntryCount: number;
 }
 
 /**
@@ -65,7 +65,7 @@ export interface SourceSessionState {
 export function planTargetSession(
 	state: SourceSessionState,
 ): TargetSessionPlan {
-	if (state.entryCount === 0) return { kind: "empty" };
+	if (state.totalEntryCount === 0) return { kind: "empty" };
 	if (!state.sessionFile || !state.flushed) {
 		return { kind: "entries", reason: "unflushed" };
 	}
@@ -91,7 +91,7 @@ export function readSourceState(sm: {
 			? SessionManager.open(sessionFile as string).getLeafId()
 			: null,
 		activeLeafId: sm.getLeafId(),
-		entryCount: sm.getBranch().length,
+		totalEntryCount: sm.getEntries().length,
 	};
 }
 
@@ -117,6 +117,8 @@ export interface TargetOrientation {
 }
 
 export const TRANSITION_MESSAGE_TYPE = "pi-worktree-transition";
+export const TRANSITION_VERIFICATION_TYPE =
+	"pi-worktree-transition-verification";
 
 export function materializeTargetSession(opts: {
 	plan: TargetSessionPlan;
@@ -125,57 +127,81 @@ export function materializeTargetSession(opts: {
 	expectedLeafId: string | null;
 	sessionDir?: string;
 	parentSession?: string;
-	orientation?: TargetOrientation;
+	orientation: TargetOrientation;
 }): string {
 	const { plan, targetCwd, sessionDir } = opts;
+	let file: string | undefined;
 
-	if (plan.kind === "fork") {
-		const forked = SessionManager.forkFrom(plan.source, targetCwd, sessionDir);
-		const file = forked.getSessionFile();
-		if (!file || !existsSync(file)) {
-			throw new Error("pi did not create the target session file.");
+	try {
+		if (plan.kind === "fork") {
+			const forked = SessionManager.forkFrom(
+				plan.source,
+				targetCwd,
+				sessionDir,
+			);
+			file = forked.getSessionFile();
+			if (!file || !existsSync(file)) {
+				throw new Error("pi did not create the target session file.");
+			}
+			verifyTargetCwd(file, targetCwd);
+			if (forked.getLeafId() !== opts.expectedLeafId) {
+				throw new Error("Forked target does not resume the active branch.");
+			}
+			return appendOrientation(file, opts.orientation, opts.expectedLeafId);
 		}
-		verifyTarget(file, targetCwd, forked.getLeafId());
-		return appendOrientation(file, opts.orientation);
+
+		const target = SessionManager.create(
+			targetCwd,
+			sessionDir,
+			opts.parentSession ? { parentSession: opts.parentSession } : undefined,
+		);
+		file = target.getSessionFile();
+		const header = target.getHeader();
+		if (!file || !header) {
+			throw new Error("pi could not prepare a target session.");
+		}
+
+		const carried = plan.kind === "entries" ? opts.entries : [];
+		const document = [header, ...carried]
+			.map((entry) => JSON.stringify(entry))
+			.join("\n");
+		writeFileSync(file, `${document}\n`, {
+			encoding: "utf8",
+			flag: "wx",
+			mode: 0o600,
+		});
+
+		const verified = verifyTargetCwd(file, targetCwd);
+		if (
+			plan.kind === "entries" &&
+			opts.expectedLeafId !== null &&
+			!verified.getEntry(opts.expectedLeafId)
+		) {
+			throw new Error("Target session does not contain the active leaf.");
+		}
+		return appendOrientation(file, opts.orientation, opts.expectedLeafId);
+	} catch (error) {
+		const cleanupError = file ? removePreparedTarget(file) : undefined;
+		if (cleanupError) {
+			throw new Error(
+				`${error instanceof Error ? error.message : String(error)} Cleanup also failed: ${cleanupError}`,
+				{ cause: error },
+			);
+		}
+		throw error;
 	}
-
-	const target = SessionManager.create(
-		targetCwd,
-		sessionDir,
-		opts.parentSession ? { parentSession: opts.parentSession } : undefined,
-	);
-	const file = target.getSessionFile();
-	const header = target.getHeader();
-	if (!file || !header) {
-		throw new Error("pi could not prepare a target session.");
-	}
-
-	const carried = plan.kind === "entries" ? opts.entries : [];
-	const document = [header, ...carried]
-		.map((entry) => JSON.stringify(entry))
-		.join("\n");
-	writeFileSync(file, `${document}\n`, {
-		encoding: "utf8",
-		flag: "wx",
-		mode: 0o600,
-	});
-
-	verifyTarget(
-		file,
-		targetCwd,
-		plan.kind === "entries" ? opts.expectedLeafId : null,
-	);
-	return appendOrientation(file, opts.orientation);
 }
 
-/** Persist the handoff before switching so the replacement cannot arrive bare. */
+/** Persist the handoff on the branch the source session had selected. */
 function appendOrientation(
 	file: string,
-	orientation: TargetOrientation | undefined,
+	orientation: TargetOrientation,
+	parentLeafId: string | null,
 ): string {
-	if (!orientation) return file;
-
 	const target = SessionManager.open(file);
+	if (parentLeafId === null) target.resetLeaf();
+	else target.branch(parentLeafId);
+
 	const entryId = target.appendCustomMessageEntry(
 		TRANSITION_MESSAGE_TYPE,
 		orientation.content,
@@ -183,7 +209,12 @@ function appendOrientation(
 		orientation.details,
 	);
 	const verified = SessionManager.open(file);
-	if (verified.getLeafId() !== entryId) {
+	const entry = verified.getLeafEntry();
+	if (
+		verified.getLeafId() !== entryId ||
+		entry?.type !== "custom_message" ||
+		entry.parentId !== parentLeafId
+	) {
 		throw new Error(
 			"Target session did not persist its transition orientation.",
 		);
@@ -196,21 +227,23 @@ function appendOrientation(
  * caller's trailing separator must not read as pi having chosen a different
  * directory.
  */
-function verifyTarget(
-	file: string,
-	targetCwd: string,
-	expectedLeafId: string | null,
-): string {
+function verifyTargetCwd(file: string, targetCwd: string): SessionManager {
 	const verified = SessionManager.open(file);
 	if (resolve(verified.getCwd()) !== resolve(targetCwd)) {
 		throw new Error(
 			`Target session names ${verified.getCwd()}, not ${targetCwd}.`,
 		);
 	}
-	if (verified.getLeafId() !== expectedLeafId) {
-		throw new Error("Target session does not resume the active branch.");
+	return verified;
+}
+
+function removePreparedTarget(file: string): string | undefined {
+	try {
+		unlinkSync(file);
+		return undefined;
+	} catch (error) {
+		return error instanceof Error ? error.message : String(error);
 	}
-	return file;
 }
 
 /** Outcome of an attempted in-process move. */
@@ -242,11 +275,11 @@ export async function switchIntoCheckout(
 		const sm = ctx.sessionManager;
 		const state = readSourceState(sm);
 		const plan = planTargetSession(state);
-		const sessionDir = sm.getSessionDir();
+		const sessionDir = explicitSessionDir(sm);
 		target = materializeTargetSession({
 			plan,
 			targetCwd,
-			entries: sm.getBranch(),
+			entries: sm.getEntries(),
 			expectedLeafId: state.activeLeafId,
 			...(sessionDir ? { sessionDir } : {}),
 			...(state.sessionFile ? { parentSession: state.sessionFile } : {}),
@@ -269,7 +302,16 @@ export async function switchIntoCheckout(
 	// Let failures propagate to Pi's replacement handler: after teardown the
 	// captured command context is stale, so using it for a fallback is unsafe.
 	const result = await ctx.switchSession(target);
-	if (result.cancelled) return { moved: false, reason: "cancelled" };
+	if (result.cancelled) {
+		const cleanupError = removePreparedTarget(target);
+		return cleanupError
+			? {
+					moved: false,
+					reason: "failed",
+					detail: `Switch cancelled, but target cleanup failed: ${cleanupError}`,
+				}
+			: { moved: false, reason: "cancelled" };
+	}
 	if (
 		predecessorHandoff !== undefined &&
 		process.env.PI_WT_HANDOFF === predecessorHandoff
@@ -277,4 +319,17 @@ export async function switchIntoCheckout(
 		delete process.env.PI_WT_HANDOFF;
 	}
 	return { moved: true };
+}
+
+/** Preserve a caller-supplied session store; let Pi relocate its default. */
+function explicitSessionDir(
+	sm: ExtensionCommandContext["sessionManager"],
+): string | undefined {
+	if (
+		!("usesDefaultSessionDir" in sm) ||
+		typeof sm.usesDefaultSessionDir !== "function"
+	) {
+		throw new Error("Pi cannot identify whether the session store is custom.");
+	}
+	return sm.usesDefaultSessionDir() ? undefined : sm.getSessionDir();
 }

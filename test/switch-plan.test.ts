@@ -41,7 +41,7 @@ function state(
 		flushed: true,
 		persistedLeafId: "leaf-1",
 		activeLeafId: "leaf-1",
-		entryCount: 3,
+		totalEntryCount: 3,
 		...overrides,
 	};
 }
@@ -54,11 +54,11 @@ check("a flushed file that agrees with the session is forked", () => {
 });
 
 check("a session with nothing to carry produces an empty target", () => {
-	assert.deepEqual(planTargetSession(state({ entryCount: 0 })), {
+	assert.deepEqual(planTargetSession(state({ totalEntryCount: 0 })), {
 		kind: "empty",
 	});
 	assert.deepEqual(
-		planTargetSession(state({ entryCount: 0, flushed: false })),
+		planTargetSession(state({ totalEntryCount: 0, flushed: false })),
 		{ kind: "empty" },
 	);
 });
@@ -119,7 +119,7 @@ check("an unflushed session reports itself as such", () => {
 	assert.equal(observed.flushed, false);
 	assert.equal(observed.persistedLeafId, null);
 	assert.equal(observed.activeLeafId, sm.getLeafId());
-	assert.ok(observed.entryCount > 0);
+	assert.ok(observed.totalEntryCount > 0);
 	assert.equal(planTargetSession(observed).kind, "entries");
 });
 
@@ -132,14 +132,15 @@ check("an unflushed conversation reaches the target intact", () => {
 	const file = materializeTargetSession({
 		plan: planTargetSession(observed),
 		targetCwd: fx.worktree,
-		entries: sm.getBranch(),
+		entries: sm.getEntries(),
 		expectedLeafId: observed.activeLeafId,
 		sessionDir: fx.sessionDir,
+		orientation: { content: "orientation" },
 	});
 
 	const written = SessionManager.open(file);
 	assert.equal(written.getCwd(), fx.worktree);
-	assert.equal(written.getLeafId(), sm.getLeafId());
+	assert.equal(written.getLeafEntry()?.parentId, sm.getLeafId());
 	assert.ok(JSON.stringify(written.getEntries()).includes("carried-marker"));
 });
 
@@ -153,7 +154,7 @@ check("orientation is persisted after the carried conversation", () => {
 	const file = materializeTargetSession({
 		plan: planTargetSession(observed),
 		targetCwd: fx.worktree,
-		entries: sm.getBranch(),
+		entries: sm.getEntries(),
 		expectedLeafId: observed.activeLeafId,
 		sessionDir: fx.sessionDir,
 		orientation: {
@@ -186,9 +187,10 @@ check("a flushed conversation reaches the target intact", () => {
 	const file = materializeTargetSession({
 		plan: planTargetSession(observed),
 		targetCwd: fx.worktree,
-		entries: sm.getBranch(),
+		entries: sm.getEntries(),
 		expectedLeafId: observed.activeLeafId,
 		sessionDir: fx.sessionDir,
+		orientation: { content: "orientation" },
 	});
 
 	const written = SessionManager.open(file);
@@ -198,7 +200,7 @@ check("a flushed conversation reaches the target intact", () => {
 	assert.ok(carried.includes("reply-marker"));
 });
 
-check("an empty session yields a target with no entries", () => {
+check("an empty session attaches orientation at the root", () => {
 	const fx = fixture();
 	const sm = SessionManager.create(fx.repo, fx.sessionDir);
 
@@ -206,15 +208,76 @@ check("an empty session yields a target with no entries", () => {
 	const file = materializeTargetSession({
 		plan: planTargetSession(observed),
 		targetCwd: fx.worktree,
-		entries: sm.getBranch(),
+		entries: sm.getEntries(),
 		expectedLeafId: observed.activeLeafId,
 		sessionDir: fx.sessionDir,
+		orientation: { content: "orientation" },
 	});
 
 	const written = SessionManager.open(file);
 	assert.equal(written.getCwd(), fx.worktree);
-	assert.equal(written.getEntries().length, 0);
-	assert.equal(written.getLeafId(), null);
+	assert.equal(written.getEntries().length, 1);
+	assert.equal(written.getLeafEntry()?.parentId, null);
+});
+
+check("a reset leaf preserves the whole tree beside root orientation", () => {
+	const fx = fixture();
+	const sm = SessionManager.create(fx.repo, fx.sessionDir);
+	sm.appendMessage({ role: "user", content: "first-user" } as never);
+	sm.appendMessage({ role: "assistant", content: "first-assistant" } as never);
+	sm.appendMessage({ role: "user", content: "second-user" } as never);
+	sm.appendMessage({ role: "assistant", content: "second-assistant" } as never);
+	sm.resetLeaf();
+
+	const observed = readSourceState(sm);
+	assert.equal(observed.totalEntryCount, 4);
+	assert.equal(observed.activeLeafId, null);
+	assert.deepEqual(planTargetSession(observed), {
+		kind: "entries",
+		reason: "stale-leaf",
+	});
+
+	const file = materializeTargetSession({
+		plan: planTargetSession(observed),
+		targetCwd: fx.worktree,
+		entries: sm.getEntries(),
+		expectedLeafId: null,
+		sessionDir: fx.sessionDir,
+		orientation: { content: "root-orientation" },
+	});
+	const written = SessionManager.open(file);
+	const serialized = JSON.stringify(written.getEntries());
+	assert.match(serialized, /first-user/);
+	assert.match(serialized, /second-assistant/);
+	assert.equal(written.getLeafEntry()?.parentId, null);
+});
+
+check("a rewound leaf preserves sibling entries", () => {
+	const fx = fixture();
+	const sm = SessionManager.create(fx.repo, fx.sessionDir);
+	sm.appendMessage({ role: "user", content: "first-user" } as never);
+	sm.appendMessage({ role: "assistant", content: "selected-parent" } as never);
+	const selectedLeaf = sm.getLeafId();
+	sm.appendMessage({ role: "user", content: "abandoned-user" } as never);
+	sm.appendMessage({
+		role: "assistant",
+		content: "abandoned-assistant",
+	} as never);
+	assert.ok(selectedLeaf);
+	sm.branch(selectedLeaf);
+
+	const observed = readSourceState(sm);
+	const file = materializeTargetSession({
+		plan: planTargetSession(observed),
+		targetCwd: fx.worktree,
+		entries: sm.getEntries(),
+		expectedLeafId: selectedLeaf,
+		sessionDir: fx.sessionDir,
+		orientation: { content: "rewound-orientation" },
+	});
+	const written = SessionManager.open(file);
+	assert.match(JSON.stringify(written.getEntries()), /abandoned-assistant/);
+	assert.equal(written.getLeafEntry()?.parentId, selectedLeaf);
 });
 
 check("a target that does not resume the active branch is refused", () => {
@@ -227,11 +290,12 @@ check("a target that does not resume the active branch is refused", () => {
 			materializeTargetSession({
 				plan: { kind: "entries", reason: "unflushed" },
 				targetCwd: fx.worktree,
-				entries: sm.getBranch(),
+				entries: sm.getEntries(),
 				expectedLeafId: "a-leaf-the-entries-do-not-end-on",
 				sessionDir: fx.sessionDir,
+				orientation: { content: "orientation" },
 			}),
-		/does not resume the active branch/,
+		/does not contain the active leaf/,
 	);
 });
 
@@ -243,9 +307,10 @@ check("a trailing separator on the target is not a mismatch", () => {
 	const file = materializeTargetSession({
 		plan: { kind: "entries", reason: "unflushed" },
 		targetCwd: `${fx.worktree}${sep}`,
-		entries: sm.getBranch(),
+		entries: sm.getEntries(),
 		expectedLeafId: sm.getLeafId(),
 		sessionDir: fx.sessionDir,
+		orientation: { content: "orientation" },
 	});
 
 	assert.equal(SessionManager.open(file).getCwd(), fx.worktree);

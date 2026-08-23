@@ -13,11 +13,12 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	realpathSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -26,7 +27,11 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { encodeHandoff } from "../../extensions/worktree-handoff.ts";
-import { TRANSITION_MESSAGE_TYPE } from "../../extensions/worktree-switch.ts";
+import { createStore, receiptPath } from "../../extensions/worktree-receipt.ts";
+import {
+	TRANSITION_MESSAGE_TYPE,
+	TRANSITION_VERIFICATION_TYPE,
+} from "../../extensions/worktree-switch.ts";
 
 if (
 	!existsSync("/.dockerenv") ||
@@ -46,6 +51,8 @@ const git = (cwd: string, ...args: string[]) =>
 
 const extensionPath = new URL("../../extensions/worktree.ts", import.meta.url)
 	.pathname;
+let extraExtensionPaths: string[] = [];
+let extensionFlagValues: Map<string, string | boolean> | undefined;
 
 function fixture() {
 	const root = realpathSync(mkdtempSync(join(tmpdir(), "pi-wt-container-")));
@@ -65,7 +72,13 @@ function fixture() {
 	const sessionDir = join(root, "sessions");
 	mkdirSync(agentDir);
 	mkdirSync(sessionDir);
-	return { repo, worktree, agentDir, sessionDir };
+	return { root, repo, worktree, agentDir, sessionDir };
+}
+
+function addWorktree(fx: ReturnType<typeof fixture>, branch: string): string {
+	const path = join(fx.root, "repo.worktrees", branch.replaceAll("/", "-"));
+	git(fx.repo, "worktree", "add", "-b", branch, path);
+	return path;
 }
 
 const createRuntime: CreateAgentSessionRuntimeFactory = async ({
@@ -77,7 +90,10 @@ const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 	const services = await createAgentSessionServices({
 		cwd,
 		agentDir,
-		resourceLoaderOptions: { additionalExtensionPaths: [extensionPath] },
+		extensionFlagValues,
+		resourceLoaderOptions: {
+			additionalExtensionPaths: [extensionPath, ...extraExtensionPaths],
+		},
 	});
 	return {
 		...(await createAgentSessionFromServices({
@@ -104,17 +120,28 @@ async function bind(runtime: Runtime, notices: string[]) {
 			switchSession: async (sessionPath: string, options?: never) =>
 				runtime.switchSession(sessionPath, options),
 		} as never,
+		onError: ({ error }) => notices.push(`extension-error: ${error}`),
 	});
 	return runtime.session.extensionRunner;
+}
+
+async function attach(runtime: Runtime, notices: string[]) {
+	runtime.setRebindSession(async () => {
+		await bind(runtime, notices);
+	});
+	return bind(runtime, notices);
 }
 
 async function proveEnter(): Promise<void> {
 	const fx = fixture();
 	const notices: string[] = [];
+	const sourceManager = SessionManager.create(fx.repo);
+	const sourceSessionDir = sourceManager.getSessionDir();
+	const targetSessionDir = SessionManager.create(fx.worktree).getSessionDir();
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: fx.repo,
 		agentDir: fx.agentDir,
-		sessionManager: SessionManager.create(fx.repo, fx.sessionDir),
+		sessionManager: sourceManager,
 	});
 	delete process.env.TMUX;
 	delete process.env.CMUX_SURFACE_ID;
@@ -127,7 +154,7 @@ async function proveEnter(): Promise<void> {
 	});
 
 	try {
-		const runner = await bind(runtime, notices);
+		const runner = await attach(runtime, notices);
 		const command = runner.getCommand("worktree");
 		assert.ok(command, "the extension did not register /worktree");
 		await command.handler("enter feat/x", runner.createCommandContext());
@@ -139,6 +166,12 @@ async function proveEnter(): Promise<void> {
 		);
 		assert.equal(runtime.services.cwd, fx.worktree);
 		assert.equal(runtime.session.sessionManager.getCwd(), fx.worktree);
+		assert.notEqual(sourceSessionDir, targetSessionDir);
+		assert.equal(
+			runtime.session.sessionManager.getSessionDir(),
+			targetSessionDir,
+			"the target session stayed in the source checkout's default store",
+		);
 		assert.equal(
 			process.env.PI_WT_HANDOFF,
 			undefined,
@@ -183,6 +216,15 @@ async function proveEnter(): Promise<void> {
 			"orientation used the process cwd as the replacement location",
 		);
 
+		assert.ok(
+			entries.some(
+				(entry) =>
+					entry.type === "custom" &&
+					entry.customType === TRANSITION_VERIFICATION_TYPE,
+			),
+			"successful target verification was not persisted",
+		);
+
 		const context = runtime.session.sessionManager.buildSessionContext();
 		assert.ok(
 			JSON.stringify(context.messages).includes(
@@ -192,6 +234,134 @@ async function proveEnter(): Promise<void> {
 		);
 	} finally {
 		delete process.env.PI_WT_HANDOFF;
+		await runtime.dispose();
+	}
+}
+
+async function proveCancellationCleansTarget(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	const cancelExtension = join(fx.root, "cancel-switch.ts");
+	writeFileSync(
+		cancelExtension,
+		`export default function (pi) {\n  pi.on("session_before_switch", () => ({ cancel: true }));\n}\n`,
+	);
+	extraExtensionPaths = [cancelExtension];
+	const before = readdirSync(fx.sessionDir).sort();
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.repo,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.repo, fx.sessionDir),
+	});
+	process.env.PI_WT_HANDOFF = "predecessor-handoff";
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("enter feat/x", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(process.env.PI_WT_HANDOFF, "predecessor-handoff");
+		assert.deepEqual(readdirSync(fx.sessionDir).sort(), before);
+		assert.ok(notices.some((notice) => notice.includes("cancelled")));
+	} finally {
+		extraExtensionPaths = [];
+		delete process.env.PI_WT_HANDOFF;
+		await runtime.dispose();
+	}
+}
+
+async function proveCliFlagDoesNotReplay(): Promise<void> {
+	const fx = fixture();
+	const target = addWorktree(fx, "feat/y");
+	const notices: string[] = [];
+	extensionFlagValues = new Map([["worktree", "feat/x"]]);
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree, fx.sessionDir),
+	});
+
+	try {
+		const runner = await attach(runtime, notices);
+		assert.equal(runtime.cwd, fx.worktree);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("enter feat/y", runner.createCommandContext());
+		assert.equal(
+			runtime.cwd,
+			target,
+			`the replacement replayed --worktree feat/x: ${JSON.stringify(notices)}`,
+		);
+	} finally {
+		extensionFlagValues = undefined;
+		await runtime.dispose();
+	}
+}
+
+async function proveSuccessorVerification(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const corruptReceipt = receiptPath(createStore(commonDir), fx.worktree);
+	const mutationExtension = join(fx.root, "mutate-receipt.ts");
+	writeFileSync(
+		mutationExtension,
+		`import { mkdirSync, writeFileSync } from "node:fs";\nimport { dirname } from "node:path";\nconst receipt = ${JSON.stringify(corruptReceipt)};\nexport default function (pi) {\n  pi.on("session_before_switch", (event) => {\n    if (event.reason !== "resume") return;\n    mkdirSync(dirname(receipt), { recursive: true });\n    writeFileSync(receipt, "not-json");\n  });\n}\n`,
+	);
+	extraExtensionPaths = [mutationExtension];
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.repo,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.repo, fx.sessionDir),
+	});
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("enter feat/x", runner.createCommandContext());
+		assert.equal(runtime.cwd, fx.worktree);
+
+		const verificationMessages = runtime.session.sessionManager
+			.getEntries()
+			.filter(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(
+			verificationMessages.length,
+			1,
+			JSON.stringify({
+				entries: runtime.session.sessionManager.getEntries(),
+				notices,
+			}),
+		);
+		const verificationMessage = verificationMessages[0];
+		assert.equal(verificationMessage?.type, "custom_message");
+		if (verificationMessage?.type !== "custom_message") return;
+		assert.match(
+			String(verificationMessage.content),
+			/transition did NOT land as planned/i,
+		);
+
+		await runtime.session.reload();
+		await bind(runtime, notices);
+		const afterReload = runtime.session.sessionManager
+			.getEntries()
+			.filter(
+				(entry) =>
+					(entry.type === "custom" || entry.type === "custom_message") &&
+					entry.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(afterReload.length, 1);
+	} finally {
+		extraExtensionPaths = [];
 		await runtime.dispose();
 	}
 }
@@ -212,7 +382,7 @@ async function proveRelaunchHandoffIsConsumed(): Promise<void> {
 	});
 
 	try {
-		const runner = await bind(runtime, notices);
+		const runner = await attach(runtime, notices);
 		const first = await runner.emitBeforeAgentStart(
 			"anything",
 			undefined,
@@ -246,5 +416,8 @@ function escapeRegExp(value: string): string {
 }
 
 await proveEnter();
+await proveCancellationCleansTarget();
+await proveCliFlagDoesNotReplay();
+await proveSuccessorVerification();
 await proveRelaunchHandoffIsConsumed();
 console.log("container enter-switch e2e: OK");

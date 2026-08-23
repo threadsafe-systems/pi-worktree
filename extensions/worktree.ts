@@ -15,6 +15,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
@@ -35,7 +36,11 @@ import {
 } from "./worktree-handoff.ts";
 import { Type } from "typebox";
 import { shQuote } from "./worktree-shell.ts";
-import { switchIntoCheckout } from "./worktree-switch.ts";
+import {
+	switchIntoCheckout,
+	TRANSITION_MESSAGE_TYPE,
+	TRANSITION_VERIFICATION_TYPE,
+} from "./worktree-switch.ts";
 import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
 import {
 	acquireClaim,
@@ -1245,6 +1250,70 @@ async function relaunchInPlace(
 	});
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isSuccessorVerification(
+	value: unknown,
+): value is SuccessorVerification {
+	if (!isRecord(value)) return false;
+	return (
+		(value.kind === "enter" || value.kind === "dispose") &&
+		(value.status === "verified" ||
+			value.status === "partial" ||
+			value.status === "mismatch" ||
+			value.status === "legacy-unverified") &&
+		typeof value.checkedAt === "string" &&
+		isRecord(value.actual) &&
+		Array.isArray(value.issues)
+	);
+}
+
+function latestTransitionHandoff(
+	entries: readonly SessionEntry[],
+): TransitionHandoffV2 | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (
+			entry?.type !== "custom_message" ||
+			entry.customType !== TRANSITION_MESSAGE_TYPE ||
+			!isRecord(entry.details) ||
+			typeof entry.details.handoffB64 !== "string"
+		) {
+			continue;
+		}
+		const decoded = decodeTransitionHandoff(entry.details.handoffB64);
+		if (decoded?.version === 2) return decoded.handoff;
+	}
+	return null;
+}
+
+function storedTransitionVerification(
+	entries: readonly SessionEntry[],
+	operationId: string,
+): SuccessorVerification | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (
+			!entry ||
+			(entry.type !== "custom" && entry.type !== "custom_message") ||
+			entry.customType !== TRANSITION_VERIFICATION_TYPE
+		) {
+			continue;
+		}
+		const data = entry.type === "custom" ? entry.data : entry.details;
+		if (
+			isRecord(data) &&
+			data.operationId === operationId &&
+			isSuccessorVerification(data.verification)
+		) {
+			return data.verification;
+		}
+	}
+	return null;
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -1260,6 +1329,38 @@ export default function (pi: ExtensionAPI) {
 	let pendingTransition: PendingTransition | null = null;
 	/** Result of checking the hand-off this session woke up with, if any. */
 	let lastVerification: SuccessorVerification | null = null;
+
+	async function restoreOrVerifySessionTransition(
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const entries = ctx.sessionManager.getBranch();
+		const handoff = latestTransitionHandoff(entries);
+		if (!handoff) return;
+
+		const stored = storedTransitionVerification(entries, handoff.operationId);
+		if (stored) {
+			lastVerification = stored;
+			return;
+		}
+
+		const verification = await verifyTransition(handoff);
+		lastVerification = verification;
+		const data = { operationId: handoff.operationId, verification };
+		const caveat = transitionCaveat(verification);
+		if (caveat) {
+			pi.sendMessage(
+				{
+					customType: TRANSITION_VERIFICATION_TYPE,
+					content: caveat,
+					display: true,
+					details: data,
+				},
+				{ deliverAs: "followUp" },
+			);
+		} else {
+			pi.appendEntry(TRANSITION_VERIFICATION_TYPE, data);
+		}
+	}
 
 	// --- Model-callable worktree session helper ---
 	pi.registerTool({
@@ -1449,10 +1550,14 @@ export default function (pi: ExtensionAPI) {
 		typeof v === "string" && v.length > 0 ? v : undefined;
 
 	// --- Auto-detect worktree from cwd, or handle --worktree flag ---
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const flagValue = pi.getFlag("worktree") as string | boolean | undefined;
 
-		if (flagValue !== undefined && flagValue !== false) {
+		if (
+			event.reason === "startup" &&
+			flagValue !== undefined &&
+			flagValue !== false
+		) {
 			// --worktree was passed (with or without a name)
 			try {
 				const repoRoot = await getRepoRoot(pi);
@@ -1564,6 +1669,7 @@ export default function (pi: ExtensionAPI) {
 			pi.setSessionName(`wt:${worktreeBranch}`);
 			ctx.ui.setStatus("worktree", `🌿 ${worktreeBranch}`);
 		}
+		await restoreOrVerifySessionTransition(ctx);
 	});
 
 	// --- Inject worktree context (and a one-turn migration caveat) ---
@@ -2984,6 +3090,7 @@ export default function (pi: ExtensionAPI) {
 						operationId: decodedEnterHandoff.handoff.operationId,
 						targetCwd: targetPath,
 						targetBranch: entry.branch,
+						handoffB64,
 					},
 				},
 			});
