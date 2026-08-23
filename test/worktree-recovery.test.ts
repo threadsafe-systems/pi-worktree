@@ -74,6 +74,31 @@ await check("reflog-only commit is a recovery risk until tagged", async () => {
 	assert.equal(after.recoveryOids.includes(recoveryOid), false);
 });
 
+await check(
+	"a destroy snapshot treats its hard-deleted branch as non-durable",
+	async () => {
+		const fx = fixture();
+		writeFileSync(join(fx.worktree, "feature.txt"), "feature\n");
+		git(fx.worktree, "add", "feature.txt");
+		git(fx.worktree, "commit", "-m", "feature commit");
+		const featureOid = git(fx.worktree, "rev-parse", "HEAD");
+
+		const dispose = await inspectAdministrativeRecovery(fx.worktree);
+		assert.equal(dispose.recoveryOids.includes(featureOid), false);
+
+		const destroy = await inspectAdministrativeRecovery(fx.worktree, {
+			excludedDurableRefs: ["refs/heads/feat/x"],
+		});
+		assert.equal(destroy.recoveryOids.includes(featureOid), true);
+
+		git(fx.repo, "tag", "rescue", featureOid);
+		const rescued = await inspectAdministrativeRecovery(fx.worktree, {
+			excludedDurableRefs: ["refs/heads/feat/x"],
+		});
+		assert.equal(rescued.recoveryOids.includes(featureOid), false);
+	},
+);
+
 await check("detached worktree identity records a null branch", async () => {
 	const fx = fixture();
 	git(fx.worktree, "checkout", "--detach");
@@ -100,6 +125,22 @@ await check("unreferenced detached HEAD is risky without reflogs", async () => {
 	const recovery = await inspectAdministrativeRecovery(fx.worktree);
 	assert.equal(recovery.identity.head, detachedOid);
 	assert.equal(recovery.recoveryOids.includes(detachedOid), true);
+});
+
+await check("a pruned FETCH_HEAD object carries no recovery risk", async () => {
+	const fx = fixture();
+	const administrativePath = git(
+		fx.worktree,
+		"rev-parse",
+		"--absolute-git-dir",
+	);
+	const missingOid = "1".repeat(40);
+	writeFileSync(
+		join(administrativePath, "FETCH_HEAD"),
+		`${missingOid}\t\tbranch 'lost' of file:///missing\n`,
+	);
+	const recovery = await inspectAdministrativeRecovery(fx.worktree);
+	assert.equal(recovery.recoveryOids.includes(missingOid), false);
 });
 
 await check("symlinked administrative log entries fail closed", async () => {

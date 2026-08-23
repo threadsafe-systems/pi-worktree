@@ -171,6 +171,22 @@ await check(
 	},
 );
 
+await check("detached reports do not persist failing hook output", async () => {
+	const fx = await fixture();
+	writeOwner(fx.ownerFile, 4242);
+	const secret = "SUPER_SECRET_API_KEY=do-not-persist";
+	writeDetachedTeardownRequest(fx.requestFile, {
+		...fx.request,
+		preRemove: [`printf '${secret}\\n' >&2; exit 1`],
+	});
+	const result = await runDetachedTeardownRequest(fx.requestFile, 4242);
+	assert.equal(result.status, "refused");
+	assert.match(result.details.join("\n"), /SUPER_SECRET_API_KEY/);
+	const report = readReport(fx.reportFile);
+	assert.deepEqual(report.details, []);
+	assert.doesNotMatch(readFileSync(fx.reportFile, "utf8"), /SUPER_SECRET/);
+});
+
 await check(
 	"claim mismatch refuses without releasing another owner",
 	async () => {

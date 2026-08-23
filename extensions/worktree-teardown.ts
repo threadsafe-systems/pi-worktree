@@ -361,7 +361,7 @@ function buildReport(
 		reason: result.reason,
 		message: result.message,
 		changes: result.changes,
-		details: result.details,
+		details: result.reason === "hook-failed" ? [] : result.details,
 		stages: stageReport(result, request.preRemove.length > 0),
 		observed: {
 			pathPresent: existsSync(request.worktreePath),

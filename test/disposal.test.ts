@@ -466,9 +466,25 @@ await checkAsync(
 		const f = fixture();
 		const script = await scriptFor(f, { preRemove: ["true"] });
 		assert.doesNotMatch(script, /\bgit (?:worktree|branch)\b|\brm\s+-/);
+		assert.ok(script.startsWith(`'${process.execPath}' `));
 		assert.match(
 			script,
-			/^node '.+worktree-teardown\.ts' '.+\.request\.json' "\$1"$/,
+			/^'.+' '.+worktree-teardown\.ts' '.+\.request\.json' "\$1"$/,
+		);
+	},
+);
+
+await checkAsync(
+	"detached teardown pins the current Pi Node executable",
+	async () => {
+		const script = buildVerifiedTeardownScript({
+			requestFile: "/tmp/request with space.json",
+			nodePath: "/runtime/node with space",
+			entrypoint: "/package/worktree-teardown.ts",
+		});
+		assert.equal(
+			script,
+			"'/runtime/node with space' '/package/worktree-teardown.ts' '/tmp/request with space.json' \"$1\"",
 		);
 	},
 );

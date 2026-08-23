@@ -794,7 +794,7 @@ async function proveFailedHookPersistsPartialOutcome(): Promise<void> {
 			verification?: { status?: string; branchDisposition?: string };
 		};
 		assert.equal(details.verification?.status, "partial");
-		assert.equal(details.verification?.branchDisposition, "delete-failed");
+		assert.equal(details.verification?.branchDisposition, "not-attempted");
 		assert.match(String(entry.content), /hook-failed/);
 	} finally {
 		await runtime.dispose();
@@ -840,7 +840,7 @@ async function proveHookCreatedStateRefuses(): Promise<void> {
 			verification?: { status?: string; branchDisposition?: string };
 		};
 		assert.equal(details.verification?.status, "partial");
-		assert.equal(details.verification?.branchDisposition, "delete-failed");
+		assert.equal(details.verification?.branchDisposition, "not-attempted");
 		assert.match(String(entry.content), /ignored inventory/);
 	} finally {
 		await runtime.dispose();

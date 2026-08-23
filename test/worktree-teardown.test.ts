@@ -189,6 +189,32 @@ await check("preRemove hooks stop at the first failure", async () => {
 });
 
 await check(
+	"destroy revalidates with its hard-deleted branch excluded",
+	async () => {
+		const fx = fixture();
+		writeFileSync(join(fx.worktree, "feature.txt"), "feature\n");
+		git(fx.worktree, "add", "feature.txt");
+		git(fx.worktree, "commit", "-m", "feature");
+		const featureOid = git(fx.worktree, "rev-parse", "HEAD");
+		const approvedSnapshot = await inspectWorktreeSafety(fx.worktree, {
+			excludedDurableRefs: [`refs/heads/${fx.branch}`],
+		});
+		assert.equal(approvedSnapshot.recoveryOids.includes(featureOid), true);
+
+		const result = await executeWorktreeTeardown({
+			repoRoot: fx.repo,
+			worktreePath: fx.worktree,
+			branch: fx.branch,
+			mode: "destroy",
+			approvedSnapshot,
+		});
+		assert.equal(result.status, "complete");
+		assert.equal(result.branchDisposition, "deleted");
+		assert.equal(existsSync(fx.worktree), false);
+	},
+);
+
+await check(
 	"destroy removes the exact dirty snapshot a human approved",
 	async () => {
 		const fx = fixture();

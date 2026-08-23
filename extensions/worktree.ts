@@ -914,11 +914,12 @@ export {
 export function buildVerifiedTeardownScript(opts: {
 	requestFile: string;
 	entrypoint?: string;
+	nodePath?: string;
 }): string {
 	const entrypoint =
 		opts.entrypoint ??
 		join(dirname(fileURLToPath(import.meta.url)), "worktree-teardown.ts");
-	return `node ${shQuote(entrypoint)} ${shQuote(opts.requestFile)} "$1"`;
+	return `${shQuote(opts.nodePath ?? process.execPath)} ${shQuote(entrypoint)} ${shQuote(opts.requestFile)} "$1"`;
 }
 
 type InProcessDisposeResult = WorktreeTeardownResult;
@@ -1000,7 +1001,6 @@ function verificationBranchDisposition(
 	disposition: WorktreeTeardownResult["branchDisposition"],
 ): BranchDisposition {
 	if (disposition === "absent") return "deleted";
-	if (disposition === "not-attempted") return "delete-failed";
 	return disposition;
 }
 
@@ -1041,11 +1041,13 @@ function summarizeInProcessDisposal(opts: {
 			: "removed",
 		issues: complete ? [] : ["dispose-partial"],
 	};
-	let branchNote = "Branch cleanup was skipped or failed.";
+	let branchNote = "Branch cleanup failed.";
 	if (opts.disposed.branchDisposition === "deleted") {
 		branchNote = "The branch was deleted.";
 	} else if (opts.disposed.branchDisposition === "kept-unmerged") {
 		branchNote = "The unmerged branch was kept.";
+	} else if (opts.disposed.branchDisposition === "not-attempted") {
+		branchNote = "Branch cleanup was not attempted.";
 	}
 	if (complete) {
 		return {
@@ -3444,7 +3446,9 @@ export default function (pi: ExtensionAPI) {
 			}
 			let destroyed: WorktreeTeardownResult | null = null;
 			try {
-				const safety = await inspectWorktreeSafety(worktreePath);
+				const safety = await inspectWorktreeSafety(worktreePath, {
+					excludedDurableRefs: [`refs/heads/${branch}`],
+				});
 				const confirmation = formatDestroyConfirmation(safety, branch);
 				const ok = await ctx.ui.confirm(confirmation.title, confirmation.body);
 				if (!ok) return;

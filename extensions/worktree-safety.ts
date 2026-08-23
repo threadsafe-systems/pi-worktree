@@ -627,37 +627,84 @@ async function administrativeCandidates(
 	return [...new Set(candidates)].sort(compareStrings);
 }
 
-async function isDurablyReachable(
+async function gitObjectIsMissing(
 	runner: GitRunner,
 	worktreePath: string,
 	oid: string,
 ): Promise<boolean> {
 	const output = await runGit(
 		runner,
-		[
-			"for-each-ref",
-			"--format=%(refname)",
-			`--contains=${oid}`,
-			"refs/heads",
-			"refs/tags",
-			"refs/remotes",
-		],
+		["cat-file", "--batch-check=%(objectname) %(objecttype)"],
 		worktreePath,
+		`${oid}\n`,
 	);
+	const lines = nonEmptyLines(output, `git cat-file result for ${oid}`);
+	if (lines.length !== 1) {
+		throw new WorktreeSafetyError(
+			"Git returned an unexpected object-existence result.",
+		);
+	}
+	const line = lines[0] ?? "";
+	if (line === `${oid} missing`) return true;
+	const [objectName, objectType, ...extra] = line.split(" ");
+	if (
+		objectName === oid &&
+		/^(?:blob|commit|tag|tree)$/u.test(objectType ?? "") &&
+		extra.length === 0
+	) {
+		return false;
+	}
+	throw new WorktreeSafetyError(
+		"Git returned an unexpected object-existence result.",
+	);
+}
+
+type RecoveryReachability = "durable" | "missing" | "recovery-only";
+
+async function classifyRecoveryReachability(
+	runner: GitRunner,
+	worktreePath: string,
+	oid: string,
+	excludedRefs: ReadonlySet<string>,
+): Promise<RecoveryReachability> {
+	let output: string;
+	try {
+		output = await runGit(
+			runner,
+			[
+				"for-each-ref",
+				"--format=%(refname)",
+				`--contains=${oid}`,
+				"refs/heads",
+				"refs/tags",
+				"refs/remotes",
+			],
+			worktreePath,
+		);
+	} catch (error) {
+		if (await gitObjectIsMissing(runner, worktreePath, oid)) return "missing";
+		throw error;
+	}
+	let durable = false;
 	for (const ref of nonEmptyLines(output, `durable refs containing ${oid}`)) {
 		if (!/^refs\/(?:heads|tags|remotes)\/.+/u.test(ref)) {
 			throw new WorktreeSafetyError(
 				"Git returned an unexpected durable ref name.",
 			);
 		}
-		return true;
+		if (!excludedRefs.has(ref)) durable = true;
 	}
-	return false;
+	return durable ? "durable" : "recovery-only";
+}
+
+interface WorktreeSafetyInspectionOptions {
+	runner?: GitRunner;
+	excludedDurableRefs?: readonly string[];
 }
 
 export async function inspectAdministrativeRecovery(
 	worktreePath: string,
-	options: { runner?: GitRunner } = {},
+	options: WorktreeSafetyInspectionOptions = {},
 ): Promise<AdministrativeRecoveryInspection> {
 	const runner = options.runner ?? nodeGitRunner;
 	const gitDirOutput = await runGit(
@@ -700,11 +747,16 @@ export async function inspectAdministrativeRecovery(
 	const candidates = [...new Set([head, ...administrative])].sort(
 		compareStrings,
 	);
+	const excludedRefs = new Set(options.excludedDurableRefs ?? []);
 	const recoveryOids: string[] = [];
 	for (const oid of candidates) {
-		if (!(await isDurablyReachable(runner, worktreePath, oid))) {
-			recoveryOids.push(oid);
-		}
+		const reachability = await classifyRecoveryReachability(
+			runner,
+			worktreePath,
+			oid,
+			excludedRefs,
+		);
+		if (reachability === "recovery-only") recoveryOids.push(oid);
 	}
 	return {
 		administrativePath,
@@ -718,7 +770,7 @@ export async function inspectAdministrativeRecovery(
 
 export async function inspectWorktreeSafety(
 	worktreePath: string,
-	options: { runner?: GitRunner } = {},
+	options: WorktreeSafetyInspectionOptions = {},
 ): Promise<WorktreeSafetySnapshot> {
 	let canonicalPath: string;
 	try {
@@ -1018,7 +1070,11 @@ async function revalidateTeardown(
 ): Promise<TeardownGate<null>> {
 	let current: WorktreeSafetySnapshot;
 	try {
-		current = await inspectWorktreeSafety(options.worktreePath, { runner });
+		current = await inspectWorktreeSafety(options.worktreePath, {
+			runner,
+			excludedDurableRefs:
+				options.mode === "destroy" ? [`refs/heads/${options.branch}`] : [],
+		});
 	} catch (error) {
 		return {
 			ok: false,
