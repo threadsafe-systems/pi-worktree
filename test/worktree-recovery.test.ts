@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	inspectAdministrativeRecovery,
+	inspectWorktreeSafety,
 	WorktreeSafetyError,
 } from "../extensions/worktree-safety.ts";
 
@@ -142,6 +143,22 @@ await check("a pruned FETCH_HEAD object carries no recovery risk", async () => {
 	const recovery = await inspectAdministrativeRecovery(fx.worktree);
 	assert.equal(recovery.recoveryOids.includes(missingOid), false);
 });
+
+await check(
+	"a missing registered checkout explains safe manual recovery",
+	async () => {
+		const fx = fixture();
+		rmSync(fx.worktree, { recursive: true, force: true });
+		await assert.rejects(
+			inspectWorktreeSafety(fx.worktree),
+			(error) =>
+				error instanceof WorktreeSafetyError &&
+				/path is missing.*recovery state.*branch or tag.*git worktree prune/is.test(
+					error.message,
+				),
+		);
+	},
+);
 
 await check("symlinked administrative log entries fail closed", async () => {
 	const fx = fixture();

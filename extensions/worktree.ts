@@ -1004,6 +1004,18 @@ function verificationBranchDisposition(
 	return disposition;
 }
 
+export function teardownBranchNote(
+	disposition: WorktreeTeardownResult["branchDisposition"],
+): string {
+	if (disposition === "deleted") return "The branch was deleted.";
+	if (disposition === "kept-unmerged") return "The unmerged branch was kept.";
+	if (disposition === "absent") return "There was no branch to delete.";
+	if (disposition === "not-attempted") {
+		return "Branch cleanup was not attempted.";
+	}
+	return "Branch cleanup failed.";
+}
+
 function summarizeInProcessDisposal(opts: {
 	disposed: InProcessDisposeResult;
 	expected: CheckoutState;
@@ -1041,14 +1053,7 @@ function summarizeInProcessDisposal(opts: {
 			: "removed",
 		issues: complete ? [] : ["dispose-partial"],
 	};
-	let branchNote = "Branch cleanup failed.";
-	if (opts.disposed.branchDisposition === "deleted") {
-		branchNote = "The branch was deleted.";
-	} else if (opts.disposed.branchDisposition === "kept-unmerged") {
-		branchNote = "The unmerged branch was kept.";
-	} else if (opts.disposed.branchDisposition === "not-attempted") {
-		branchNote = "Branch cleanup was not attempted.";
-	}
+	const branchNote = teardownBranchNote(opts.disposed.branchDisposition);
 	if (complete) {
 		return {
 			verification,

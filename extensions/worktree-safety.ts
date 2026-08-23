@@ -776,6 +776,11 @@ export async function inspectWorktreeSafety(
 	try {
 		canonicalPath = realpathSync(worktreePath);
 	} catch (error) {
+		if (nodeErrorCode(error) === "ENOENT") {
+			throw new WorktreeSafetyError(
+				`The registered worktree path is missing: ${escapeForDisplay(worktreePath)}. Local and administrative recovery state cannot be inspected safely, so nothing was removed. Inspect the surviving branch and per-worktree reflog, preserve each needed commit with a branch or tag, then run git worktree prune manually.`,
+			);
+		}
 		throw new WorktreeSafetyError(
 			`Cannot resolve worktree path ${escapeForDisplay(worktreePath)}: ${error instanceof Error ? error.message : String(error)}`,
 		);

@@ -90,7 +90,7 @@ D1, D2, D3, D4, D5, D6, D7, D19.
 
 ### Deliverable
 
-Inspect the selected worktree's canonical administrative directory and collect candidate OIDs from reflogs, per-worktree refs, pseudorefs, and `FETCH_HEAD`. Reject symlinked/unexpected entries and read failures. Deduplicate candidates, then use Git ref-containment queries to retain only OIDs not reachable from local branches, tags, or remote-tracking refs.
+Inspect the selected worktree's canonical administrative directory and collect candidate OIDs from reflogs, per-worktree refs, pseudorefs, and `FETCH_HEAD`. Reject symlinked/unexpected entries and read failures. Deduplicate candidates, then use Git ref-containment queries to retain only OIDs not reachable from local branches, tags, or remote-tracking refs. Support excluding the target local branch when a downstream hard destroy will delete that ref.
 
 Temporary-repository tests must create a real reflog-only commit and prove that a branch or tag makes it durable.
 
@@ -118,7 +118,7 @@ D8, D9, D10, D19.
 Replace count-only disposal reasoning with structured policy:
 
 - dispose refusal lists exact protected, ignored, and recovery entries plus preservation guidance;
-- destroy confirmation lists the exact destructive snapshot and recovery warning;
+- destroy confirmation lists the exact destructive snapshot and recovery warning, treating its hard-deleted target branch as non-durable;
 - every Git-derived display value is sanitized;
 - snapshot mismatch diagnostics identify which inventory class changed;
 - model callers can receive refusal details but cannot authorize destructive loss.

@@ -10,7 +10,10 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { buildVerifiedTeardownScript } from "../extensions/worktree.ts";
+import {
+	buildVerifiedTeardownScript,
+	teardownBranchNote,
+} from "../extensions/worktree.ts";
 import {
 	acquireClaim,
 	canonicalJson,
@@ -470,6 +473,16 @@ await checkAsync(
 		assert.match(
 			script,
 			/^'.+' '.+worktree-teardown\.ts' '.+\.request\.json' "\$1"$/,
+		);
+	},
+);
+
+await checkAsync(
+	"an absent branch is reported as nothing to delete",
+	async () => {
+		assert.equal(
+			teardownBranchNote("absent"),
+			"There was no branch to delete.",
 		);
 	},
 );

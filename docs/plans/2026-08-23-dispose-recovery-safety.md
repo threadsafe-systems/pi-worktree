@@ -102,7 +102,7 @@ Resolve the selected worktree's absolute administrative directory through Git. R
 - `BISECT_HEAD`;
 - `FETCH_HEAD`.
 
-Validate every parsed object ID. For each candidate, ask Git whether a local branch, tag, or remote-tracking ref contains it. Candidates with no durable containing ref are recovery risks.
+Validate every parsed object ID. For each candidate, ask Git whether a local branch, tag, or remote-tracking ref contains it. Candidates with no durable containing ref are recovery risks. When classifying a destroy snapshot, exclude the target local branch because successful destroy hard-deletes that ref; any other containing branch, tag, or remote-tracking ref remains durable.
 
 Filesystem errors, unexpected administrative entry types, malformed files, unsupported sparse-rule verification, and Git failures refuse the operation rather than treating the corresponding inventory as empty.
 
@@ -114,7 +114,7 @@ After `preRemove`, take a fresh snapshot and require exact equality with the app
 
 ### Destroy policy
 
-Inspect before presenting confirmation. The confirmation lists all inventory and recovery-only OIDs, including an explicit warning that administrative pointers may disappear and commits may later be garbage-collected.
+Inspect before presenting confirmation, treating the target branch as non-durable because destroy will hard-delete it. The confirmation lists all inventory and recovery-only OIDs, including an explicit warning that the branch and administrative pointers may disappear and commits may later be garbage-collected.
 
 After confirmation, run `preRemove`, take a fresh snapshot, and require exact equality with the confirmed snapshot. Any change refuses before worktree or branch mutation. The user may inspect the new state and invoke destroy again.
 
