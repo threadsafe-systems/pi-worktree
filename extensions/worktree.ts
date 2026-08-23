@@ -938,11 +938,13 @@ function buildTeardownScript(
 	lines.push(
 		`git worktree remove --force ${shQuote(worktreePath)} 2>/dev/null || git worktree prune 2>/dev/null || true`,
 	);
-	lines.push(`if [ ! -e ${shQuote(worktreePath)} ]; then`);
-	lines.push(
-		`  git branch -${hardDelete ? "D" : "d"} ${shQuote(branch)} 2>/dev/null || true`,
-	);
-	lines.push("fi");
+	if (hardDelete) {
+		lines.push(`git branch -D ${shQuote(branch)} 2>/dev/null || true`);
+	} else {
+		lines.push(`if [ ! -e ${shQuote(worktreePath)} ]; then`);
+		lines.push(`  git branch -d ${shQuote(branch)} 2>/dev/null || true`);
+		lines.push("fi");
+	}
 	return lines.join("\n");
 }
 
@@ -1162,6 +1164,11 @@ function runAsyncProcess(
 	});
 }
 
+function normalizeHeadBranch(output: string): string | null {
+	const branch = output.trim();
+	return branch && branch !== "HEAD" ? branch : null;
+}
+
 async function observeCheckout(cwd: string): Promise<CheckoutState> {
 	const [top, head] = await Promise.all([
 		runAsyncProcess("git", ["rev-parse", "--show-toplevel"], {
@@ -1174,10 +1181,9 @@ async function observeCheckout(cwd: string): Promise<CheckoutState> {
 		}),
 	]);
 	const path = canonicalPath(top.exitCode === 0 ? top.stdout.trim() : cwd);
-	const headName = head.stdout.trim();
 	return {
 		path,
-		branch: head.exitCode === 0 && headName !== "HEAD" ? headName : null,
+		branch: head.exitCode === 0 ? normalizeHeadBranch(head.stdout) : null,
 		kind: isMainCheckout(path) ? "main" : "linked",
 	};
 }
@@ -3444,7 +3450,7 @@ export default function (pi: ExtensionAPI) {
 		const targetPath = canonicalPath(opts.worktreePath);
 		const destination: CheckoutState = {
 			path: canonicalPath(opts.repoRoot),
-			branch: destinationBranch.stdout.trim(),
+			branch: normalizeHeadBranch(destinationBranch.stdout),
 			kind: "main",
 		};
 		const store = createStore(await resolveGitCommonDir(opts.repoRoot));

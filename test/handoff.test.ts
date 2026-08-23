@@ -593,6 +593,7 @@ check("buildDestroyScript: shQuotes and hard-deletes the branch", () => {
 	]);
 	assert.match(s, /git worktree remove --force '\/repo.worktrees\/feat-x'/);
 	assert.match(s, /git branch -D 'feat\/x'/);
+	assert.doesNotMatch(s, /if \[ ! -e '\/repo\.worktrees\/feat-x' \]; then/);
 	assert.match(s, /dropdb foo/);
 });
 

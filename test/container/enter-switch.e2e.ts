@@ -565,6 +565,55 @@ async function proveDisposeSwitchesBeforeRemoval(): Promise<void> {
 	}
 }
 
+async function proveDetachedMainCanReceiveDisposal(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	git(fx.repo, "checkout", "--detach");
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree),
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(process.cwd(), fx.repo);
+		assert.equal(existsSync(fx.worktree), false);
+		assert.throws(() =>
+			git(fx.repo, "show-ref", "--verify", "refs/heads/feat/x"),
+		);
+		const entry = runtime.session.sessionManager
+			.getEntries()
+			.find(
+				(candidate) =>
+					candidate.type === "custom_message" &&
+					candidate.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(entry?.type, "custom_message");
+		if (entry?.type !== "custom_message") return;
+		const details = entry.details as {
+			verification?: {
+				status?: string;
+				expected?: { branch?: string | null };
+				actual?: { branch?: string | null };
+			};
+		};
+		assert.equal(details.verification?.status, "verified");
+		assert.equal(details.verification?.expected?.branch, null);
+		assert.equal(details.verification?.actual?.branch, null);
+	} finally {
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
 async function proveUnmergedBranchSurvivesDisposal(): Promise<void> {
 	const fx = fixture();
 	const notices: string[] = [];
@@ -755,6 +804,7 @@ await proveCliFlagDoesNotReplay();
 await proveSuccessorVerification();
 await proveRelaunchHandoffIsConsumed();
 await proveDisposeSwitchesBeforeRemoval();
+await proveDetachedMainCanReceiveDisposal();
 await proveUnmergedBranchSurvivesDisposal();
 await proveLandingMismatchSkipsTeardown();
 await proveFailedHookPersistsPartialOutcome();
