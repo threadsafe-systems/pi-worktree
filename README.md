@@ -304,7 +304,7 @@ there reaches those users on their next `pi update`. The rules:
 
 | Rule                                      | Setting                 |
 | ----------------------------------------- | ----------------------- |
-| Required checks                           | `check (node 22 \| 24)` |
+| Required checks                           | `check (node 22 \| 24)`, `container enter-switch` |
 | Branches up to date before merge (strict) | yes                     |
 | Pull request required                     | yes, 0 approvals        |
 | Conversation resolution required          | yes                     |
