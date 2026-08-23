@@ -15,6 +15,7 @@ import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import type {
@@ -35,6 +36,11 @@ import {
 } from "./worktree-handoff.ts";
 import { Type } from "typebox";
 import { shQuote } from "./worktree-shell.ts";
+import {
+	switchIntoCheckout,
+	TRANSITION_MESSAGE_TYPE,
+	TRANSITION_VERIFICATION_TYPE,
+} from "./worktree-switch.ts";
 import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
 import {
 	acquireClaim,
@@ -1244,6 +1250,70 @@ async function relaunchInPlace(
 	});
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function isSuccessorVerification(
+	value: unknown,
+): value is SuccessorVerification {
+	if (!isRecord(value)) return false;
+	return (
+		(value.kind === "enter" || value.kind === "dispose") &&
+		(value.status === "verified" ||
+			value.status === "partial" ||
+			value.status === "mismatch" ||
+			value.status === "legacy-unverified") &&
+		typeof value.checkedAt === "string" &&
+		isRecord(value.actual) &&
+		Array.isArray(value.issues)
+	);
+}
+
+function latestTransitionHandoff(
+	entries: readonly SessionEntry[],
+): TransitionHandoffV2 | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (
+			entry?.type !== "custom_message" ||
+			entry.customType !== TRANSITION_MESSAGE_TYPE ||
+			!isRecord(entry.details) ||
+			typeof entry.details.handoffB64 !== "string"
+		) {
+			continue;
+		}
+		const decoded = decodeTransitionHandoff(entry.details.handoffB64);
+		if (decoded?.version === 2) return decoded.handoff;
+	}
+	return null;
+}
+
+function storedTransitionVerification(
+	entries: readonly SessionEntry[],
+	operationId: string,
+): SuccessorVerification | null {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		if (
+			!entry ||
+			(entry.type !== "custom" && entry.type !== "custom_message") ||
+			entry.customType !== TRANSITION_VERIFICATION_TYPE
+		) {
+			continue;
+		}
+		const data = entry.type === "custom" ? entry.data : entry.details;
+		if (
+			isRecord(data) &&
+			data.operationId === operationId &&
+			isSuccessorVerification(data.verification)
+		) {
+			return data.verification;
+		}
+	}
+	return null;
+}
+
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -1259,6 +1329,38 @@ export default function (pi: ExtensionAPI) {
 	let pendingTransition: PendingTransition | null = null;
 	/** Result of checking the hand-off this session woke up with, if any. */
 	let lastVerification: SuccessorVerification | null = null;
+
+	async function restoreOrVerifySessionTransition(
+		ctx: ExtensionContext,
+	): Promise<void> {
+		const entries = ctx.sessionManager.getBranch();
+		const handoff = latestTransitionHandoff(entries);
+		if (!handoff) return;
+
+		const stored = storedTransitionVerification(entries, handoff.operationId);
+		if (stored) {
+			lastVerification = stored;
+			return;
+		}
+
+		const verification = await verifyTransition(handoff);
+		lastVerification = verification;
+		const data = { operationId: handoff.operationId, verification };
+		const caveat = transitionCaveat(verification);
+		if (caveat) {
+			pi.sendMessage(
+				{
+					customType: TRANSITION_VERIFICATION_TYPE,
+					content: caveat,
+					display: true,
+					details: data,
+				},
+				{ deliverAs: "followUp" },
+			);
+		} else {
+			pi.appendEntry(TRANSITION_VERIFICATION_TYPE, data);
+		}
+	}
 
 	// --- Model-callable worktree session helper ---
 	pi.registerTool({
@@ -1448,10 +1550,14 @@ export default function (pi: ExtensionAPI) {
 		typeof v === "string" && v.length > 0 ? v : undefined;
 
 	// --- Auto-detect worktree from cwd, or handle --worktree flag ---
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		const flagValue = pi.getFlag("worktree") as string | boolean | undefined;
 
-		if (flagValue !== undefined && flagValue !== false) {
+		if (
+			event.reason === "startup" &&
+			flagValue !== undefined &&
+			flagValue !== false
+		) {
 			// --worktree was passed (with or without a name)
 			try {
 				const repoRoot = await getRepoRoot(pi);
@@ -1563,11 +1669,12 @@ export default function (pi: ExtensionAPI) {
 			pi.setSessionName(`wt:${worktreeBranch}`);
 			ctx.ui.setStatus("worktree", `🌿 ${worktreeBranch}`);
 		}
+		await restoreOrVerifySessionTransition(ctx);
 	});
 
 	// --- Inject worktree context (and a one-turn migration caveat) ---
 	let handoffShown = false;
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		let extra = "";
 		if (worktreeBranch) {
 			extra +=
@@ -1595,6 +1702,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		// One-turn orientation when this session was forked across a worktree hop.
 		const handoffEnv = process.env.PI_WT_HANDOFF;
+		if (handoffEnv) delete process.env.PI_WT_HANDOFF;
 		if (!handoffShown && handoffEnv) {
 			const decoded = decodeTransitionHandoff(handoffEnv);
 			if (decoded?.version === 1) {
@@ -1604,7 +1712,7 @@ export default function (pi: ExtensionAPI) {
 					new Date().toISOString(),
 					decoded.legacy.kind ?? "enter",
 				);
-				extra += `\n\n${legacyCaveat(decoded.legacy, process.cwd(), worktreeBranch ?? "")}`;
+				extra += `\n\n${legacyCaveat(decoded.legacy, ctx.cwd, worktreeBranch ?? "")}`;
 			} else if (decoded?.version === 2) {
 				handoffShown = true;
 				// The predecessor's claim is only a claim; check it before letting
@@ -1620,7 +1728,7 @@ export default function (pi: ExtensionAPI) {
 							: { ignored: decoded.handoff.ignored }),
 						kind: decoded.handoff.kind,
 					},
-					process.cwd(),
+					ctx.cwd,
 					worktreeBranch ?? "",
 				)}`;
 				const caveat = transitionCaveat(lastVerification);
@@ -1934,6 +2042,9 @@ export default function (pi: ExtensionAPI) {
 	) {
 		return {
 			content: [{ type: "text" as const, text: message }],
+			// SAFETY: TransitionDetails is a closed set of JSON-serialisable
+			// fields, so it satisfies the index signature a tool result requires.
+			// An interface has no index signature, so inference cannot see that.
 			details: details as unknown as Record<string, unknown>,
 			...(terminate ? { terminate: true } : {}),
 		};
@@ -2015,6 +2126,9 @@ export default function (pi: ExtensionAPI) {
 				defaultWorktreeBase: getWorktreeDir(repoRoot, config),
 			};
 			return toolResult(
+				// SAFETY: built field by field above to match the status arm of
+				// TransitionDetails; a union cannot be narrowed to one arm by the
+				// shape of an object literal alone.
 				status as unknown as TransitionDetails,
 				`repoRoot: ${repoRoot}\n` +
 					`discipline: ${marker?.enforce === true ? "on" : "off"}\n` +
@@ -2825,7 +2939,7 @@ export default function (pi: ExtensionAPI) {
 						"Usage:\n" +
 							"  /worktree [type/name]     — Create a worktree (auto-generates name if omitted)\n" +
 							"  /worktree create [type/name] — Same as above\n" +
-							"  /worktree enter <type/name> — Reopen pi inside an existing linked worktree\n" +
+							"  /worktree enter <type/name> — Switch this session into an existing linked worktree\n" +
 							"  /worktree dispose         — Leave this worktree, remove it, reopen pi in the main repo\n" +
 							"  /worktree destroy <branch> — Destroy a worktree from the main checkout\n" +
 							"  /worktree list            — List all worktrees\n" +
@@ -2863,7 +2977,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("worktree-enter", {
 		description:
-			"Enter an existing linked git worktree, reopening pi there (shortcut for /worktree enter)",
+			"Enter an existing linked git worktree by switching this session there (shortcut for /worktree enter)",
 		handler: async (args, ctx) => handleEnter(args?.trim() || "", ctx),
 	});
 
@@ -2952,30 +3066,49 @@ export default function (pi: ExtensionAPI) {
 				store,
 				sessionFile,
 			});
-			const relaunched = await relaunchInPlace(
-				entry.path,
-				entry.branch,
-				sessionFile,
-				handoffB64,
-				continuationFor(ctx, "enter", entry.path),
-			);
-			if (!relaunched) {
-				ctx.ui.notify(
-					`✅ Worktree "${entry.branch}" found.\n` +
-						`   Path:   ${entry.path}\n` +
-						`   Branch: ${entry.branch}\n` +
-						`   Start PI: cd ${entry.path} && pi`,
-					"info",
-				);
-				return;
+			const decodedEnterHandoff = decodeTransitionHandoff(handoffB64);
+			if (decodedEnterHandoff?.version !== 2) {
+				throw new Error("Could not prepare the worktree transition handoff.");
 			}
-			ctx.shutdown();
-		} catch (err) {
-			ctx.ui.setStatus("worktree", undefined);
-			ctx.ui.notify(
-				`Failed to enter worktree: ${(err as Error).message}`,
-				"error",
+			const orientation = legacyCaveat(
+				{
+					parentCwd: decodedEnterHandoff.handoff.source.path,
+					parentBranch: decodedEnterHandoff.handoff.source.branch ?? "",
+					uncommitted: decodedEnterHandoff.handoff.uncommitted,
+					...(decodedEnterHandoff.handoff.ignored === undefined
+						? {}
+						: { ignored: decodedEnterHandoff.handoff.ignored }),
+					kind: "enter",
+				},
+				targetPath,
+				entry.branch,
 			);
+			const switched = await switchIntoCheckout(ctx, targetPath, {
+				orientation: {
+					content: orientation,
+					details: {
+						operationId: decodedEnterHandoff.handoff.operationId,
+						targetCwd: targetPath,
+						targetBranch: entry.branch,
+						handoffB64,
+					},
+				},
+			});
+			if (switched.moved) return;
+			ctx.ui.notify(
+				switched.reason === "cancelled"
+					? `Workspace switch cancelled. Worktree retained at ${entry.path}.`
+					: `Could not prepare the target session${switched.detail ? `: ${switched.detail}` : "."}\nWorktree retained at ${entry.path}. Re-run /worktree enter ${entry.branch} after resolving the problem.`,
+				"warning",
+			);
+		} catch (err) {
+			const message = `Failed to enter worktree: ${(err as Error).message}`;
+			try {
+				ctx.ui.setStatus("worktree", undefined);
+				ctx.ui.notify(message, "error");
+			} catch {
+				console.error(message);
+			}
 		}
 	}
 
