@@ -696,6 +696,147 @@ export async function inspectAdministrativeRecovery(
 	};
 }
 
+export async function inspectWorktreeSafety(
+	worktreePath: string,
+	options: { runner?: GitRunner } = {},
+): Promise<WorktreeSafetySnapshot> {
+	let canonicalPath: string;
+	try {
+		canonicalPath = realpathSync(worktreePath);
+	} catch (error) {
+		throw new WorktreeSafetyError(
+			`Cannot resolve worktree path ${escapeForDisplay(worktreePath)}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const [inventory, recovery] = await Promise.all([
+		inspectWorktreeInventory(canonicalPath, options),
+		inspectAdministrativeRecovery(canonicalPath, options),
+	]);
+	return normalizeSafetySnapshot({
+		worktreePath: canonicalPath,
+		administrativePath: recovery.administrativePath,
+		identity: recovery.identity,
+		protected: inventory.protected,
+		ignored: inventory.ignored,
+		recoveryOids: recovery.recoveryOids,
+	});
+}
+
+function formattedEntries(
+	entries: readonly WorktreeInventoryEntry[],
+): string[] {
+	return entries.map((entry) => `- ${formatInventoryEntry(entry)}`);
+}
+
+export function disposeSafetyReason(
+	snapshot: WorktreeSafetySnapshot,
+): string | null {
+	const normalized = normalizeSafetySnapshot(snapshot);
+	if (
+		normalized.protected.length === 0 &&
+		normalized.ignored.length === 0 &&
+		normalized.recoveryOids.length === 0
+	) {
+		return null;
+	}
+	const lines = [
+		`Refusing to dispose ${escapeForDisplay(normalized.worktreePath)} because removal would discard worktree-local or recovery data.`,
+	];
+	if (normalized.protected.length > 0) {
+		lines.push(
+			"Protected worktree data:",
+			...formattedEntries(normalized.protected),
+		);
+	}
+	if (normalized.ignored.length > 0) {
+		lines.push(
+			"Ignored worktree data:",
+			...formattedEntries(normalized.ignored),
+		);
+	}
+	if (normalized.recoveryOids.length > 0) {
+		lines.push(
+			"Recovery-only commits not contained by a local branch, tag, or remote-tracking ref:",
+			...normalized.recoveryOids.map((oid) => `- ${oid}`),
+		);
+	}
+	lines.push(
+		"Commit, remove, or move local data and preserve each recovery commit with a branch or tag before retrying.",
+	);
+	return lines.join("\n");
+}
+
+export function formatDestroyConfirmation(
+	snapshot: WorktreeSafetySnapshot,
+	branch: string,
+): { title: string; body: string } {
+	const normalized = normalizeSafetySnapshot(snapshot);
+	const hasLocalData =
+		normalized.protected.length > 0 || normalized.ignored.length > 0;
+	const hasRecoveryData = normalized.recoveryOids.length > 0;
+	let title = "Destroy worktree";
+	if (hasLocalData && hasRecoveryData) {
+		title = "Destroy worktree and discard local and recovery data";
+	} else if (hasLocalData) {
+		title = "Destroy worktree and discard local data";
+	} else if (hasRecoveryData) {
+		title = "Destroy worktree and discard recovery history";
+	}
+	const lines = [
+		`Remove ${escapeForDisplay(normalized.worktreePath)} and hard-delete branch ${escapeForDisplay(branch)}?`,
+	];
+	if (normalized.protected.length > 0) {
+		lines.push(
+			"Protected worktree data:",
+			...formattedEntries(normalized.protected),
+		);
+	}
+	if (normalized.ignored.length > 0) {
+		lines.push(
+			"Ignored worktree data:",
+			...formattedEntries(normalized.ignored),
+		);
+	}
+	if (hasRecoveryData) {
+		lines.push(
+			"Recovery-only commits whose administrative pointers will be removed and may later be garbage-collected:",
+			...normalized.recoveryOids.map((oid) => `- ${oid}`),
+		);
+	}
+	if (!hasLocalData && !hasRecoveryData) {
+		lines.push("No protected, ignored, or recovery-only state was found.");
+	}
+	return { title, body: lines.join("\n") };
+}
+
+export function describeSafetySnapshotChanges(
+	approved: WorktreeSafetySnapshot,
+	current: WorktreeSafetySnapshot,
+): string[] {
+	const left = normalizeSafetySnapshot(approved);
+	const right = normalizeSafetySnapshot(current);
+	const changes: string[] = [];
+	if (
+		left.worktreePath !== right.worktreePath ||
+		left.administrativePath !== right.administrativePath ||
+		JSON.stringify(left.identity) !== JSON.stringify(right.identity)
+	) {
+		changes.push("worktree identity");
+	}
+	if (JSON.stringify(left.protected) !== JSON.stringify(right.protected)) {
+		changes.push("protected inventory");
+	}
+	if (JSON.stringify(left.ignored) !== JSON.stringify(right.ignored)) {
+		changes.push("ignored inventory");
+	}
+	if (
+		JSON.stringify(left.recoveryOids) !== JSON.stringify(right.recoveryOids)
+	) {
+		changes.push("recovery history");
+	}
+	return changes;
+}
+
 export function parseReflogOids(value: string, source: string): string[] {
 	const oids: string[] = [];
 	for (const line of nonEmptyLines(value, source)) {

@@ -33,6 +33,7 @@ import {
 	worktreeDisciplinePrompt,
 	worktreeLocationHint,
 } from "../extensions/worktree.ts";
+import type { WorktreeSafetySnapshot } from "../extensions/worktree-safety.ts";
 
 let fail = 0;
 let total = 0;
@@ -409,6 +410,30 @@ check(
 		);
 	},
 );
+
+check("unsafeDisposeReason: renders a structured safety snapshot", () => {
+	const snapshot: WorktreeSafetySnapshot = {
+		worktreePath: "/repo.worktrees/feat-x",
+		administrativePath: "/repo/.git/worktrees/feat-x",
+		identity: { head: "a".repeat(40), branch: "refs/heads/feat/x" },
+		protected: [
+			{
+				kind: "index-flag",
+				path: "hidden file",
+				flags: ["assume-unchanged"],
+			},
+		],
+		ignored: [],
+		recoveryOids: ["b".repeat(40)],
+	};
+	const reason = unsafeDisposeReason({
+		cwd: "/repo",
+		worktreePath: snapshot.worktreePath,
+		snapshot,
+	});
+	assert.match(reason ?? "", /index flag assume-unchanged: hidden file/);
+	assert.match(reason ?? "", new RegExp("b".repeat(40)));
+});
 
 check("branchToDirName: slashes collapse to hyphens", () => {
 	assert.equal(

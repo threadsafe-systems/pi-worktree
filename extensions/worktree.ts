@@ -35,6 +35,12 @@ import {
 	verifyEnter,
 } from "./worktree-handoff.ts";
 import { Type } from "typebox";
+import {
+	disposeSafetyReason,
+	formatDestroyConfirmation,
+	inspectWorktreeSafety,
+	type WorktreeSafetySnapshot,
+} from "./worktree-safety.ts";
 import { shQuote } from "./worktree-shell.ts";
 import {
 	type ReplacementSessionContext,
@@ -596,20 +602,25 @@ export function summarizeWorktreeStatus(porcelainWithIgnored: string): {
 	return { uncommitted, ignored };
 }
 
-export function unsafeDisposeReason(opts: {
-	cwd: string;
-	sessionFile?: string;
-	worktreePath: string;
-	porcelainWithIgnored: string;
-	/** A waiter can safely remove the live checkout only after Pi exits. */
-	allowLiveCwd?: boolean;
-}): string | null {
+export function unsafeDisposeReason(
+	opts: {
+		cwd: string;
+		sessionFile?: string;
+		worktreePath: string;
+		/** A waiter can safely remove the live checkout only after Pi exits. */
+		allowLiveCwd?: boolean;
+	} & (
+		| { snapshot: WorktreeSafetySnapshot; porcelainWithIgnored?: never }
+		| { porcelainWithIgnored: string; snapshot?: never }
+	),
+): string | null {
 	if (!opts.allowLiveCwd && isPathInside(opts.cwd, opts.worktreePath)) {
 		return `Refusing to dispose ${opts.worktreePath} because the current pi session is running inside that worktree.`;
 	}
 	if (opts.sessionFile && isPathInside(opts.sessionFile, opts.worktreePath)) {
 		return `Refusing to dispose ${opts.worktreePath} because the session file (${opts.sessionFile}) is inside that worktree.`;
 	}
+	if (opts.snapshot) return disposeSafetyReason(opts.snapshot);
 	const { uncommitted, ignored } = summarizeWorktreeStatus(
 		opts.porcelainWithIgnored,
 	);
@@ -2828,19 +2839,22 @@ export default function (pi: ExtensionAPI) {
 			kind: "linked",
 		};
 
-		const dirty = await pi.exec("git", ["status", "--porcelain", "--ignored"], {
-			cwd: entry.path,
-			timeout: 5_000,
-		});
-		if (dirty.code !== 0)
-			return refuse("git-failed", "could not read the worktree status.");
+		let safety: WorktreeSafetySnapshot;
+		try {
+			safety = await inspectWorktreeSafety(entry.path);
+		} catch (error) {
+			return refuse(
+				"git-failed",
+				`could not inspect worktree removal safety: ${error instanceof Error ? error.message : String(error)}`,
+			);
+		}
 		const unsafeReason = unsafeDisposeReason({
 			cwd: ctx.cwd,
 			...(currentSessionFile(ctx)
 				? { sessionFile: currentSessionFile(ctx) }
 				: {}),
 			worktreePath: entry.path,
-			porcelainWithIgnored: dirty.stdout,
+			snapshot: safety,
 			allowLiveCwd: live,
 		});
 		if (unsafeReason) {
@@ -3556,22 +3570,12 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const st = await pi.exec("git", ["status", "--porcelain", "--ignored"], {
-				cwd: worktreePath,
-				timeout: 5_000,
-			});
-			if (st.code !== 0) {
-				ctx.ui.notify(
-					"Could not read the worktree status; nothing was removed.",
-					"error",
-				);
-				return;
-			}
+			const safety = await inspectWorktreeSafety(worktreePath);
 			const unsafeReason = unsafeDisposeReason({
 				cwd: ctx.cwd,
 				...(sessionFile ? { sessionFile } : {}),
 				worktreePath,
-				porcelainWithIgnored: st.stdout,
+				snapshot: safety,
 				allowLiveCwd: true,
 			});
 			if (unsafeReason) {
@@ -3643,10 +3647,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const ok = await ctx.ui.confirm(
-				"Destroy worktree?",
-				`This will remove ${worktreePath} and hard-delete branch ${branch}.`,
-			);
+			const safety = await inspectWorktreeSafety(worktreePath);
+			const confirmation = formatDestroyConfirmation(safety, branch);
+			const ok = await ctx.ui.confirm(confirmation.title, confirmation.body);
 			if (!ok) return;
 
 			const step = (msg: string) => ctx.ui.setStatus("worktree", msg);

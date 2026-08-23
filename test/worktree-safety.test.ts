@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import {
+	describeSafetySnapshotChanges,
+	disposeSafetyReason,
 	escapeForDisplay,
+	formatDestroyConfirmation,
 	formatInventoryEntry,
 	normalizeSafetySnapshot,
 	parseFetchHeadOids,
@@ -177,6 +180,82 @@ check(
 		);
 	},
 );
+
+check("dispose refusal lists exact inventory and recovery objects", () => {
+	const snapshot: WorktreeSafetySnapshot = {
+		worktreePath: "/repo.worktrees/feat-\u001b",
+		administrativePath: "/repo/.git/worktrees/feat-x",
+		identity: { head: SHA1_A, branch: "refs/heads/feat/x" },
+		protected: [
+			{
+				kind: "index-flag",
+				path: "hidden\nfile",
+				flags: ["assume-unchanged"],
+			},
+		],
+		ignored: [{ kind: "ignored", path: "local.cache" }],
+		recoveryOids: [SHA1_B],
+	};
+	const reason = disposeSafetyReason(snapshot);
+	assert.match(reason ?? "", /feat-\\x1b/);
+	assert.match(reason ?? "", /index flag assume-unchanged: hidden\\nfile/);
+	assert.match(reason ?? "", /ignored: local\.cache/);
+	assert.match(reason ?? "", new RegExp(SHA1_B));
+	assert.doesNotMatch(reason ?? "", /\b[123] file/);
+	assert.equal(
+		disposeSafetyReason({
+			...snapshot,
+			protected: [],
+			ignored: [],
+			recoveryOids: [],
+		}),
+		null,
+	);
+});
+
+check("destroy confirmation identifies every approved risk category", () => {
+	const snapshot: WorktreeSafetySnapshot = {
+		worktreePath: "/repo.worktrees/feat-x",
+		administrativePath: "/repo/.git/worktrees/feat-x",
+		identity: { head: SHA1_A, branch: "refs/heads/feat/x" },
+		protected: [{ kind: "status", status: " M", path: "tracked.txt" }],
+		ignored: [{ kind: "ignored", path: "local.cache" }],
+		recoveryOids: [SHA1_B],
+	};
+	const confirmation = formatDestroyConfirmation(snapshot, "feat/x");
+	assert.match(confirmation.title, /discard local and recovery data/i);
+	assert.match(confirmation.body, /status {2}M: tracked\.txt/);
+	assert.match(confirmation.body, /ignored: local\.cache/);
+	assert.match(confirmation.body, new RegExp(SHA1_B));
+	assert.match(confirmation.body, /hard-delete branch feat\/x/);
+});
+
+check("snapshot mismatch names each changed class", () => {
+	const approved: WorktreeSafetySnapshot = {
+		worktreePath: "/repo.worktrees/feat-x",
+		administrativePath: "/repo/.git/worktrees/feat-x",
+		identity: { head: SHA1_A, branch: "refs/heads/feat/x" },
+		protected: [],
+		ignored: [],
+		recoveryOids: [],
+	};
+	assert.deepEqual(
+		describeSafetySnapshotChanges(approved, {
+			...approved,
+			identity: { ...approved.identity, head: SHA1_B },
+			protected: [{ kind: "status", status: "??", path: "new" }],
+			ignored: [{ kind: "ignored", path: "cache" }],
+			recoveryOids: [SHA1_B],
+		}),
+		[
+			"worktree identity",
+			"protected inventory",
+			"ignored inventory",
+			"recovery history",
+		],
+	);
+	assert.deepEqual(describeSafetySnapshotChanges(approved, approved), []);
+});
 
 if (failed > 0) {
 	console.error(`worktree safety tests: ${failed} FAILED of ${total}`);
