@@ -19,9 +19,9 @@
  * target must preserve the complete tree while attaching its orientation to
  * the active leaf, including the root state where that leaf is null.
  *
- * Note that the OS working directory of the process is untouched: pi never
- * calls `process.chdir`. `ctx.cwd` moves, `process.cwd()` does not, so anything
- * downstream that wants to know where the session is must read the context.
+ * The switch itself leaves the OS working directory untouched: pi never calls
+ * `process.chdir`. `ctx.cwd` moves, `process.cwd()` does not, so callers that
+ * will remove the launch directory must align the process cwd after replacement.
  */
 
 import { existsSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -31,6 +31,13 @@ import {
 	SessionManager,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
+
+type SwitchSessionOptions = NonNullable<
+	Parameters<ExtensionCommandContext["switchSession"]>[1]
+>;
+export type ReplacementSessionContext = Parameters<
+	NonNullable<SwitchSessionOptions["withSession"]>
+>[0];
 
 /** How the target session document should be produced. */
 export type TargetSessionPlan =
@@ -261,12 +268,16 @@ export type SwitchOutcome =
  *
  * A failure here leaves the checkout alone. The worktree exists either way,
  * and destroying it because the session could not follow would turn a
- * recoverable problem into a lost one.
+ * recoverable problem into a lost one. `afterSwitch` runs with the fresh
+ * replacement context; if it throws, the source context is already stale.
  */
 export async function switchIntoCheckout(
 	ctx: ExtensionCommandContext,
 	targetCwd: string,
-	options: { orientation: TargetOrientation },
+	options: {
+		orientation: TargetOrientation;
+		afterSwitch?: (ctx: ReplacementSessionContext) => Promise<void>;
+	},
 ): Promise<SwitchOutcome> {
 	let target: string;
 	try {
@@ -301,7 +312,9 @@ export async function switchIntoCheckout(
 	// switchSession tears the old runtime down before constructing the new one.
 	// Let failures propagate to Pi's replacement handler: after teardown the
 	// captured command context is stale, so using it for a fallback is unsafe.
-	const result = await ctx.switchSession(target);
+	const result = await ctx.switchSession(target, {
+		...(options.afterSwitch ? { withSession: options.afterSwitch } : {}),
+	});
 	if (result.cancelled) {
 		const cleanupError = removePreparedTarget(target);
 		return cleanupError

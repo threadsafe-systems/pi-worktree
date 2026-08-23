@@ -3,7 +3,7 @@
  *
  * This file is deliberately outside `test/*.test.ts`: the normal suite must
  * never call `switchSession`. It loads the real extension into a real runtime,
- * invokes the registered `/worktree enter` command, and replaces that runtime
+ * invokes the registered session-switching commands, and replaces that runtime
  * inside a disposable container whose process and session store can be lost.
  */
 
@@ -411,6 +411,88 @@ async function proveRelaunchHandoffIsConsumed(): Promise<void> {
 	}
 }
 
+async function proveDisposeSwitchesBeforeRemoval(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	const sourceManager = SessionManager.create(fx.worktree);
+	sourceManager.appendMessage({
+		role: "user",
+		content: "carried-dispose-marker",
+	} as never);
+	sourceManager.appendMessage({
+		role: "assistant",
+		content: "ready-to-leave",
+	} as never);
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: sourceManager,
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command, "the extension did not register /worktree");
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(
+			runtime.cwd,
+			fx.repo,
+			`runtime stayed in the disposed worktree: ${JSON.stringify(notices)}`,
+		);
+		assert.equal(runtime.session.sessionManager.getCwd(), fx.repo);
+		assert.equal(
+			process.cwd(),
+			fx.repo,
+			"the OS cwd still names the removed launch directory",
+		);
+		assert.equal(existsSync(fx.worktree), false, "the worktree path survived");
+		assert.doesNotMatch(
+			git(fx.repo, "worktree", "list", "--porcelain"),
+			new RegExp(escapeRegExp(fx.worktree)),
+		);
+		assert.throws(() =>
+			git(fx.repo, "show-ref", "--verify", "refs/heads/feat/x"),
+		);
+
+		const entries = runtime.session.sessionManager.getEntries();
+		assert.ok(
+			JSON.stringify(entries).includes("carried-dispose-marker"),
+			"the replacement lost the source conversation",
+		);
+		const disposalOrientation = entries.find(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === TRANSITION_MESSAGE_TYPE,
+		);
+		assert.equal(
+			disposalOrientation?.type,
+			"custom_message",
+			"the replacement has no disposal orientation",
+		);
+		if (disposalOrientation?.type === "custom_message") {
+			assert.doesNotMatch(
+				String(disposalOrientation.content),
+				/forked|shutdown/i,
+				"the orientation describes a process relaunch that did not happen",
+			);
+		}
+		assert.ok(
+			entries.some(
+				(entry) =>
+					(entry.type === "custom" || entry.type === "custom_message") &&
+					entry.customType === TRANSITION_VERIFICATION_TYPE,
+			),
+			"the disposal result was not persisted",
+		);
+	} finally {
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -420,4 +502,5 @@ await proveCancellationCleansTarget();
 await proveCliFlagDoesNotReplay();
 await proveSuccessorVerification();
 await proveRelaunchHandoffIsConsumed();
-console.log("container enter-switch e2e: OK");
+await proveDisposeSwitchesBeforeRemoval();
+console.log("container session-switch e2e: OK");

@@ -185,10 +185,10 @@ check("no relaunch path can construct a v1 handoff", () => {
 	);
 });
 
-check("both teardown paths write a report the successor can read", () => {
-	// Dispose verification treats a missing report as partial, so a caller that
-	// emits a v2 dispose handoff must also produce a report, or a complete
-	// teardown reports itself as incomplete.
+check("both live-disposal mechanisms persist successor verification", () => {
+	// Relaunch disposal writes a report for the next process. In-process disposal
+	// observes teardown directly and writes that result into the replacement
+	// session instead.
 	const source = readFileSync(join(ROOT, "extensions/worktree.ts"), "utf-8");
 	const scheduleLive = source.slice(
 		source.indexOf("async function scheduleLiveDisposal"),
@@ -199,16 +199,36 @@ check("both teardown paths write a report the successor can read", () => {
 		"live disposal must use the reporting teardown",
 	);
 
-	const slashDispose = source.slice(
-		source.indexOf("async function handleDispose"),
+	const inProcessSwitch = source.slice(
+		source.indexOf("async function switchAndDisposeLiveCheckout"),
+		source.indexOf("// --- Dispose handler"),
 	);
 	assert.match(
-		slashDispose.slice(0, 4000),
-		/scheduleLiveDisposal\(/,
-		"the slash command must share the live disposal machinery, not duplicate it",
+		inProcessSwitch,
+		/switchIntoCheckout\(/,
+		"the slash command must leave the worktree before removing it",
+	);
+	assert.match(
+		inProcessSwitch,
+		/finishInProcessDisposal\(/,
+		"the replacement session must perform the teardown",
+	);
+	const inProcessTeardown = source.slice(
+		source.indexOf("async function finishInProcessDisposal"),
+		source.indexOf("Build the teardown script for `/worktree destroy`"),
+	);
+	assert.match(inProcessTeardown, /runInProcessDisposal\(/);
+	assert.match(
+		inProcessTeardown,
+		/TRANSITION_VERIFICATION_TYPE/,
+		"the replacement session must persist the observed teardown result",
+	);
+	const slashDispose = source.slice(
+		source.indexOf("async function handleDispose"),
+		source.indexOf("// --- Destroy handler ---"),
 	);
 	assert.doesNotMatch(
-		slashDispose.slice(0, 4000),
+		slashDispose,
 		/ctx\.ui\.confirm\(/,
 		"clean disposal must not wait for an interactive confirmation",
 	);
