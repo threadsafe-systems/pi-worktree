@@ -428,9 +428,14 @@ check(
 		const iRemove = s.indexOf(
 			"git worktree remove --force '/repo.worktrees/feat-x'",
 		);
+		const iPathGone = s.indexOf("if [ ! -e '/repo.worktrees/feat-x' ]; then");
 		const iBranch = s.indexOf("git branch -d 'feat/x'");
 		assert.ok(
-			iHook >= 0 && iCd > iHook && iRemove > iCd && iBranch > iRemove,
+			iHook >= 0 &&
+				iCd > iHook &&
+				iRemove > iCd &&
+				iPathGone > iRemove &&
+				iBranch > iPathGone,
 			s,
 		);
 	},

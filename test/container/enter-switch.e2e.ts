@@ -18,7 +18,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -27,7 +27,11 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { encodeHandoff } from "../../extensions/worktree-handoff.ts";
-import { createStore, receiptPath } from "../../extensions/worktree-receipt.ts";
+import {
+	claimPath,
+	createStore,
+	receiptPath,
+} from "../../extensions/worktree-receipt.ts";
 import {
 	TRANSITION_MESSAGE_TYPE,
 	TRANSITION_VERIFICATION_TYPE,
@@ -414,6 +418,30 @@ async function proveRelaunchHandoffIsConsumed(): Promise<void> {
 async function proveDisposeSwitchesBeforeRemoval(): Promise<void> {
 	const fx = fixture();
 	const notices: string[] = [];
+	const heartbeat = join(fx.root, "dispose-heartbeat");
+	const heartbeatExtension = join(fx.root, "dispose-heartbeat.ts");
+	writeFileSync(
+		heartbeatExtension,
+		`import { writeFileSync } from "node:fs";\nexport default function (pi) {\n  pi.on("session_start", (event) => {\n    if (event.reason !== "resume") return;\n    let ticks = 0;\n    writeFileSync(${JSON.stringify(heartbeat)}, "0");\n    globalThis.__piWorktreeDisposeHeartbeat = setInterval(() => writeFileSync(${JSON.stringify(heartbeat)}, String(++ticks)), 10);\n  });\n}\n`,
+	);
+	mkdirSync(join(fx.repo, ".pi"));
+	writeFileSync(
+		join(fx.repo, ".pi", "worktree.json"),
+		JSON.stringify({
+			preRemove: [
+				`before=$(cat ${heartbeat}); sleep 0.2; after=$(cat ${heartbeat}); [ "$after" -gt "$before" ]`,
+			],
+		}),
+	);
+	extraExtensionPaths = [heartbeatExtension];
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const store = createStore(commonDir);
+	const receipt = receiptPath(store, fx.worktree);
+	mkdirSync(dirname(receipt), { recursive: true });
+	writeFileSync(receipt, "successful-receipt");
 	const sourceManager = SessionManager.create(fx.worktree);
 	sourceManager.appendMessage({
 		role: "user",
@@ -456,6 +484,16 @@ async function proveDisposeSwitchesBeforeRemoval(): Promise<void> {
 		assert.throws(() =>
 			git(fx.repo, "show-ref", "--verify", "refs/heads/feat/x"),
 		);
+		assert.equal(
+			existsSync(receipt),
+			false,
+			"successful teardown kept receipt",
+		);
+		assert.equal(
+			existsSync(claimPath(store, fx.worktree)),
+			false,
+			"successful teardown leaked its lifecycle claim",
+		);
 
 		const entries = runtime.session.sessionManager.getEntries();
 		assert.ok(
@@ -479,14 +517,228 @@ async function proveDisposeSwitchesBeforeRemoval(): Promise<void> {
 				"the orientation describes a process relaunch that did not happen",
 			);
 		}
-		assert.ok(
-			entries.some(
-				(entry) =>
-					(entry.type === "custom" || entry.type === "custom_message") &&
-					entry.customType === TRANSITION_VERIFICATION_TYPE,
-			),
+		const verificationEntry = entries.find(
+			(entry) =>
+				entry.type === "custom_message" &&
+				entry.customType === TRANSITION_VERIFICATION_TYPE,
+		);
+		assert.equal(
+			verificationEntry?.type,
+			"custom_message",
 			"the disposal result was not persisted",
 		);
+		if (verificationEntry?.type !== "custom_message") return;
+		const verificationDetails = verificationEntry.details as {
+			verification?: {
+				status?: string;
+				branchDisposition?: string;
+				pathDisposition?: string;
+				registrationDisposition?: string;
+				receiptDisposition?: string;
+			};
+		};
+		assert.equal(verificationDetails.verification?.status, "verified");
+		assert.equal(
+			verificationDetails.verification?.branchDisposition,
+			"deleted",
+		);
+		assert.equal(verificationDetails.verification?.pathDisposition, "removed");
+		assert.equal(
+			verificationDetails.verification?.registrationDisposition,
+			"removed",
+		);
+		assert.equal(
+			verificationDetails.verification?.receiptDisposition,
+			"removed",
+		);
+	} finally {
+		const heartbeatGlobal = globalThis as typeof globalThis & {
+			__piWorktreeDisposeHeartbeat?: ReturnType<typeof setInterval>;
+		};
+		if (heartbeatGlobal.__piWorktreeDisposeHeartbeat) {
+			clearInterval(heartbeatGlobal.__piWorktreeDisposeHeartbeat);
+			delete heartbeatGlobal.__piWorktreeDisposeHeartbeat;
+		}
+		extraExtensionPaths = [];
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
+async function proveUnmergedBranchSurvivesDisposal(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	writeFileSync(join(fx.worktree, "feature.txt"), "unmerged\n");
+	git(fx.worktree, "add", "feature.txt");
+	git(fx.worktree, "commit", "-m", "unmerged work");
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const store = createStore(commonDir);
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree),
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(existsSync(fx.worktree), false);
+		assert.doesNotThrow(() =>
+			git(fx.repo, "show-ref", "--verify", "refs/heads/feat/x"),
+		);
+		assert.throws(() =>
+			git(fx.repo, "merge-base", "--is-ancestor", "feat/x", "main"),
+		);
+		assert.equal(existsSync(claimPath(store, fx.worktree)), false);
+		const entry = runtime.session.sessionManager
+			.getEntries()
+			.find(
+				(candidate) =>
+					candidate.type === "custom_message" &&
+					candidate.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(entry?.type, "custom_message");
+		if (entry?.type !== "custom_message") return;
+		const details = entry.details as {
+			verification?: { status?: string; branchDisposition?: string };
+		};
+		assert.equal(details.verification?.status, "verified");
+		assert.equal(details.verification?.branchDisposition, "kept-unmerged");
+	} finally {
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
+async function proveLandingMismatchSkipsTeardown(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	const mutationExtension = join(fx.root, "change-main-branch.ts");
+	writeFileSync(
+		mutationExtension,
+		`import { execFileSync } from "node:child_process";\nexport default function (pi) {\n  pi.on("session_start", (event) => {\n    if (event.reason === "resume") execFileSync("git", ["switch", "-c", "moved-main"], { cwd: ${JSON.stringify(fx.repo)} });\n  });\n}\n`,
+	);
+	extraExtensionPaths = [mutationExtension];
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const store = createStore(commonDir);
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree),
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(process.cwd(), fx.repo);
+		assert.equal(
+			git(fx.repo, "rev-parse", "--abbrev-ref", "HEAD"),
+			"moved-main",
+		);
+		assert.equal(
+			existsSync(fx.worktree),
+			true,
+			"a landing mismatch still removed the worktree",
+		);
+		assert.equal(existsSync(claimPath(store, fx.worktree)), false);
+		const entry = runtime.session.sessionManager
+			.getEntries()
+			.find(
+				(candidate) =>
+					candidate.type === "custom_message" &&
+					candidate.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(entry?.type, "custom_message");
+		if (entry?.type !== "custom_message") return;
+		const details = entry.details as {
+			verification?: {
+				status?: string;
+				expected?: { branch?: string };
+				actual?: { branch?: string };
+			};
+		};
+		assert.equal(details.verification?.status, "mismatch");
+		assert.equal(details.verification?.expected?.branch, "main");
+		assert.equal(details.verification?.actual?.branch, "moved-main");
+	} finally {
+		extraExtensionPaths = [];
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
+async function proveFailedHookPersistsPartialOutcome(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	mkdirSync(join(fx.repo, ".pi"));
+	writeFileSync(
+		join(fx.repo, ".pi", "worktree.json"),
+		JSON.stringify({ preRemove: ["echo hook-failed >&2; exit 42"] }),
+	);
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const store = createStore(commonDir);
+	const receipt = receiptPath(store, fx.worktree);
+	mkdirSync(dirname(receipt), { recursive: true });
+	writeFileSync(receipt, "retained-receipt");
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree),
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(process.cwd(), fx.repo);
+		assert.equal(existsSync(fx.worktree), true);
+		assert.equal(existsSync(receipt), true, "partial teardown removed receipt");
+		assert.equal(
+			existsSync(claimPath(store, fx.worktree)),
+			false,
+			"partial teardown leaked its lifecycle claim",
+		);
+		const entry = runtime.session.sessionManager
+			.getEntries()
+			.find(
+				(candidate) =>
+					candidate.type === "custom_message" &&
+					candidate.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(entry?.type, "custom_message");
+		if (entry?.type !== "custom_message") return;
+		const details = entry.details as {
+			verification?: { status?: string; branchDisposition?: string };
+		};
+		assert.equal(details.verification?.status, "partial");
+		assert.equal(details.verification?.branchDisposition, "delete-failed");
+		assert.match(String(entry.content), /hook-failed/);
 	} finally {
 		await runtime.dispose();
 		process.chdir(originalProcessCwd);
@@ -503,4 +755,7 @@ await proveCliFlagDoesNotReplay();
 await proveSuccessorVerification();
 await proveRelaunchHandoffIsConsumed();
 await proveDisposeSwitchesBeforeRemoval();
+await proveUnmergedBranchSurvivesDisposal();
+await proveLandingMismatchSkipsTeardown();
+await proveFailedHookPersistsPartialOutcome();
 console.log("container session-switch e2e: OK");

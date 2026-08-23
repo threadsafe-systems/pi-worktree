@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -938,9 +938,11 @@ function buildTeardownScript(
 	lines.push(
 		`git worktree remove --force ${shQuote(worktreePath)} 2>/dev/null || git worktree prune 2>/dev/null || true`,
 	);
+	lines.push(`if [ ! -e ${shQuote(worktreePath)} ]; then`);
 	lines.push(
-		`git branch -${hardDelete ? "D" : "d"} ${shQuote(branch)} 2>/dev/null || true`,
+		`  git branch -${hardDelete ? "D" : "d"} ${shQuote(branch)} 2>/dev/null || true`,
 	);
+	lines.push("fi");
 	return lines.join("\n");
 }
 
@@ -1125,51 +1127,106 @@ interface InProcessDisposeResult {
 	stderr: string;
 	pathGone: boolean;
 	registrationGone: boolean;
-	branchKept: boolean;
+	branchDisposition: BranchDisposition;
 }
 
-function runInProcessDisposal(
+interface AsyncProcessResult {
+	exitCode: number;
+	stdout: string;
+	stderr: string;
+}
+
+function runAsyncProcess(
+	command: string,
+	args: string[],
+	opts: { cwd: string; timeout: number },
+): Promise<AsyncProcessResult> {
+	return new Promise((resolveProcess) => {
+		execFile(
+			command,
+			args,
+			{
+				cwd: opts.cwd,
+				encoding: "utf8",
+				maxBuffer: 16 * 1024 * 1024,
+				timeout: opts.timeout,
+			},
+			(error, stdout, stderr) => {
+				let exitCode = 0;
+				if (error) {
+					exitCode = typeof error.code === "number" ? error.code : 1;
+				}
+				resolveProcess({ exitCode, stdout, stderr });
+			},
+		);
+	});
+}
+
+async function observeCheckout(cwd: string): Promise<CheckoutState> {
+	const [top, head] = await Promise.all([
+		runAsyncProcess("git", ["rev-parse", "--show-toplevel"], {
+			cwd,
+			timeout: 5_000,
+		}),
+		runAsyncProcess("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+			cwd,
+			timeout: 5_000,
+		}),
+	]);
+	const path = canonicalPath(top.exitCode === 0 ? top.stdout.trim() : cwd);
+	const headName = head.stdout.trim();
+	return {
+		path,
+		branch: head.exitCode === 0 && headName !== "HEAD" ? headName : null,
+		kind: isMainCheckout(path) ? "main" : "linked",
+	};
+}
+
+async function runInProcessDisposal(
 	repoRoot: string,
 	worktreePath: string,
 	branch: string,
 	preRemove?: string[],
-): InProcessDisposeResult {
-	const teardown = spawnSync(
+): Promise<InProcessDisposeResult> {
+	const teardown = await runAsyncProcess(
 		"bash",
 		["-c", buildDisposeScript(repoRoot, worktreePath, branch, preRemove)],
-		{
+		{ cwd: repoRoot, timeout: 130_000 },
+	);
+	const [listed, branchRef] = await Promise.all([
+		runAsyncProcess("git", ["worktree", "list", "--porcelain"], {
 			cwd: repoRoot,
-			encoding: "utf8",
-			timeout: 130_000,
-		},
-	);
-	const listed = spawnSync("git", ["worktree", "list", "--porcelain"], {
-		cwd: repoRoot,
-		encoding: "utf8",
-		timeout: 5_000,
-	});
-	const branchRef = spawnSync(
-		"git",
-		["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
-		{ cwd: repoRoot, encoding: "utf8", timeout: 5_000 },
-	);
+			timeout: 5_000,
+		}),
+		runAsyncProcess(
+			"git",
+			["show-ref", "--verify", "--quiet", `refs/heads/${branch}`],
+			{ cwd: repoRoot, timeout: 5_000 },
+		),
+	]);
+	const pathGone = !existsSync(worktreePath);
+	let branchDisposition: BranchDisposition = "delete-failed";
+	if (teardown.exitCode === 0 && pathGone) {
+		branchDisposition = branchRef.exitCode === 0 ? "kept-unmerged" : "deleted";
+	}
 	return {
-		exitCode: teardown.status ?? 1,
-		stdout: teardown.stdout ?? "",
-		stderr: teardown.stderr ?? teardown.error?.message ?? "",
-		pathGone: !existsSync(worktreePath),
+		exitCode: teardown.exitCode,
+		stdout: teardown.stdout,
+		stderr: teardown.stderr,
+		pathGone,
 		registrationGone:
-			listed.status === 0 &&
-			!parseWorktreeList(listed.stdout ?? "").some(
+			listed.exitCode === 0 &&
+			!parseWorktreeList(listed.stdout).some(
 				(entry) => canonicalPath(entry.path) === canonicalPath(worktreePath),
 			),
-		branchKept: branchRef.status === 0,
+		branchDisposition,
 	};
 }
 
 function summarizeInProcessDisposal(opts: {
 	disposed: InProcessDisposeResult;
-	destination: CheckoutState;
+	expected: CheckoutState;
+	actual: CheckoutState;
 	targetPath: string;
 	branch: string;
 	store: ReceiptStore;
@@ -1189,9 +1246,9 @@ function summarizeInProcessDisposal(opts: {
 		status: complete ? "verified" : "partial",
 		operationId: opts.operationId,
 		checkedAt: new Date().toISOString(),
-		expected: opts.destination,
-		actual: opts.destination,
-		branchDisposition: opts.disposed.branchKept ? "kept-unmerged" : "deleted",
+		expected: opts.expected,
+		actual: opts.actual,
+		branchDisposition: opts.disposed.branchDisposition,
 		pathDisposition: opts.disposed.pathGone ? "removed" : "present",
 		registrationDisposition: opts.disposed.registrationGone
 			? "removed"
@@ -1201,9 +1258,12 @@ function summarizeInProcessDisposal(opts: {
 			: "removed",
 		issues: complete ? [] : ["dispose-partial"],
 	};
-	const branchNote = opts.disposed.branchKept
-		? "The unmerged branch was kept."
-		: "The branch was deleted.";
+	let branchNote = "Branch cleanup was skipped or failed.";
+	if (opts.disposed.branchDisposition === "deleted") {
+		branchNote = "The branch was deleted.";
+	} else if (opts.disposed.branchDisposition === "kept-unmerged") {
+		branchNote = "The unmerged branch was kept.";
+	}
 	if (complete) {
 		return {
 			verification,
@@ -1231,7 +1291,43 @@ async function finishInProcessDisposal(opts: {
 	operationId: string;
 }): Promise<void> {
 	process.chdir(opts.destination.path);
-	const disposed = runInProcessDisposal(
+	opts.ctx.ui.setStatus("worktree", undefined);
+	const actual = await observeCheckout(opts.destination.path);
+	if (
+		actual.path !== opts.destination.path ||
+		actual.branch !== opts.destination.branch ||
+		actual.kind !== opts.destination.kind
+	) {
+		const verification: SuccessorVerification = {
+			kind: "dispose",
+			status: "mismatch",
+			operationId: opts.operationId,
+			checkedAt: new Date().toISOString(),
+			expected: opts.destination,
+			actual,
+			branchDisposition: "unknown",
+			pathDisposition: existsSync(opts.targetPath) ? "present" : "removed",
+			receiptDisposition: existsSync(receiptPath(opts.store, opts.targetPath))
+				? "present"
+				: "removed",
+			issues: ["target-conflict"],
+		};
+		await opts.ctx.sendMessage(
+			{
+				customType: TRANSITION_VERIFICATION_TYPE,
+				content: transitionCaveat(verification),
+				display: true,
+				details: { operationId: opts.operationId, verification },
+			},
+			{ triggerTurn: false, deliverAs: "followUp" },
+		);
+		opts.ctx.ui.notify(
+			"The main checkout changed while this session was moving. Nothing was removed.",
+			"warning",
+		);
+		return;
+	}
+	const disposed = await runInProcessDisposal(
 		opts.destination.path,
 		opts.targetPath,
 		opts.branch,
@@ -1242,7 +1338,8 @@ async function finishInProcessDisposal(opts: {
 	}
 	const summary = summarizeInProcessDisposal({
 		disposed,
-		destination: opts.destination,
+		expected: opts.destination,
+		actual,
 		targetPath: opts.targetPath,
 		branch: opts.branch,
 		store: opts.store,
