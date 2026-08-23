@@ -270,3 +270,4 @@ Every DoD item has one owning implementation task and at least one downstream in
 - Exact post-hook equality intentionally requires a second invocation when a hook changes the approved snapshot.
 - The active branch is local and unpushed until the advisory implementation reaches PR review.
 - T1 escapes control bytes in diagnostics instead of deleting them, preserving path distinctions while preventing terminal interpretation.
+- T2 enumerates initialized submodule paths with Git's recursive `submodule foreach`, then inspects each checkout independently; this avoids parsing human-oriented submodule descriptions while keeping every Git call argv-based.

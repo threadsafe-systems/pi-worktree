@@ -1,3 +1,6 @@
+import { spawn } from "node:child_process";
+import { isAbsolute, posix, relative, resolve, sep } from "node:path";
+
 export type IndexFlag = "assume-unchanged" | "skip-worktree";
 
 export type WorktreeInventoryEntry =
@@ -35,6 +38,94 @@ export class WorktreeSafetyError extends Error {
 		this.name = "WorktreeSafetyError";
 	}
 }
+
+export interface GitResult {
+	code: number;
+	stdout: string;
+	stderr: string;
+	killed: boolean;
+}
+
+export interface GitRunOptions {
+	cwd: string;
+	input?: string;
+	timeout?: number;
+}
+
+export type GitRunner = (
+	args: readonly string[],
+	options: GitRunOptions,
+) => Promise<GitResult>;
+
+const GIT_TIMEOUT_MS = 10_000;
+const MAX_GIT_OUTPUT_BYTES = 16 * 1024 * 1024;
+
+const nodeGitRunner: GitRunner = (args, options) =>
+	new Promise((resolveGit, rejectGit) => {
+		const child = spawn("git", [...args], {
+			cwd: options.cwd,
+			stdio: ["pipe", "pipe", "pipe"],
+		});
+		const stdout: Buffer[] = [];
+		const stderr: Buffer[] = [];
+		let outputBytes = 0;
+		let timedOut = false;
+		let overflow = false;
+		let settled = false;
+		const finish = (callback: () => void) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			callback();
+		};
+		const collect = (target: Buffer[]) => (chunk: Buffer) => {
+			outputBytes += chunk.length;
+			if (outputBytes > MAX_GIT_OUTPUT_BYTES) {
+				overflow = true;
+				child.kill("SIGTERM");
+				return;
+			}
+			target.push(chunk);
+		};
+		const timer = setTimeout(() => {
+			timedOut = true;
+			child.kill("SIGTERM");
+		}, options.timeout ?? GIT_TIMEOUT_MS);
+		child.stdout.on("data", collect(stdout));
+		child.stderr.on("data", collect(stderr));
+		child.on("error", (error) =>
+			finish(() =>
+				rejectGit(
+					new WorktreeSafetyError(`Could not start Git: ${error.message}`),
+				),
+			),
+		);
+		child.on("close", (code, signal) =>
+			finish(() => {
+				if (overflow) {
+					rejectGit(new WorktreeSafetyError("Git output exceeded 16 MiB."));
+					return;
+				}
+				resolveGit({
+					code: code ?? 1,
+					stdout: Buffer.concat(stdout).toString("utf8"),
+					stderr: Buffer.concat(stderr).toString("utf8"),
+					killed: timedOut || signal !== null,
+				});
+			}),
+		);
+		child.stdin.on("error", (error: NodeJS.ErrnoException) => {
+			if (error.code === "EPIPE") return;
+			finish(() =>
+				rejectGit(
+					new WorktreeSafetyError(
+						`Could not write Git input: ${error.message}`,
+					),
+				),
+			);
+		});
+		child.stdin.end(options.input ?? "");
+	});
 
 function splitTerminated(
 	value: string,
@@ -145,6 +236,208 @@ export function parseIndexFlagEntries(value: string): WorktreeInventoryEntry[] {
 		if (flags.length > 0) entries.push({ kind: "index-flag", path, flags });
 	}
 	return entries;
+}
+
+async function runGit(
+	runner: GitRunner,
+	args: readonly string[],
+	cwd: string,
+	input?: string,
+): Promise<string> {
+	const result = await runner(args, {
+		cwd,
+		...(input === undefined ? {} : { input }),
+	});
+	if (result.killed) {
+		throw new WorktreeSafetyError(
+			`git ${args.slice(0, 2).join(" ")} timed out.`,
+		);
+	}
+	if (result.code !== 0) {
+		const detail = escapeForDisplay(
+			(result.stderr || result.stdout).trim() || `exit ${result.code}`,
+		);
+		throw new WorktreeSafetyError(
+			`git ${args.slice(0, 2).join(" ")} failed: ${detail}`,
+		);
+	}
+	return result.stdout;
+}
+
+function parseNulPaths(value: string, source: string): string[] {
+	const paths = splitTerminated(value, "\0", source);
+	if (paths.some((path) => !path)) {
+		throw new WorktreeSafetyError(`${source} contains an empty path.`);
+	}
+	return paths;
+}
+
+async function sparseManagedPaths(
+	runner: GitRunner,
+	cwd: string,
+	candidates: readonly string[],
+): Promise<ReadonlySet<string>> {
+	if (candidates.length === 0) return new Set();
+	const configArgs = ["config", "--bool", "--get", "core.sparseCheckout"];
+	const config = await runner(configArgs, { cwd });
+	if (config.killed) {
+		throw new WorktreeSafetyError("git config sparseCheckout timed out.");
+	}
+	if (config.code === 1 || config.stdout.trim() === "false") return new Set();
+	if (config.code !== 0 || config.stdout.trim() !== "true") {
+		throw new WorktreeSafetyError(
+			"Git could not determine whether sparse checkout is active.",
+		);
+	}
+	const checkArgs = ["sparse-checkout", "check-rules", "-z"];
+	const result = await runner(checkArgs, {
+		cwd,
+		input: `${candidates.join("\0")}\0`,
+	});
+	if (result.killed || result.code !== 0) {
+		throw new WorktreeSafetyError(
+			`git sparse-checkout check-rules failed: ${escapeForDisplay((result.stderr || result.stdout).trim() || `exit ${result.code}`)}`,
+		);
+	}
+	const candidateSet = new Set(candidates);
+	const included = new Set(parseNulPaths(result.stdout, "Git sparse rule"));
+	for (const path of included) {
+		if (!candidateSet.has(path)) {
+			throw new WorktreeSafetyError(
+				"Git sparse rule output contains an unexpected path.",
+			);
+		}
+	}
+	return new Set(candidates.filter((path) => !included.has(path)));
+}
+
+async function inspectStatusAndIndex(
+	cwd: string,
+	runner: GitRunner,
+): Promise<{
+	protected: WorktreeInventoryEntry[];
+	ignored: WorktreeInventoryEntry[];
+}> {
+	const status = parsePorcelainInventory(
+		await runGit(
+			runner,
+			[
+				"status",
+				"--porcelain=v1",
+				"-z",
+				"--untracked-files=all",
+				"--ignored=matching",
+				"--ignore-submodules=none",
+			],
+			cwd,
+		),
+	);
+	const indexEntries = parseIndexFlagEntries(
+		await runGit(runner, ["ls-files", "-v", "-z"], cwd),
+	);
+	const skipPaths = indexEntries.flatMap((entry) =>
+		entry.kind === "index-flag" && entry.flags.includes("skip-worktree")
+			? [entry.path]
+			: [],
+	);
+	const sparseManaged = await sparseManagedPaths(runner, cwd, skipPaths);
+	const visibleIndexEntries: WorktreeInventoryEntry[] = [];
+	for (const entry of indexEntries) {
+		if (entry.kind !== "index-flag") {
+			visibleIndexEntries.push(entry);
+			continue;
+		}
+		const flags = entry.flags.filter(
+			(flag) => flag !== "skip-worktree" || !sparseManaged.has(entry.path),
+		);
+		if (flags.length > 0) visibleIndexEntries.push({ ...entry, flags });
+	}
+	return {
+		protected: [...status.protected, ...visibleIndexEntries],
+		ignored: status.ignored,
+	};
+}
+
+function submodulePath(root: string, path: string): string {
+	const absolute = resolve(root, path);
+	const local = relative(root, absolute);
+	if (local === ".." || local.startsWith(`..${sep}`) || isAbsolute(local)) {
+		throw new WorktreeSafetyError(
+			"Git returned a submodule path outside the worktree.",
+		);
+	}
+	return absolute;
+}
+
+function prefixInventoryEntry(
+	prefix: string,
+	entry: WorktreeInventoryEntry,
+): WorktreeInventoryEntry {
+	const path = posix.join(prefix, entry.path);
+	if (entry.kind === "status") {
+		return {
+			...entry,
+			path,
+			...(entry.originalPath === undefined
+				? {}
+				: { originalPath: posix.join(prefix, entry.originalPath) }),
+		};
+	}
+	return { ...entry, path };
+}
+
+export async function inspectWorktreeInventory(
+	worktreePath: string,
+	options: { runner?: GitRunner } = {},
+): Promise<{
+	protected: WorktreeInventoryEntry[];
+	ignored: WorktreeInventoryEntry[];
+}> {
+	const runner = options.runner ?? nodeGitRunner;
+	const inventory = await inspectStatusAndIndex(worktreePath, runner);
+	const submodulePaths = parseNulPaths(
+		await runGit(
+			runner,
+			[
+				"submodule",
+				"foreach",
+				"--recursive",
+				"--quiet",
+				`printf '%s\\0' "$displaypath"`,
+			],
+			worktreePath,
+		),
+		"Git submodule",
+	);
+	for (const path of submodulePaths) {
+		const cwd = submodulePath(worktreePath, path);
+		const headLines = parseOidLines(
+			await runGit(runner, ["rev-parse", "HEAD"], cwd),
+			`submodule ${path} HEAD`,
+		);
+		if (headLines.length !== 1) {
+			throw new WorktreeSafetyError(
+				`Submodule ${escapeForDisplay(path)} has no unique HEAD object.`,
+			);
+		}
+		inventory.protected.push({
+			kind: "initialized-submodule",
+			path,
+			commit: headLines[0] ?? "",
+			state: "initialized",
+		});
+		const nested = await inspectStatusAndIndex(cwd, runner);
+		inventory.protected.push(
+			...nested.protected.map((entry) => prefixInventoryEntry(path, entry)),
+		);
+		inventory.ignored.push(
+			...nested.ignored.map((entry) => prefixInventoryEntry(path, entry)),
+		);
+	}
+	return {
+		protected: normalizeInventory(inventory.protected),
+		ignored: normalizeInventory(inventory.ignored),
+	};
 }
 
 export function parseReflogOids(value: string, source: string): string[] {
