@@ -91,7 +91,9 @@ Worktrees are created in a **sibling** directory next to the repo
 For example `feat/my-feature` lives at `../my-repo.worktrees/feat-my-feature`.
 Because it sits outside the repo tree, there is nothing to add to `.gitignore`.
 
-When cmux, [herdr](https://herdr.dev), or tmux is detected, Pi relaunches itself in the worktree directory within the same terminal. Ownership of the pane is verified first, and the relaunch waiter must be confirmed running by the OS before Pi agrees to exit. Without a usable multiplexer, Pi prints the exact command to run instead. If a worktree already exists because it was created manually or by another session, use `/worktree enter <type/name>` to relaunch Pi inside that existing linked checkout.
+Creating a worktree still relaunches Pi through cmux, [herdr](https://herdr.dev), or tmux. Ownership of the pane is verified first, and the relaunch waiter must be confirmed running by the OS before Pi agrees to exit. Without a usable multiplexer, Pi prints the exact command to run instead.
+
+Entering an existing worktree does not restart the process. `/worktree enter <type/name>` writes a target session carrying the current conversation and a visible transition orientation, then asks Pi to rebuild its cwd-bound runtime against that checkout. Tools, settings, project extensions and context files are therefore resolved from the worktree before the command reports success.
 
 ## Project configuration
 
@@ -217,8 +219,9 @@ both mutating the same checkout.
 **Enter** (`/worktree enter feat/my-feature`, from any checkout):
 
 1. Finds an existing linked worktree by exact branch (`feat/my-feature`) or the conventional shorthand (`my-feature` → `feat/my-feature`)
-2. Relaunches Pi in that worktree directory, forking the session so history follows
-3. Refuses to "enter" the main working tree; create a linked worktree first
+2. Writes a target session at that checkout, preserving the active conversation branch and adding a visible transition orientation
+3. Switches to it in-process, which rebuilds tools and project resources against the worktree cwd
+4. Refuses to "enter" the main working tree; create a linked worktree first
 
 **Dispose** (`/worktree dispose`, from inside a worktree):
 
@@ -232,7 +235,9 @@ both mutating the same checkout.
 2. `git worktree remove --force <repoRoot>.worktrees/feat-my-feature`
 3. `git branch -D feat/my-feature`
 
-**Relaunch strategy:** Pi's tools (bash, read, edit, etc.) bind to the working directory at startup via closure — there is no way to change it mid-session. When a worktree is created from the main repo, Pi shuts down and injects `cd <worktree> && pi` into the terminal via `cmux send`, `herdr pane send-text`, or `tmux send-keys`, so Pi restarts with the correct cwd. Detection prefers cmux, then herdr, then tmux — cmux and herdr stamp a per-pane id on the processes they spawn, whereas `$TMUX` can leak into herdr panes from an outer session.
+**Transition strategies:** Pi's tools bind to the session cwd when its runtime is created. `ctx.switchSession()` tears that runtime down and rebuilds it from another session file, so entering an existing checkout can move in-process. It does not call `process.chdir`; extension code must use the session context's cwd rather than the process cwd.
+
+Creating and disposing still cross a process boundary. Pi injects `cd <worktree> && pi` into the terminal via `cmux send`, `herdr pane send-text`, or `tmux send-keys`. Detection prefers cmux, then herdr, then tmux — cmux and herdr stamp a per-pane id on the processes they spawn, whereas `$TMUX` can leak into herdr panes from an outer session.
 
 ## Examples
 
@@ -284,6 +289,7 @@ npm run typecheck # tsc --noEmit only
 npm run lint      # biome check (format + lint, read-only)
 npm run format    # biome check --write (apply fixes)
 npm test          # pure decision/handoff tests
+npm run test:container-enter # live /worktree enter proof, isolated in Docker
 ```
 
 Formatting and linting are pinned via [biome](https://biomejs.dev) in

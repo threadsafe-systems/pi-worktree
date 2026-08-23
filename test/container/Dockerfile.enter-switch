@@ -1,0 +1,15 @@
+FROM node:24-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work/pi-worktree
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+ENV PI_WORKTREE_CONTAINER_TEST=1
+CMD ["npx", "tsx", "test/container/enter-switch.e2e.ts"]

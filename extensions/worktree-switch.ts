@@ -111,6 +111,13 @@ function isNonEmptyFile(path: string | undefined): boolean {
  * that does not name the target cwd would switch the session somewhere other
  * than the caller asked for, which is worse than refusing to switch at all.
  */
+export interface TargetOrientation {
+	content: string;
+	details?: Record<string, unknown>;
+}
+
+export const TRANSITION_MESSAGE_TYPE = "pi-worktree-transition";
+
 export function materializeTargetSession(opts: {
 	plan: TargetSessionPlan;
 	targetCwd: string;
@@ -118,6 +125,7 @@ export function materializeTargetSession(opts: {
 	expectedLeafId: string | null;
 	sessionDir?: string;
 	parentSession?: string;
+	orientation?: TargetOrientation;
 }): string {
 	const { plan, targetCwd, sessionDir } = opts;
 
@@ -127,7 +135,8 @@ export function materializeTargetSession(opts: {
 		if (!file || !existsSync(file)) {
 			throw new Error("pi did not create the target session file.");
 		}
-		return verifyTarget(file, targetCwd, forked.getLeafId());
+		verifyTarget(file, targetCwd, forked.getLeafId());
+		return appendOrientation(file, opts.orientation);
 	}
 
 	const target = SessionManager.create(
@@ -151,11 +160,35 @@ export function materializeTargetSession(opts: {
 		mode: 0o600,
 	});
 
-	return verifyTarget(
+	verifyTarget(
 		file,
 		targetCwd,
 		plan.kind === "entries" ? opts.expectedLeafId : null,
 	);
+	return appendOrientation(file, opts.orientation);
+}
+
+/** Persist the handoff before switching so the replacement cannot arrive bare. */
+function appendOrientation(
+	file: string,
+	orientation: TargetOrientation | undefined,
+): string {
+	if (!orientation) return file;
+
+	const target = SessionManager.open(file);
+	const entryId = target.appendCustomMessageEntry(
+		TRANSITION_MESSAGE_TYPE,
+		orientation.content,
+		true,
+		orientation.details,
+	);
+	const verified = SessionManager.open(file);
+	if (verified.getLeafId() !== entryId) {
+		throw new Error(
+			"Target session did not persist its transition orientation.",
+		);
+	}
+	return file;
 }
 
 /**
@@ -186,39 +219,12 @@ export type SwitchOutcome =
 	| { moved: false; reason: "cancelled" | "failed"; detail?: string };
 
 /**
- * Whether an in-process move should be attempted instead of a relaunch.
- *
- * Off unless asked for, so the relaunch remains the path every existing
- * session takes.
- */
-export function inProcessSwitchEnabled(
-	env: NodeJS.ProcessEnv = process.env,
-): boolean {
-	return env.PI_WT_SWITCH === "1";
-}
-
-/**
- * Name of the environment variable carrying the transition handoff.
- *
- * A relaunch passes it to the replacement process; an in-process switch has no
- * new process to pass it to, so it is published here and consumed by the
- * extension instance the switch creates. Either way exactly one reader is
- * expected, and the reader clears it — a handoff left set outlives the move it
- * describes and would be re-consumed by the next session in this process.
- */
-export const HANDOFF_ENV = "PI_WT_HANDOFF";
-
-/**
  * Move this session into `targetCwd`.
  *
  * Waits for the agent to stop streaming first, so the turn in flight is part
- * of the carried conversation rather than lost to the teardown.
- *
- * `handoff` orients the replacement: without it the new session arrives in a
- * different directory with no account of how it got there. `continuation` is
- * submitted as a message and is for the mid-task case only — a session that
- * hopped from an idle prompt would otherwise open by burning a turn on a
- * message nobody asked for.
+ * of the carried conversation rather than lost to the teardown. Orientation
+ * is written into the target document before switching: if it cannot be
+ * persisted, the move does not begin and the source session remains active.
  *
  * A failure here leaves the checkout alone. The worktree exists either way,
  * and destroying it because the session could not follow would turn a
@@ -227,9 +233,9 @@ export const HANDOFF_ENV = "PI_WT_HANDOFF";
 export async function switchIntoCheckout(
 	ctx: ExtensionCommandContext,
 	targetCwd: string,
-	options: { continuation?: string; handoff?: string } = {},
+	options: { orientation: TargetOrientation },
 ): Promise<SwitchOutcome> {
-	const priorHandoff = process.env[HANDOFF_ENV];
+	let target: string;
 	try {
 		await ctx.waitForIdle();
 
@@ -237,42 +243,38 @@ export async function switchIntoCheckout(
 		const state = readSourceState(sm);
 		const plan = planTargetSession(state);
 		const sessionDir = sm.getSessionDir();
-		const target = materializeTargetSession({
+		target = materializeTargetSession({
 			plan,
 			targetCwd,
 			entries: sm.getBranch(),
 			expectedLeafId: state.activeLeafId,
 			...(sessionDir ? { sessionDir } : {}),
 			...(state.sessionFile ? { parentSession: state.sessionFile } : {}),
+			orientation: options.orientation,
 		});
-
-		if (options.handoff) process.env[HANDOFF_ENV] = options.handoff;
-		else delete process.env[HANDOFF_ENV];
-
-		const continuation = options.continuation?.trim();
-		const result = await ctx.switchSession(target, {
-			withSession: async (replacement) => {
-				if (continuation) await replacement.sendUserMessage(continuation);
-			},
-		});
-
-		if (result.cancelled) {
-			restoreHandoff(priorHandoff);
-			return { moved: false, reason: "cancelled" };
-		}
-		return { moved: true };
 	} catch (error) {
-		restoreHandoff(priorHandoff);
 		return {
 			moved: false,
 			reason: "failed",
 			detail: error instanceof Error ? error.message : String(error),
 		};
 	}
-}
 
-/** Put the environment back when the move did not happen. */
-function restoreHandoff(prior: string | undefined): void {
-	if (prior === undefined) delete process.env[HANDOFF_ENV];
-	else process.env[HANDOFF_ENV] = prior;
+	// A relaunch handoff may still be pending if no model turn has consumed it.
+	// Keep it on cancellation; after a successful move it describes the checkout
+	// we just left and must not be inherited by the replacement.
+	const predecessorHandoff = process.env.PI_WT_HANDOFF;
+
+	// switchSession tears the old runtime down before constructing the new one.
+	// Let failures propagate to Pi's replacement handler: after teardown the
+	// captured command context is stale, so using it for a fallback is unsafe.
+	const result = await ctx.switchSession(target);
+	if (result.cancelled) return { moved: false, reason: "cancelled" };
+	if (
+		predecessorHandoff !== undefined &&
+		process.env.PI_WT_HANDOFF === predecessorHandoff
+	) {
+		delete process.env.PI_WT_HANDOFF;
+	}
+	return { moved: true };
 }

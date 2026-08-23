@@ -14,11 +14,11 @@ import { tmpdir } from "node:os";
 import { join, sep } from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import {
-	inProcessSwitchEnabled,
 	materializeTargetSession,
 	planTargetSession,
 	readSourceState,
 	type SourceSessionState,
+	TRANSITION_MESSAGE_TYPE,
 } from "../extensions/worktree-switch.ts";
 
 let fail = 0;
@@ -33,7 +33,9 @@ const check = (name: string, fn: () => void) => {
 	}
 };
 
-function state(overrides: Partial<SourceSessionState> = {}): SourceSessionState {
+function state(
+	overrides: Partial<SourceSessionState> = {},
+): SourceSessionState {
 	return {
 		sessionFile: "/sessions/a.jsonl",
 		flushed: true,
@@ -76,18 +78,10 @@ check("a session with no file at all is carried by its entries", () => {
 });
 
 check("a file whose leaf is ahead of the session is not forked", () => {
-	assert.deepEqual(
-		planTargetSession(state({ persistedLeafId: "leaf-9" })),
-		{ kind: "entries", reason: "stale-leaf" },
-	);
-});
-
-check("the in-process switch is off unless asked for", () => {
-	assert.equal(inProcessSwitchEnabled({}), false);
-	assert.equal(inProcessSwitchEnabled({ PI_WT_SWITCH: "" }), false);
-	assert.equal(inProcessSwitchEnabled({ PI_WT_SWITCH: "0" }), false);
-	assert.equal(inProcessSwitchEnabled({ PI_WT_SWITCH: "true" }), false);
-	assert.equal(inProcessSwitchEnabled({ PI_WT_SWITCH: "1" }), true);
+	assert.deepEqual(planTargetSession(state({ persistedLeafId: "leaf-9" })), {
+		kind: "entries",
+		reason: "stale-leaf",
+	});
 });
 
 // --- against real session files -------------------------------------------
@@ -147,6 +141,36 @@ check("an unflushed conversation reaches the target intact", () => {
 	assert.equal(written.getCwd(), fx.worktree);
 	assert.equal(written.getLeafId(), sm.getLeafId());
 	assert.ok(JSON.stringify(written.getEntries()).includes("carried-marker"));
+});
+
+check("orientation is persisted after the carried conversation", () => {
+	const fx = fixture();
+	const sm = SessionManager.create(fx.repo, fx.sessionDir);
+	sm.appendMessage({ role: "user", content: "carried-marker" } as never);
+	const sourceLeaf = sm.getLeafId();
+
+	const observed = readSourceState(sm);
+	const file = materializeTargetSession({
+		plan: planTargetSession(observed),
+		targetCwd: fx.worktree,
+		entries: sm.getBranch(),
+		expectedLeafId: observed.activeLeafId,
+		sessionDir: fx.sessionDir,
+		orientation: {
+			content: "moved-to-worktree-marker",
+			details: { targetCwd: fx.worktree },
+		},
+	});
+
+	const written = SessionManager.open(file);
+	const leaf = written.getLeafEntry();
+	assert.equal(leaf?.type, "custom_message");
+	if (leaf?.type !== "custom_message") return;
+	assert.equal(leaf.customType, TRANSITION_MESSAGE_TYPE);
+	assert.equal(leaf.content, "moved-to-worktree-marker");
+	assert.equal(leaf.display, true);
+	assert.deepEqual(leaf.details, { targetCwd: fx.worktree });
+	assert.equal(leaf.parentId, sourceLeaf);
 });
 
 check("a flushed conversation reaches the target intact", () => {

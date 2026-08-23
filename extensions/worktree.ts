@@ -35,6 +35,7 @@ import {
 } from "./worktree-handoff.ts";
 import { Type } from "typebox";
 import { shQuote } from "./worktree-shell.ts";
+import { switchIntoCheckout } from "./worktree-switch.ts";
 import type { ClaimOwner, ReceiptStore } from "./worktree-receipt.ts";
 import {
 	acquireClaim,
@@ -1567,7 +1568,7 @@ export default function (pi: ExtensionAPI) {
 
 	// --- Inject worktree context (and a one-turn migration caveat) ---
 	let handoffShown = false;
-	pi.on("before_agent_start", async (event) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		let extra = "";
 		if (worktreeBranch) {
 			extra +=
@@ -1595,6 +1596,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		// One-turn orientation when this session was forked across a worktree hop.
 		const handoffEnv = process.env.PI_WT_HANDOFF;
+		if (handoffEnv) delete process.env.PI_WT_HANDOFF;
 		if (!handoffShown && handoffEnv) {
 			const decoded = decodeTransitionHandoff(handoffEnv);
 			if (decoded?.version === 1) {
@@ -1604,7 +1606,7 @@ export default function (pi: ExtensionAPI) {
 					new Date().toISOString(),
 					decoded.legacy.kind ?? "enter",
 				);
-				extra += `\n\n${legacyCaveat(decoded.legacy, process.cwd(), worktreeBranch ?? "")}`;
+				extra += `\n\n${legacyCaveat(decoded.legacy, ctx.cwd, worktreeBranch ?? "")}`;
 			} else if (decoded?.version === 2) {
 				handoffShown = true;
 				// The predecessor's claim is only a claim; check it before letting
@@ -1620,7 +1622,7 @@ export default function (pi: ExtensionAPI) {
 							: { ignored: decoded.handoff.ignored }),
 						kind: decoded.handoff.kind,
 					},
-					process.cwd(),
+					ctx.cwd,
 					worktreeBranch ?? "",
 				)}`;
 				const caveat = transitionCaveat(lastVerification);
@@ -2831,7 +2833,7 @@ export default function (pi: ExtensionAPI) {
 						"Usage:\n" +
 							"  /worktree [type/name]     — Create a worktree (auto-generates name if omitted)\n" +
 							"  /worktree create [type/name] — Same as above\n" +
-							"  /worktree enter <type/name> — Reopen pi inside an existing linked worktree\n" +
+							"  /worktree enter <type/name> — Switch this session into an existing linked worktree\n" +
 							"  /worktree dispose         — Leave this worktree, remove it, reopen pi in the main repo\n" +
 							"  /worktree destroy <branch> — Destroy a worktree from the main checkout\n" +
 							"  /worktree list            — List all worktrees\n" +
@@ -2869,7 +2871,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("worktree-enter", {
 		description:
-			"Enter an existing linked git worktree, reopening pi there (shortcut for /worktree enter)",
+			"Enter an existing linked git worktree by switching this session there (shortcut for /worktree enter)",
 		handler: async (args, ctx) => handleEnter(args?.trim() || "", ctx),
 	});
 
@@ -2958,30 +2960,48 @@ export default function (pi: ExtensionAPI) {
 				store,
 				sessionFile,
 			});
-			const relaunched = await relaunchInPlace(
-				entry.path,
-				entry.branch,
-				sessionFile,
-				handoffB64,
-				continuationFor(ctx, "enter", entry.path),
-			);
-			if (!relaunched) {
-				ctx.ui.notify(
-					`✅ Worktree "${entry.branch}" found.\n` +
-						`   Path:   ${entry.path}\n` +
-						`   Branch: ${entry.branch}\n` +
-						`   Start PI: cd ${entry.path} && pi`,
-					"info",
-				);
-				return;
+			const decodedEnterHandoff = decodeTransitionHandoff(handoffB64);
+			if (decodedEnterHandoff?.version !== 2) {
+				throw new Error("Could not prepare the worktree transition handoff.");
 			}
-			ctx.shutdown();
-		} catch (err) {
-			ctx.ui.setStatus("worktree", undefined);
-			ctx.ui.notify(
-				`Failed to enter worktree: ${(err as Error).message}`,
-				"error",
+			const orientation = legacyCaveat(
+				{
+					parentCwd: decodedEnterHandoff.handoff.source.path,
+					parentBranch: decodedEnterHandoff.handoff.source.branch ?? "",
+					uncommitted: decodedEnterHandoff.handoff.uncommitted,
+					...(decodedEnterHandoff.handoff.ignored === undefined
+						? {}
+						: { ignored: decodedEnterHandoff.handoff.ignored }),
+					kind: "enter",
+				},
+				targetPath,
+				entry.branch,
 			);
+			const switched = await switchIntoCheckout(ctx, targetPath, {
+				orientation: {
+					content: orientation,
+					details: {
+						operationId: decodedEnterHandoff.handoff.operationId,
+						targetCwd: targetPath,
+						targetBranch: entry.branch,
+					},
+				},
+			});
+			if (switched.moved) return;
+			ctx.ui.notify(
+				switched.reason === "cancelled"
+					? `Workspace switch cancelled. Worktree retained at ${entry.path}.`
+					: `Could not prepare the target session${switched.detail ? `: ${switched.detail}` : "."}\nWorktree retained at ${entry.path}. Re-run /worktree enter ${entry.branch} after resolving the problem.`,
+				"warning",
+			);
+		} catch (err) {
+			const message = `Failed to enter worktree: ${(err as Error).message}`;
+			try {
+				ctx.ui.setStatus("worktree", undefined);
+				ctx.ui.notify(message, "error");
+			} catch {
+				console.error(message);
+			}
 		}
 	}
 

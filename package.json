@@ -43,6 +43,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "tsx test/run-all.ts",
+    "test:container-enter": "bash test/container/run-enter-switch.sh",
     "check": "npm run typecheck && npm run lint && npm test",
     "lint": "biome check . --error-on-warnings",
     "format": "biome check --write ."

@@ -3,35 +3,41 @@
 **Question.** Can a live pi session change its working directory without the
 process restarting, and does that deliver everything a relaunch delivers?
 
-**Answer.** Yes, with two constraints that change the design of the work that
-follows.
+**Answer.** Yes, but a runtime switch is only the transport. The replacement
+also needs orientation persisted in its own session before the source runtime
+is torn down.
 
 ## What was measured
 
-A real `AgentSessionRuntime` was stood up against a temp `agentDir`, so the
-ambient pi installation could not influence a result, in a temp repo with one
-linked worktree. Each checkout carries a distinguishable `AGENTS.md`. The
-runtime is switched from the main checkout into the worktree with
-`SessionManager.forkFrom` plus `ctx.switchSession`.
+The first mechanism probe stood a real `AgentSessionRuntime` up against a temp
+`agentDir` and switched it between a temp repo and linked worktree. It proved
+cwd and resource rebinding, but the first product integration did not carry the
+relaunch handoff across the processless boundary. Two host attempts therefore
+arrived in a target session with no instruction and were abandoned. That is a
+failed product spike, not a failed `switchSession` mechanism.
 
-`test/session-switch.test.ts` pins the results that are expressible through
-public API. Two further observations are recorded here because pinning them
-would mean asserting against pi internals.
+Live switching no longer runs in the normal test suite or directly on a
+developer host. `test/container/enter-switch.e2e.ts` loads the real extension,
+invokes its registered `/worktree enter` command and replaces a real runtime
+inside a disposable Docker container. The target session contains its visible
+transition orientation before switching begins.
 
 ## Results
 
 | Property | Result | Where |
 | --- | --- | --- |
-| Runtime rebinds to the target cwd | pass | test |
-| `withSession` context is bound to the target cwd | pass | test |
-| Context files re-resolve from the new cwd | pass | test |
-| Conversation history carries across | pass | test |
-| `process.cwd()` is left where it was | pass (see below) | test |
-| `forkFrom` refuses an unflushed session | pass (see below) | test |
-| In-memory entries can carry an unflushed conversation | pass | test |
-| A session with no entries yields a valid target | pass | test |
-| `bash` executes in the new cwd | pass | manual, below |
-| Built-in tools are constructed from the session cwd | pass | source, below |
+| Runtime rebinds to the target cwd | pass | container |
+| Services re-resolve from the new cwd | pass | container |
+| Conversation history carries across | pass | pure + container |
+| Orientation exists before replacement | pass | pure + container |
+| Orientation participates in the next model context | pass | container |
+| Idle enter triggers no synthetic model turn | pass | container |
+| `process.cwd()` is left where it was | pass (see below) | mechanism probe |
+| `forkFrom` refuses an unflushed session | pass (see below) | pure |
+| In-memory entries can carry an unflushed conversation | pass | pure |
+| A session with no entries yields a valid target | pass | pure |
+| `bash` executes in the new cwd | pass | mechanism probe |
+| Relaunch handoff is consumed once | pass | container |
 
 ### Tools follow the switch
 
@@ -92,20 +98,24 @@ conversation that was recoverable all along.
 Pi calls `process.chdir` nowhere. After a switch, `runtime.cwd` is the target
 while `process.cwd()` is still wherever the process was launched.
 
-Tools are unaffected: they receive an explicit cwd. The exposure is anything
-that resolves a relative path against the process, and it becomes material only
-when the original directory is *deleted* — the dispose case, where the process
-would be left with a working directory that no longer exists. Enumerate the
-callers that read `process.cwd()` before relying on an in-process dispose.
+Tools are unaffected: they receive an explicit cwd. `pi.exec` also defaults to
+the extension instance's session cwd (`options?.cwd ?? cwd`), not the process
+cwd. The exposure is therefore limited to code that reads `process.cwd()`
+directly, and becomes material when the original directory is *deleted* — the
+dispose case. Enumerate those direct callers before relying on an in-process
+dispose.
 
 ## Verdict
 
-Green. The mechanism does what a relaunch does, in-process, and is available
-across interactive, print and rpc modes.
+Green in the disposable container. `/worktree enter` can switch in-process
+without abandoning the replacement, and Pi wires the same replacement API in
+interactive, print and rpc modes.
 
-Two adjustments to the work that follows:
+Three rules follow:
 
-- every transition must build its target session from in-memory entries, not
-  from the source file, and must not assume a source file exists;
-- the dispose path needs the `process.cwd()` exposure enumerated before it can
-  drop the relaunch fallback.
+- every transition builds from in-memory entries and never assumes a source
+  file exists;
+- orientation is a persisted custom message in the target document, not a
+  process environment variable or a callback that runs after teardown;
+- the dispose path must enumerate direct `process.cwd()` readers before it can
+  drop its relaunch boundary.

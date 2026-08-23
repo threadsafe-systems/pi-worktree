@@ -32,9 +32,19 @@ jobs:
 
       - run: npm run check
 
+  container-enter:
+    name: container enter-switch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Live session replacement never runs on the host runner. The wrapper
+      # builds a disposable image, runs the proof there, then removes it.
+      - run: bash test/container/run-enter-switch.sh
+
   release:
     name: release
-    needs: check
+    needs: [check, container-enter]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
