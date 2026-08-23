@@ -1,5 +1,13 @@
 import { spawn } from "node:child_process";
-import { isAbsolute, posix, relative, resolve, sep } from "node:path";
+import {
+	existsSync,
+	lstatSync,
+	readdirSync,
+	readFileSync,
+	realpathSync,
+	type Stats,
+} from "node:fs";
+import { isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 
 export type IndexFlag = "assume-unchanged" | "skip-worktree";
 
@@ -151,6 +159,10 @@ function normalizedOid(value: string, source: string): string | null {
 
 function uniqueInOrder(values: string[]): string[] {
 	return [...new Set(values)];
+}
+
+function compareStrings(left: string, right: string): number {
+	return left.localeCompare(right);
 }
 
 function nonEmptyLines(value: string, source: string): string[] {
@@ -440,10 +452,254 @@ export async function inspectWorktreeInventory(
 	};
 }
 
+export interface AdministrativeRecoveryInspection {
+	administrativePath: string;
+	identity: WorktreeSafetySnapshot["identity"];
+	recoveryOids: string[];
+}
+
+function nodeErrorCode(error: unknown): string | undefined {
+	return error instanceof Error && "code" in error
+		? String((error as NodeJS.ErrnoException).code)
+		: undefined;
+}
+
+function inspectAdministrativeEntry(path: string): Stats {
+	try {
+		const stat = lstatSync(path);
+		if (!stat) {
+			throw new WorktreeSafetyError(
+				`Administrative history entry disappeared: ${escapeForDisplay(path)}.`,
+			);
+		}
+		return stat;
+	} catch (error) {
+		throw new WorktreeSafetyError(
+			`Cannot inspect administrative history entry ${escapeForDisplay(path)}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function readAdministrativeFile(path: string): string | undefined {
+	if (!existsSync(path)) return undefined;
+	const stat = inspectAdministrativeEntry(path);
+	if (stat.isSymbolicLink() || !stat.isFile()) {
+		throw new WorktreeSafetyError(
+			`Unexpected administrative history entry: ${escapeForDisplay(path)}.`,
+		);
+	}
+	try {
+		return readFileSync(path, "utf8");
+	} catch (error) {
+		throw new WorktreeSafetyError(
+			`Cannot read administrative history entry ${escapeForDisplay(path)}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+}
+
+function readReflogTree(directory: string): string[] {
+	if (!existsSync(directory)) return [];
+	const stat = inspectAdministrativeEntry(directory);
+	if (stat.isSymbolicLink() || !stat.isDirectory()) {
+		throw new WorktreeSafetyError(
+			`Unexpected administrative history entry: ${escapeForDisplay(directory)}.`,
+		);
+	}
+	let names: string[];
+	try {
+		names = readdirSync(directory).sort(compareStrings);
+	} catch (error) {
+		throw new WorktreeSafetyError(
+			`Cannot read administrative history directory ${escapeForDisplay(directory)}: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const oids: string[] = [];
+	for (const name of names) {
+		const path = join(directory, name);
+		const entry = inspectAdministrativeEntry(path);
+		if (entry.isSymbolicLink()) {
+			throw new WorktreeSafetyError(
+				`Unexpected administrative history entry: ${escapeForDisplay(path)}.`,
+			);
+		}
+		if (entry.isDirectory()) {
+			oids.push(...readReflogTree(path));
+			continue;
+		}
+		if (!entry.isFile()) {
+			throw new WorktreeSafetyError(
+				`Unexpected administrative history entry: ${escapeForDisplay(path)}.`,
+			);
+		}
+		const contents = readAdministrativeFile(path);
+		if (contents !== undefined) oids.push(...parseReflogOids(contents, path));
+	}
+	return oids;
+}
+
+function singleLine(value: string, source: string): string {
+	const lines = nonEmptyLines(value, source);
+	if (lines.length !== 1) {
+		throw new WorktreeSafetyError(`${source} did not return one value.`);
+	}
+	return lines[0] ?? "";
+}
+
+async function symbolicHead(
+	runner: GitRunner,
+	worktreePath: string,
+): Promise<string | null> {
+	const result = await runner(["symbolic-ref", "-q", "HEAD"], {
+		cwd: worktreePath,
+	});
+	if (result.killed) {
+		throw new WorktreeSafetyError("git symbolic-ref HEAD timed out.");
+	}
+	if (result.code === 1) return null;
+	if (result.code !== 0) {
+		throw new WorktreeSafetyError(
+			`git symbolic-ref HEAD failed: ${escapeForDisplay((result.stderr || result.stdout).trim() || `exit ${result.code}`)}`,
+		);
+	}
+	const ref = singleLine(result.stdout, "git symbolic-ref HEAD");
+	if (!ref.startsWith("refs/")) {
+		throw new WorktreeSafetyError("Git returned an invalid symbolic HEAD ref.");
+	}
+	return ref;
+}
+
+async function administrativeCandidates(
+	runner: GitRunner,
+	worktreePath: string,
+	administrativePath: string,
+): Promise<string[]> {
+	const candidates = readReflogTree(join(administrativePath, "logs"));
+	const refs = await runGit(
+		runner,
+		[
+			`--git-dir=${administrativePath}`,
+			"for-each-ref",
+			"--format=%(objectname)",
+			"refs/worktree",
+			"refs/bisect",
+		],
+		worktreePath,
+	);
+	candidates.push(...parseOidLines(refs, "per-worktree refs"));
+	for (const name of [
+		"ORIG_HEAD",
+		"MERGE_HEAD",
+		"REBASE_HEAD",
+		"CHERRY_PICK_HEAD",
+		"REVERT_HEAD",
+		"BISECT_HEAD",
+	]) {
+		const contents = readAdministrativeFile(join(administrativePath, name));
+		if (contents !== undefined) {
+			candidates.push(...parseOidLines(contents, name));
+		}
+	}
+	const fetchHead = readAdministrativeFile(
+		join(administrativePath, "FETCH_HEAD"),
+	);
+	if (fetchHead !== undefined)
+		candidates.push(...parseFetchHeadOids(fetchHead));
+	return [...new Set(candidates)].sort(compareStrings);
+}
+
+async function isDurablyReachable(
+	runner: GitRunner,
+	worktreePath: string,
+	oid: string,
+): Promise<boolean> {
+	const output = await runGit(
+		runner,
+		[
+			"for-each-ref",
+			"--format=%(refname)",
+			`--contains=${oid}`,
+			"refs/heads",
+			"refs/tags",
+			"refs/remotes",
+		],
+		worktreePath,
+	);
+	for (const ref of nonEmptyLines(output, `durable refs containing ${oid}`)) {
+		if (!/^refs\/(?:heads|tags|remotes)\/.+/u.test(ref)) {
+			throw new WorktreeSafetyError(
+				"Git returned an unexpected durable ref name.",
+			);
+		}
+		return true;
+	}
+	return false;
+}
+
+export async function inspectAdministrativeRecovery(
+	worktreePath: string,
+	options: { runner?: GitRunner } = {},
+): Promise<AdministrativeRecoveryInspection> {
+	const runner = options.runner ?? nodeGitRunner;
+	const gitDirOutput = await runGit(
+		runner,
+		["rev-parse", "--path-format=absolute", "--git-dir"],
+		worktreePath,
+	);
+	const gitDir = singleLine(gitDirOutput, "git rev-parse --git-dir");
+	let administrativePath: string;
+	try {
+		administrativePath = realpathSync(resolve(worktreePath, gitDir));
+	} catch (error) {
+		if (nodeErrorCode(error) === "ENOENT") {
+			throw new WorktreeSafetyError(
+				"Git returned a missing worktree administrative directory.",
+			);
+		}
+		throw new WorktreeSafetyError(
+			`Cannot resolve the worktree administrative directory: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	}
+	const headValues = parseOidLines(
+		await runGit(runner, ["rev-parse", "HEAD"], worktreePath),
+		"worktree HEAD",
+	);
+	if (headValues.length !== 1) {
+		throw new WorktreeSafetyError(
+			"Git did not return one worktree HEAD object.",
+		);
+	}
+	const head = headValues[0];
+	if (!head) {
+		throw new WorktreeSafetyError("Git did not return a worktree HEAD object.");
+	}
+	const administrative = await administrativeCandidates(
+		runner,
+		worktreePath,
+		administrativePath,
+	);
+	const candidates = [...new Set([head, ...administrative])].sort(
+		compareStrings,
+	);
+	const recoveryOids: string[] = [];
+	for (const oid of candidates) {
+		if (!(await isDurablyReachable(runner, worktreePath, oid))) {
+			recoveryOids.push(oid);
+		}
+	}
+	return {
+		administrativePath,
+		identity: {
+			head,
+			branch: await symbolicHead(runner, worktreePath),
+		},
+		recoveryOids,
+	};
+}
+
 export function parseReflogOids(value: string, source: string): string[] {
 	const oids: string[] = [];
 	for (const line of nonEmptyLines(value, source)) {
-		const match = /^(\S+) (\S+) .+> \d+ [+-]\d{4}\t.*$/u.exec(line);
+		const match = /^(\S+) (\S+) .+> \d+ [+-]\d{4}(?:\t.*)?$/u.exec(line);
 		if (!match) {
 			throw new WorktreeSafetyError(
 				`${source} contains a malformed reflog record.`,
@@ -493,7 +749,9 @@ function normalizeEntry(entry: WorktreeInventoryEntry): WorktreeInventoryEntry {
 		case "ignored":
 			return { kind: "ignored", path: entry.path };
 		case "index-flag": {
-			const flags = [...new Set(entry.flags)].sort() as IndexFlag[];
+			const flags = [...new Set(entry.flags)].sort(
+				compareStrings,
+			) as IndexFlag[];
 			return { kind: "index-flag", path: entry.path, flags };
 		}
 		case "initialized-submodule":
@@ -543,7 +801,7 @@ export function normalizeSafetySnapshot(
 		identity: { head, branch: snapshot.identity.branch },
 		protected: normalizeInventory(snapshot.protected),
 		ignored: normalizeInventory(snapshot.ignored),
-		recoveryOids: [...new Set(recoveryOids)].sort(),
+		recoveryOids: [...new Set(recoveryOids)].sort(compareStrings),
 	};
 }
 
@@ -557,19 +815,30 @@ export function sameSafetySnapshot(
 	);
 }
 
+function escapedControlCharacter(character: string): string | null {
+	if (character === "\0") return "\\0";
+	if (character === "\t") return "\\t";
+	if (character === "\n") return "\\n";
+	if (character === "\r") return "\\r";
+	const code = character.codePointAt(0) ?? 0;
+	if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+		return `\\x${code.toString(16).padStart(2, "0")}`;
+	}
+	return null;
+}
+
 export function escapeForDisplay(value: string): string {
 	let escaped = "";
 	for (const character of value) {
-		const code = character.codePointAt(0) ?? 0;
-		if (character === "\0") escaped += "\\0";
-		else if (character === "\t") escaped += "\\t";
-		else if (character === "\n") escaped += "\\n";
-		else if (character === "\r") escaped += "\\r";
-		else if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
-			escaped += `\\x${code.toString(16).padStart(2, "0")}`;
-		} else escaped += character;
+		escaped += escapedControlCharacter(character) ?? character;
 	}
 	return escaped;
+}
+
+function assertNever(value: never): never {
+	throw new WorktreeSafetyError(
+		`Unknown worktree inventory entry: ${JSON.stringify(value)}`,
+	);
 }
 
 export function formatInventoryEntry(entry: WorktreeInventoryEntry): string {
@@ -592,5 +861,7 @@ export function formatInventoryEntry(entry: WorktreeInventoryEntry): string {
 			return `initialized submodule ${entry.state} ${entry.commit}: ${path}`;
 		case "submodule-status":
 			return `submodule status ${escapeForDisplay(entry.status)}: ${path}`;
+		default:
+			return assertNever(entry);
 	}
 }
