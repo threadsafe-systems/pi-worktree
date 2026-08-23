@@ -269,3 +269,4 @@ Every DoD item has one owning implementation task and at least one downstream in
 - A remote-tracking ref is durable for recovery classification.
 - Exact post-hook equality intentionally requires a second invocation when a hook changes the approved snapshot.
 - The active branch is local and unpushed until the advisory implementation reaches PR review.
+- T1 escapes control bytes in diagnostics instead of deleting them, preserving path distinctions while preventing terminal interpretation.
