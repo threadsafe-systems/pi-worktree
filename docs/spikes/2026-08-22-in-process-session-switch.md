@@ -18,8 +18,8 @@ failed product spike, not a failed `switchSession` mechanism.
 
 Live switching no longer runs in the normal test suite or directly on a
 developer host. `test/container/enter-switch.e2e.ts` loads the real extension,
-invokes its registered `/worktree enter` command and replaces a real runtime
-inside a disposable Docker container. The target session contains its visible
+invokes its registered enter and dispose commands, and replaces a real runtime
+inside a disposable Docker container. Each target session contains its visible
 transition orientation before switching begins.
 
 ## Results
@@ -32,7 +32,10 @@ transition orientation before switching begins.
 | Orientation exists before replacement | pass | pure + container |
 | Orientation participates in the next model context | pass | container |
 | Idle enter triggers no synthetic model turn | pass | container |
-| `process.cwd()` is left where it was | pass (see below) | mechanism probe |
+| Enter leaves `process.cwd()` unchanged | pass (see below) | mechanism probe |
+| Dispose aligns `process.cwd()` before removing the launch directory | pass | container |
+| Dispose removes the path, Git registration and merged branch | pass | container |
+| Dispose persists the observed teardown result | pass | container |
 | `forkFrom` refuses an unflushed session | pass (see below) | pure |
 | In-memory entries can carry an unflushed conversation | pass | pure |
 | A session with no entries yields a valid target | pass | pure |
@@ -93,23 +96,24 @@ This supersedes the existing shell-level guard, which tests the source file for
 non-emptiness and starts a fresh session when it is empty — discarding a
 conversation that was recoverable all along.
 
-### The OS working directory of the process never moves
+### Pi does not move the OS working directory
 
-Pi calls `process.chdir` nowhere. After a switch, `runtime.cwd` is the target
-while `process.cwd()` is still wherever the process was launched.
+Pi calls `process.chdir` nowhere. After an ordinary switch, `runtime.cwd` is the
+target while `process.cwd()` is still wherever the process was launched.
 
 Tools are unaffected: they receive an explicit cwd. `pi.exec` also defaults to
 the extension instance's session cwd (`options?.cwd ?? cwd`), not the process
-cwd. The exposure is therefore limited to code that reads `process.cwd()`
-directly, and becomes material when the original directory is *deleted* — the
-dispose case. Enumerate those direct callers before relying on an in-process
-dispose.
+cwd. Direct-reader inventory found material post-switch paths, including session
+export, which still resolve against `process.cwd()`. `/worktree dispose`
+therefore changes the OS cwd to the main checkout after the replacement runtime
+is established and before deleting the launch directory. Enter leaves it
+untouched because its source checkout remains present.
 
 ## Verdict
 
-Green in the disposable container. `/worktree enter` can switch in-process
-without abandoning the replacement, and Pi wires the same replacement API in
-interactive, print and rpc modes.
+Green in the disposable container. `/worktree enter` and the slash-command
+dispose path can switch in-process without abandoning the replacement, and Pi
+wires the same replacement API in interactive, print and rpc modes.
 
 Three rules follow:
 
@@ -117,5 +121,5 @@ Three rules follow:
   file exists;
 - orientation is a persisted custom message in the target document, not a
   process environment variable or a callback that runs after teardown;
-- the dispose path must enumerate direct `process.cwd()` readers before it can
-  drop its relaunch boundary.
+- a dispose replacement must align `process.cwd()` with the main checkout before
+  removing the directory in which the process started.

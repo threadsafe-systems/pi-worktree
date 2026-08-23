@@ -79,7 +79,7 @@ export function handoffCaveat(
 			: `- The disposed worktree had no uncommitted or gitignored local files.`;
 		return (
 			`## Session moved back to the main checkout\n` +
-			`This session was forked out of the worktree at ${h.parentCwd} (branch ${h.parentBranch}) back into the main repository at ${currentCwd}. Removal of that worktree and a soft-delete (git branch -d) of branch ${h.parentBranch} were requested during shutdown — verify with \`git worktree list\` and \`git branch\`, and re-run cleanup if either remains (an unmerged branch is deliberately kept).\n` +
+			`This session moved out of the worktree at ${h.parentCwd} (branch ${h.parentBranch}) back into the main repository at ${currentCwd}. Removal of that worktree and a soft-delete (git branch -d) of branch ${h.parentBranch} were requested as part of the transition — verify with \`git worktree list\` and \`git branch\`, and re-run cleanup if either remains (an unmerged branch is deliberately kept).\n` +
 			`- Repo-relative paths are unchanged (\`src/foo.ts\` is still \`src/foo.ts\`).\n` +
 			`- Absolute paths, and any path under the old worktree directory, no longer resolve.\n` +
 			`${wip}\n` +

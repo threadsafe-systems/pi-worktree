@@ -69,7 +69,7 @@ pi --worktree my-feature --worktree-base develop
 /worktree feat/my-feature
 /worktree fix login-bug      # → fix/login-bug
 /worktree enter fix/login-bug # re-camp into an existing linked worktree
-/worktree dispose            # leave + remove this worktree, reopen Pi in the main repo
+/worktree dispose            # switch to main, then remove this worktree
 /worktree destroy fix/login-bug
 /worktree list
 
@@ -94,6 +94,8 @@ Because it sits outside the repo tree, there is nothing to add to `.gitignore`.
 Creating a worktree still relaunches Pi through cmux, [herdr](https://herdr.dev), or tmux. Ownership of the pane is verified first, and the relaunch waiter must be confirmed running by the OS before Pi agrees to exit. Without a usable multiplexer, Pi prints the exact command to run instead.
 
 Entering an existing worktree does not restart the process. `/worktree enter <type/name>` writes a target session carrying the current conversation and a visible transition orientation, then asks Pi to rebuild its cwd-bound runtime against that checkout. Tools, settings, project extensions and context files are therefore resolved from the worktree before the command reports success.
+
+`/worktree dispose` also switches in-process. It first rebuilds the session in the main checkout, aligns the process working directory with that checkout, and only then runs pre-remove hooks and removes the linked worktree. The replacement session records whether the path, Git registration and branch cleanup completed. The model-callable disposal path continues to use a process relaunch because Pi does not yet expose session replacement from a tool or settled-event context.
 
 ## Project configuration
 
