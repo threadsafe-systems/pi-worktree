@@ -95,7 +95,15 @@ Creating a worktree still relaunches Pi through cmux, [herdr](https://herdr.dev)
 
 Entering an existing worktree does not restart the process. `/worktree enter <type/name>` writes a target session carrying the current conversation and a visible transition orientation, then asks Pi to rebuild its cwd-bound runtime against that checkout. Tools, settings, project extensions and context files are therefore resolved from the worktree before the command reports success.
 
-`/worktree dispose` also switches in-process. It first rebuilds the session in the main checkout, aligns the process working directory with that checkout, and only then runs pre-remove hooks and removes the linked worktree. The replacement session records whether the path, Git registration and branch cleanup completed. The model-callable disposal path continues to use a process relaunch because Pi does not yet expose session replacement from a tool or settled-event context.
+`/worktree dispose` also switches in-process. It first verifies that removal is lossless, rebuilds the session in the main checkout, aligns the process working directory with that checkout, and only then runs pre-remove hooks and removes the linked worktree. The replacement session records whether teardown was refused, partially completed, or completed. The model-callable live-disposal path continues to use a process relaunch because Pi does not yet expose session replacement from a tool or settled-event context.
+
+### Removal safety
+
+Normal `dispose` is lossless. It refuses removal when the worktree contains tracked, untracked, or ignored files; `assume-unchanged` or unmanaged `skip-worktree` index entries; initialized submodules or nested submodule state; or commits reachable only through worktree administrative history. Diagnostics list exact paths and full commit IDs so the data can be committed, moved, removed, branched, or tagged before retrying. Sparse-checkout `skip-worktree` entries are exempt only when Git's own rule checker proves that the active sparse definition manages them.
+
+`/worktree destroy` is the human-only destructive path. Its confirmation lists the exact protected, ignored, index, submodule, and recovery-only state that will be discarded. Model callers can receive refusal details but cannot authorize this loss.
+
+Both operations run `preRemove` hooks fail-fast and then re-inspect worktree identity and the complete approved snapshot. Any addition, removal, or change made by a hook or concurrent process refuses before Git mutation; inspect the new state and invoke the operation again. Ambiguous or malformed Git administrative state also fails closed. Worktree removal and branch deletion use executable-plus-argv calls rather than interpolated shell commands.
 
 ## Project configuration
 
@@ -122,7 +130,7 @@ Create `.pi/worktree.json` in your repo root (commit it so all contributors shar
 | `types` | all conventional types | Override the accepted `<type>` set |
 | `linkEnvFiles` | `true` | Symlink gitignored `.env*` files (except `.env.local`) from main repo |
 | `postCreate` | `[]` | Shell commands run after creation (cwd = worktree) |
-| `preRemove` | `[]` | Shell commands run before removal (cwd = worktree) |
+| `preRemove` | `[]` | Shell commands run fail-fast before removal (cwd = worktree); any safety-snapshot change forces a retry |
 
 Branches follow conventional commits: `<type>/<identifier>`, e.g.
 `feat/use-conventional-commits`. Valid types: `feat`, `fix`, `chore`, `docs`,
@@ -227,19 +235,22 @@ both mutating the same checkout.
 
 **Dispose** (`/worktree dispose`, from inside a worktree):
 
-1. Exits Pi and, once it has stopped, `cd`s back to the main repo
-2. Runs each `preRemove` command, then `git worktree remove --force` + `git branch -d` (soft; the branch is kept if it still has unmerged commits)
-3. Relaunches Pi in the main repo, forking the worktree session so history follows the hop back
+1. Inspects the complete safety snapshot and refuses any protected, ignored, or recovery-only state
+2. Switches the live session to the main checkout and aligns the process cwd without losing conversation history
+3. Runs each `preRemove` command fail-fast, then requires worktree identity and the complete safety snapshot to remain unchanged
+4. Runs `git worktree remove --force` and `git branch -d` by argv (soft; the branch is kept if it still has unmerged commits)
+5. Verifies the path, Git registration, branch, lifecycle claim, and provisioning receipt outcomes and persists the result
 
 **Destroy** (`/worktree destroy feat/my-feature`, from the main checkout):
 
-1. Runs each `preRemove` command
-2. `git worktree remove --force <repoRoot>.worktrees/feat-my-feature`
-3. `git branch -D feat/my-feature`
+1. Resolves the exact registered worktree and refuses the main checkout or active worktree
+2. Inspects its complete safety snapshot and asks a human to confirm the exact data at risk
+3. Runs each `preRemove` command fail-fast and refuses if identity or any approved state changed
+4. Runs `git worktree remove --force` and `git branch -D` by argv, then verifies the observed result
 
-**Transition strategies:** Pi's tools bind to the session cwd when its runtime is created. `ctx.switchSession()` tears that runtime down and rebuilds it from another session file, so entering an existing checkout can move in-process. It does not call `process.chdir`; extension code must use the session context's cwd rather than the process cwd.
+**Transition strategies:** Pi's tools bind to the session cwd when its runtime is created. `ctx.switchSession()` tears that runtime down and rebuilds it from another session file, so slash-command enter and dispose can move in-process. It does not call `process.chdir`; disposal aligns the process cwd explicitly after the successful switch.
 
-Creating and disposing still cross a process boundary. Pi injects `cd <worktree> && pi` into the terminal via `cmux send`, `herdr pane send-text`, or `tmux send-keys`. Detection prefers cmux, then herdr, then tmux — cmux and herdr stamp a per-pane id on the processes they spawn, whereas `$TMUX` can leak into herdr panes from an outer session.
+Creation and model-triggered disposal of the live worktree still cross a process boundary. Pi injects the relaunch command into the terminal via `cmux send`, `herdr pane send-text`, or `tmux send-keys`. Detection prefers cmux, then herdr, then tmux — cmux and herdr stamp a per-pane id on the processes they spawn, whereas `$TMUX` can leak into herdr panes from an outer session. The detached waiter coordinates process exit and relaunch but delegates teardown to the same packaged Node executor; its atomic report, not process exit, proves whether removal was refused, partial, or complete.
 
 ## Examples
 

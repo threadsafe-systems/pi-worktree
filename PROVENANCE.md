@@ -183,6 +183,17 @@ the session across, and grew from there into the feature set below.
     child referenced, so an unacknowledged waiter is killed rather than left to
     act, and nothing requests shutdown until something is confirmed running.
     Scheduling still is not delivery, and results say so.
+18. **Recovery-safe teardown behavior** was ported from the behavioral prior art
+    in [`@narumitw/pi-worktree`](https://github.com/narumiruna/pi-extensions/tree/main/packages/pi-worktree),
+    an MIT-licensed implementation. Its recovery-risk scan, intentional index
+    state checks, initialized-submodule protection, sparse-checkout proof, exact
+    ignored inventory, and post-confirmation reinspection informed this work.
+    The behavior was reimplemented rather than copy-pasted so it uses this
+    project's lifecycle claims, provisioning receipts, in-process session
+    switch, detached waiter, and successor-verification architecture. All
+    removal adapters now share one fail-closed snapshot and argv-only teardown
+    executor; detached teardown persists an atomic refused, partial, or complete
+    report rather than treating process exit as proof.
 
 Back-compatible: with no session to fork (e.g. `--no-session`), the command
 falls back to the original `cd <wt> && pi`.
