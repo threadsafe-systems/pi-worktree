@@ -1,10 +1,10 @@
 # Worktree Removal Recovery Safety — Build Plan
 
-**Date:** 2026-08-23  
-**Status:** Advisory build plan  
-**Track:** Reversible  
-**Authoritative plan:** `docs/plans/2026-08-23-dispose-recovery-safety.md`  
-**Tracker projection:** None — advisory mode forbids tracker mutation
+- **Date:** 2026-08-23
+- **Status:** Advisory build plan
+- **Track:** Reversible
+- **Authoritative plan:** `docs/plans/2026-08-23-dispose-recovery-safety.md`
+- **Tracker projection:** None — advisory mode forbids tracker mutation
 
 ## Objective
 

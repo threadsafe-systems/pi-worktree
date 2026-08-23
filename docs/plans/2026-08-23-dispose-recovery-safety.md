@@ -1,9 +1,9 @@
 # Worktree Removal Recovery Safety
 
-**Date:** 2026-08-23  
-**Status:** Draft advisory plan  
-**Recommended track:** Reversible — this changes internal teardown policy and user-facing safety diagnostics without freezing a persisted or external interface  
-**Next phase:** Build
+- **Date:** 2026-08-23
+- **Status:** Draft advisory plan
+- **Recommended track:** Reversible — this changes internal teardown policy and user-facing safety diagnostics without freezing a persisted or external interface
+- **Next phase:** Build
 
 ## Summary
 
