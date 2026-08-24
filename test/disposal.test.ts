@@ -11,9 +11,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
-	buildDestroyScript,
-	buildDisposeScript,
 	buildVerifiedTeardownScript,
+	teardownBranchNote,
 } from "../extensions/worktree.ts";
 import {
 	acquireClaim,
@@ -28,6 +27,14 @@ import {
 	reportPath,
 	writeReceipt,
 } from "../extensions/worktree-receipt.ts";
+import {
+	writeDetachedTeardownRequest,
+	type DetachedTeardownRequestV1,
+} from "../extensions/worktree-teardown.ts";
+import {
+	inspectWorktreeSafety,
+	type WorktreeSafetySnapshot,
+} from "../extensions/worktree-safety.ts";
 
 let fail = 0;
 let total = 0;
@@ -124,9 +131,10 @@ interface RunResult {
  */
 async function runTeardown(
 	f: ReturnType<typeof fixture>,
-	script: string,
+	script: string | Promise<string>,
 	ownerPid: (waiterPid: number) => number | null,
 ): Promise<RunResult> {
+	const resolvedScript = await script;
 	const pidFile = join(f.root, "waiter.pid");
 	const goFile = join(f.root, "go");
 	// Invoke the teardown exactly as the real waiter does: as its OWN shell, with
@@ -140,7 +148,7 @@ async function runTeardown(
 
 	const child = spawn(
 		"bash",
-		["-c", waiter, "waiter", pidFile, goFile, script],
+		["-c", waiter, "waiter", pidFile, goFile, resolvedScript],
 		{
 			stdio: "ignore",
 		},
@@ -182,21 +190,35 @@ async function runTeardown(
 	};
 }
 
-function scriptFor(
+async function scriptFor(
 	f: ReturnType<typeof fixture>,
-	overrides: { preRemove?: string[]; destination?: string } = {},
-) {
-	return buildVerifiedTeardownScript({
+	overrides: {
+		preRemove?: string[];
+		destination?: string;
+		approvedSnapshot?: WorktreeSafetySnapshot;
+	} = {},
+): Promise<string> {
+	const reportFile = reportPath(f.store, f.operationId);
+	const requestFile = `${reportFile}.request.json`;
+	const request: DetachedTeardownRequestV1 = {
+		schemaVersion: 1,
+		operationId: f.operationId,
 		repoRoot: f.repo,
 		worktreePath: f.wt,
 		branch: BRANCH,
-		...(overrides.preRemove ? { preRemove: overrides.preRemove } : {}),
-		operationId: f.operationId,
-		waiterOwnerFile: join(claimPath(f.store, f.wt), "owner.json"),
+		expectedDestination: {
+			path: f.repo,
+			branch: overrides.destination ?? "main",
+		},
+		approvedSnapshot:
+			overrides.approvedSnapshot ?? (await inspectWorktreeSafety(f.wt)),
+		preRemove: overrides.preRemove ?? [],
+		ownerFile: join(claimPath(f.store, f.wt), "owner.json"),
 		receiptFile: receiptPath(f.store, f.wt),
-		reportFile: reportPath(f.store, f.operationId),
-		expectedDestinationBranch: overrides.destination ?? "main",
-	});
+		reportFile,
+	};
+	writeDetachedTeardownRequest(requestFile, request);
+	return buildVerifiedTeardownScript({ requestFile });
 }
 
 // --- the complete path -------------------------------------------------------
@@ -326,7 +348,7 @@ await checkAsync(
 		assert.equal(r.stageStatus("destination"), "failed");
 		assert.equal(
 			r.stageStatus("remove"),
-			undefined,
+			"skipped",
 			"removal must not even be attempted",
 		);
 	},
@@ -338,17 +360,26 @@ await checkAsync(
 	"S-DSP-15: a target that became dirty is not force-removed",
 	async () => {
 		const f = fixture();
+		const approvedSnapshot = await inspectWorktreeSafety(f.wt);
 		writeFileSync(
 			join(f.wt, "late-edit.txt"),
 			"written after the model checked\n",
 		);
-		const r = await runTeardown(f, scriptFor(f), (pid) => pid);
+		const r = await runTeardown(
+			f,
+			scriptFor(f, { approvedSnapshot }),
+			(pid) => pid,
+		);
 		assert.equal(
 			r.pathPresent,
 			true,
 			"--force destroyed files written after the check",
 		);
-		assert.equal(r.stageStatus("dirty"), "failed");
+		assert.equal(r.stageStatus("dirty-recheck"), "failed");
+		assert.equal(
+			r.report.kind === "present" ? r.report.report.outcome : undefined,
+			"refused",
+		);
 		assert.ok(existsSync(join(f.wt, "late-edit.txt")));
 	},
 );
@@ -436,76 +467,37 @@ await checkAsync(
 	"S-DSP-06: teardown never falls back to a recursive delete",
 	async () => {
 		const f = fixture();
-		const script = scriptFor(f, { preRemove: ["true"] });
-		// `rm -rf` on the claim directory is the only permitted recursive removal.
-		const recursive = [
-			...script.matchAll(/rm\s+-[a-z]*r[a-z]*\s+("?\$?[^\n]*)/g),
-		].map((m) => m[0].trim());
-		for (const use of recursive) {
-			assert.match(
-				use,
-				/dirname "\$owner"/,
-				`unexpected recursive delete: ${use}`,
-			);
-		}
-		assert.equal(/rm -rf "\$wt"/.test(script), false);
+		const script = await scriptFor(f, { preRemove: ["true"] });
+		assert.doesNotMatch(script, /\bgit (?:worktree|branch)\b|\brm\s+-/);
+		assert.ok(script.startsWith(`'${process.execPath}' `));
 		assert.match(
 			script,
-			/git worktree prune/,
-			"stale metadata should be pruned, not deleted",
-		);
-	},
-);
-
-// --- destroy stays forceful --------------------------------------------------
-
-await checkAsync(
-	"destroy still removes a worktree full of ignored files",
-	async () => {
-		const f = fixture();
-		// The normal state of a real worktree: installed dependencies and local
-		// env sitting in the checkout, which destroy is expected to take with it.
-		mkdirSync(join(f.wt, "node_modules"), { recursive: true });
-		writeFileSync(
-			join(f.wt, "node_modules", "dep.js"),
-			"module.exports = 1;\n",
-		);
-		writeFileSync(join(f.wt, ".env.local"), "SECRET=local\n");
-		assert.notEqual(
-			git(f.wt, "status", "--porcelain", "--ignored").trim(),
-			"",
-			"the fixture must not be clean, or this proves nothing",
-		);
-
-		const script = buildDestroyScript(f.repo, f.wt, BRANCH, undefined);
-		const r = spawnSync("bash", ["-c", script], { encoding: "utf-8" });
-		assert.equal(
-			existsSync(f.wt),
-			false,
-			`destroy left the worktree: ${r.stderr}`,
-		);
-		assert.equal(
-			git(f.repo, "branch", "--format=%(refname:short)")
-				.split("\n")
-				.some((b) => b.trim() === BRANCH),
-			false,
-			"destroy should hard-delete the branch",
+			/^'.+' '.+worktree-teardown\.ts' '.+\.request\.json' "\$1"$/,
 		);
 	},
 );
 
 await checkAsync(
-	"dispose refuses the same worktree, because it promises not to lose work",
+	"an absent branch is reported as nothing to delete",
 	async () => {
-		const f = fixture();
-		writeFileSync(join(f.wt, "uncommitted.txt"), "work\n");
-
-		const script = buildDisposeScript(f.repo, f.wt, BRANCH, undefined);
-		spawnSync("bash", ["-c", script], { encoding: "utf-8" });
 		assert.equal(
-			existsSync(f.wt),
-			true,
-			"dispose force-removed a dirty worktree",
+			teardownBranchNote("absent"),
+			"There was no branch to delete.",
+		);
+	},
+);
+
+await checkAsync(
+	"detached teardown pins the current Pi Node executable",
+	async () => {
+		const script = buildVerifiedTeardownScript({
+			requestFile: "/tmp/request with space.json",
+			nodePath: "/runtime/node with space",
+			entrypoint: "/package/worktree-teardown.ts",
+		});
+		assert.equal(
+			script,
+			"'/runtime/node with space' '/package/worktree-teardown.ts' '/tmp/request with space.json' \"$1\"",
 		);
 	},
 );

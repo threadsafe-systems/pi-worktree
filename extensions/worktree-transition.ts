@@ -127,7 +127,12 @@ export interface SuccessorVerification {
 	actual: CheckoutState;
 	expectedProvisioning?: "ready" | "unmanaged";
 	actualProvisioning?: ProvisioningState | "corrupt";
-	branchDisposition?: "deleted" | "kept-unmerged" | "delete-failed" | "unknown";
+	branchDisposition?:
+		| "deleted"
+		| "kept-unmerged"
+		| "not-attempted"
+		| "delete-failed"
+		| "unknown";
 	pathDisposition?: "removed" | "present";
 	registrationDisposition?: "removed" | "present";
 	receiptDisposition?: "removed" | "present" | "mismatched";

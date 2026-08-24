@@ -459,19 +459,15 @@ await checkAsync(
 await checkAsync(
 	"S-DSP-05: a remote pre-remove hook containing exit cannot skip teardown",
 	async () => {
-		// A hook that ends the shell used to take the whole script with it, silently
-		// skipping removal and every check after it.
+		// Hook failure is a pre-mutation refusal, not a partial teardown.
 		const { repo } = newRepo({ preRemove: ["exit 7"] });
 		const { call } = harness(repo);
 		const created = await call({ action: "create", name: "feat/hooked" });
 		const targetPath = created.details.target?.path ?? "";
 
 		const { details } = await call({ action: "dispose", name: "feat/hooked" });
-		assert.equal(
-			details.outcome,
-			"dispose-partial",
-			"a failed hook must not report success",
-		);
+		assert.equal(details.outcome, "refused");
+		assert.equal(details.code, "hook-failed");
 		assert.equal(
 			existsSync(targetPath),
 			true,
@@ -483,8 +479,7 @@ await checkAsync(
 await checkAsync(
 	"S-DSP-15: remote dispose rechecks cleanliness after its hooks",
 	async () => {
-		// The dirty check happens before the script runs, so a hook that writes into
-		// the target would otherwise have its output destroyed by --force.
+		// Hook-created state changes the approved snapshot and blocks mutation.
 		const { repo } = newRepo({ preRemove: ["echo late > hook-artifact.txt"] });
 		const { call } = harness(repo);
 		const created = await call({ action: "create", name: "feat/late-write" });
@@ -494,7 +489,8 @@ await checkAsync(
 			action: "dispose",
 			name: "feat/late-write",
 		});
-		assert.equal(details.outcome, "dispose-partial");
+		assert.equal(details.outcome, "refused");
+		assert.equal(details.code, "dirty-worktree");
 		assert.equal(
 			existsSync(targetPath),
 			true,

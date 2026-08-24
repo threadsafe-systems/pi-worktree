@@ -72,6 +72,11 @@ export interface TeardownReportV1 {
 	schemaVersion: typeof REPORT_SCHEMA_VERSION;
 	operationId: string;
 	expectedDestination: { path: string; branch: string };
+	outcome?: "refused" | "partial" | "complete";
+	reason?: string | null;
+	message?: string;
+	changes?: string[];
+	details?: string[];
 	stages: {
 		name: string;
 		status: "ok" | "skipped" | "failed";
@@ -666,6 +671,71 @@ export type ReportRead =
 	| { kind: "corrupt"; reason: string }
 	| { kind: "present"; report: TeardownReportV1 };
 
+function teardownReportError(value: unknown): string | null {
+	if (!value || typeof value !== "object") return "report is not an object";
+	const report = value as Partial<TeardownReportV1>;
+	if (report.schemaVersion !== REPORT_SCHEMA_VERSION) {
+		return `unsupported report schemaVersion ${String(report.schemaVersion)}`;
+	}
+	if (!report.operationId) return "report is missing operationId";
+	if (
+		!report.expectedDestination ||
+		typeof report.expectedDestination.path !== "string" ||
+		typeof report.expectedDestination.branch !== "string"
+	) {
+		return "report has no valid expectedDestination";
+	}
+	if (
+		!Array.isArray(report.stages) ||
+		!report.stages.every(
+			(stage) =>
+				typeof stage?.name === "string" &&
+				(stage.status === "ok" ||
+					stage.status === "skipped" ||
+					stage.status === "failed"),
+		)
+	) {
+		return "report has invalid stages";
+	}
+	if (
+		!report.observed ||
+		!Object.values(report.observed).every((value) => typeof value === "boolean")
+	) {
+		return "report has invalid observations";
+	}
+	if (typeof report.completedAt !== "string")
+		return "report has no completedAt";
+	if (
+		report.branchDisposition !== undefined &&
+		report.branchDisposition !== "deleted" &&
+		report.branchDisposition !== "kept-unmerged" &&
+		report.branchDisposition !== "skipped"
+	) {
+		return "report has invalid branchDisposition";
+	}
+	if (report.outcome === undefined) return null;
+	if (
+		report.outcome !== "refused" &&
+		report.outcome !== "partial" &&
+		report.outcome !== "complete"
+	) {
+		return "report has invalid outcome";
+	}
+	if (report.reason !== null && typeof report.reason !== "string") {
+		return "report has invalid reason";
+	}
+	if (typeof report.message !== "string") return "report has no message";
+	if (
+		!Array.isArray(report.changes) ||
+		!report.changes.every((entry) => typeof entry === "string") ||
+		!Array.isArray(report.details) ||
+		!report.details.every((entry) => typeof entry === "string")
+	) {
+		return "report has invalid detail lists";
+	}
+	return null;
+}
+
 export function readTeardownReport(
 	store: ReceiptStore,
 	operationId: string,
@@ -673,17 +743,22 @@ export function readTeardownReport(
 	const file = reportPath(store, operationId);
 	if (!existsSync(file)) return { kind: "absent" };
 	try {
-		const parsed = JSON.parse(readFileSync(file, "utf-8"));
-		if (
-			parsed?.schemaVersion !== REPORT_SCHEMA_VERSION ||
-			typeof parsed.operationId !== "string"
-		) {
-			return { kind: "corrupt", reason: "unsupported teardown report" };
-		}
+		const parsed: unknown = JSON.parse(readFileSync(file, "utf-8"));
+		const invalid = teardownReportError(parsed);
+		if (invalid) return { kind: "corrupt", reason: invalid };
 		return { kind: "present", report: parsed as TeardownReportV1 };
 	} catch {
 		return { kind: "corrupt", reason: "teardown report is not valid JSON" };
 	}
+}
+
+export function isSuccessfulTeardownReport(
+	read: ReportRead,
+): read is Extract<ReportRead, { kind: "present" }> {
+	return (
+		read.kind === "present" &&
+		(read.report.outcome === undefined || read.report.outcome === "complete")
+	);
 }
 
 export function removeTeardownReport(

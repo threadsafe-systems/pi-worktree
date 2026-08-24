@@ -330,6 +330,7 @@ export function verifyEnter(
 export type BranchDisposition =
 	| "deleted"
 	| "kept-unmerged"
+	| "not-attempted"
 	| "delete-failed"
 	| "unknown";
 

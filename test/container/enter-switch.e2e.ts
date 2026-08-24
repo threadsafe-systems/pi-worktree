@@ -30,8 +30,15 @@ import { encodeHandoff } from "../../extensions/worktree-handoff.ts";
 import {
 	claimPath,
 	createStore,
+	readTeardownReport,
 	receiptPath,
+	reportPath,
 } from "../../extensions/worktree-receipt.ts";
+import { inspectWorktreeSafety } from "../../extensions/worktree-safety.ts";
+import {
+	runDetachedTeardownRequest,
+	writeDetachedTeardownRequest,
+} from "../../extensions/worktree-teardown.ts";
 import {
 	TRANSITION_MESSAGE_TYPE,
 	TRANSITION_VERIFICATION_TYPE,
@@ -65,6 +72,7 @@ function fixture() {
 	git(repo, "init", "-b", "main");
 	git(repo, "config", "user.email", "test@example.invalid");
 	git(repo, "config", "user.name", "test");
+	writeFileSync(join(repo, ".gitignore"), "*.cache\n");
 	writeFileSync(join(repo, "README.md"), "main\n");
 	git(repo, "add", "-A");
 	git(repo, "commit", "-m", "init");
@@ -786,12 +794,109 @@ async function proveFailedHookPersistsPartialOutcome(): Promise<void> {
 			verification?: { status?: string; branchDisposition?: string };
 		};
 		assert.equal(details.verification?.status, "partial");
-		assert.equal(details.verification?.branchDisposition, "delete-failed");
+		assert.equal(details.verification?.branchDisposition, "not-attempted");
 		assert.match(String(entry.content), /hook-failed/);
 	} finally {
 		await runtime.dispose();
 		process.chdir(originalProcessCwd);
 	}
+}
+
+async function proveHookCreatedStateRefuses(): Promise<void> {
+	const fx = fixture();
+	const notices: string[] = [];
+	mkdirSync(join(fx.repo, ".pi"));
+	writeFileSync(
+		join(fx.repo, ".pi", "worktree.json"),
+		JSON.stringify({ preRemove: ["touch late.cache"] }),
+	);
+	const runtime = await createAgentSessionRuntime(createRuntime, {
+		cwd: fx.worktree,
+		agentDir: fx.agentDir,
+		sessionManager: SessionManager.create(fx.worktree),
+	});
+	const originalProcessCwd = process.cwd();
+	process.chdir(fx.worktree);
+
+	try {
+		const runner = await attach(runtime, notices);
+		const command = runner.getCommand("worktree");
+		assert.ok(command);
+		await command.handler("dispose", runner.createCommandContext());
+
+		assert.equal(runtime.cwd, fx.repo);
+		assert.equal(existsSync(fx.worktree), true);
+		assert.equal(existsSync(join(fx.worktree, "late.cache")), true);
+		const entry = runtime.session.sessionManager
+			.getEntries()
+			.find(
+				(candidate) =>
+					candidate.type === "custom_message" &&
+					candidate.customType === TRANSITION_VERIFICATION_TYPE,
+			);
+		assert.equal(entry?.type, "custom_message");
+		if (entry?.type !== "custom_message") return;
+		const details = entry.details as {
+			verification?: { status?: string; branchDisposition?: string };
+		};
+		assert.equal(details.verification?.status, "partial");
+		assert.equal(details.verification?.branchDisposition, "not-attempted");
+		assert.match(String(entry.content), /ignored inventory/);
+	} finally {
+		await runtime.dispose();
+		process.chdir(originalProcessCwd);
+	}
+}
+
+async function detachedReportCase(
+	preRemove: string[],
+): Promise<{ outcome?: string; pathPresent: boolean }> {
+	const fx = fixture();
+	const commonDir = resolve(
+		fx.repo,
+		git(fx.repo, "rev-parse", "--git-common-dir"),
+	);
+	const store = createStore(commonDir);
+	const operationId =
+		preRemove.length === 0 ? "detached-complete" : "detached-refused";
+	const ownerFile = join(claimPath(store, fx.worktree), "owner.json");
+	const receipt = receiptPath(store, fx.worktree);
+	const report = reportPath(store, operationId);
+	const requestFile = `${report}.request.json`;
+	mkdirSync(dirname(ownerFile), { recursive: true });
+	mkdirSync(dirname(receipt), { recursive: true });
+	writeFileSync(
+		ownerFile,
+		JSON.stringify({ operationId, pid: 4242, role: "waiter" }),
+	);
+	writeFileSync(receipt, "retained-receipt");
+	writeDetachedTeardownRequest(requestFile, {
+		schemaVersion: 1,
+		operationId,
+		repoRoot: fx.repo,
+		worktreePath: fx.worktree,
+		branch: "feat/x",
+		expectedDestination: { path: fx.repo, branch: "main" },
+		approvedSnapshot: await inspectWorktreeSafety(fx.worktree),
+		preRemove,
+		ownerFile,
+		receiptFile: receipt,
+		reportFile: report,
+	});
+	await runDetachedTeardownRequest(requestFile, 4242);
+	const recorded = readTeardownReport(store, operationId);
+	assert.equal(recorded.kind, "present");
+	return {
+		outcome: recorded.kind === "present" ? recorded.report.outcome : undefined,
+		pathPresent: existsSync(fx.worktree),
+	};
+}
+
+async function proveDetachedReportsCompleteAndRefused(): Promise<void> {
+	const complete = await detachedReportCase([]);
+	assert.deepEqual(complete, { outcome: "complete", pathPresent: false });
+	const refused = await detachedReportCase(["touch late.cache"]);
+	assert.deepEqual(refused, { outcome: "refused", pathPresent: true });
 }
 
 function escapeRegExp(value: string): string {
@@ -808,4 +913,6 @@ await proveDetachedMainCanReceiveDisposal();
 await proveUnmergedBranchSurvivesDisposal();
 await proveLandingMismatchSkipsTeardown();
 await proveFailedHookPersistsPartialOutcome();
+await proveHookCreatedStateRefuses();
+await proveDetachedReportsCompleteAndRefused();
 console.log("container session-switch e2e: OK");
